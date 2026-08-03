@@ -29,6 +29,21 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up deterministic icon tooling
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Validate Windows icon
+        shell: pwsh
+        run: |
+          python -m pip install `
+            --disable-pip-version-check `
+            --only-binary=:all: `
+            Pillow==12.3.0
+          python tools/generate_windows_icon.py `
+            assets/logo.png assets/windows/Sawer.ico --check
+
       - name: Set up MinGW build environment
         uses: msys2/setup-msys2@v2
         with:
@@ -40,9 +55,8 @@ jobs:
             mingw-w64-ucrt-x86_64-meson
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-python
-            mingw-w64-ucrt-x86_64-python-pillow
 
-      - name: Validate source version and icon
+      - name: Validate source version
         id: release
         shell: msys2 {0}
         env:
@@ -53,8 +67,6 @@ jobs:
             arguments+=(--tag "$RELEASE_TAG")
           fi
           version="$(python tools/check_release.py "${arguments[@]}")"
-          python tools/generate_windows_icon.py \
-            assets/logo.png assets/windows/Sawer.ico --check
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Configure Release build
