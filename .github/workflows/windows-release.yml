@@ -1,0 +1,146 @@
+name: Windows release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  windows-amd64:
+    name: Windows AMD64
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up MinGW build environment
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-python-pillow
+
+      - name: Validate source version and icon
+        id: release
+        shell: msys2 {0}
+        env:
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+        run: |
+          arguments=(--source-root . --print-version)
+          if [[ -n "$RELEASE_TAG" ]]; then
+            arguments+=(--tag "$RELEASE_TAG")
+          fi
+          version="$(python tools/check_release.py "${arguments[@]}")"
+          python tools/generate_windows_icon.py \
+            assets/logo.png assets/windows/Sawer.ico --check
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Configure Release build
+        shell: msys2 {0}
+        run: meson setup build --buildtype=release -Dsawer_werror=true
+
+      - name: Build Sawer and tests
+        shell: msys2 {0}
+        run: meson compile -C build
+
+      - name: Run release-safe tests
+        shell: msys2 {0}
+        run: >-
+          meson test -C build --print-errorlogs
+          unit
+          "version command"
+          "third-party notices command"
+
+      - name: Prepare direct-download assets
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          mkdir -p dist
+          asset="Sawer-${VERSION}-Windows-AMD64.exe"
+          cp build/Sawer.exe "dist/$asset"
+          cp THIRD_PARTY_NOTICES.md dist/THIRD_PARTY_NOTICES.md
+          sha256sum "dist/$asset" > "dist/$asset.sha256"
+          python tools/check_release.py \
+            --source-root . \
+            --executable "dist/$asset"
+          if objdump -p "dist/$asset" \
+              | grep -Eiq 'DLL Name: (libgcc|libstdc\+\+|libwinpthread|SDL3)'; then
+            echo "Sawer has an unexpected redistributable DLL dependency" >&2
+            exit 1
+          fi
+
+      - name: Verify Windows metadata
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $asset = "dist/Sawer-$env:VERSION-Windows-AMD64.exe"
+          $metadata = (Get-Item -LiteralPath $asset).VersionInfo
+          if ($metadata.ProductVersion -ne $env:VERSION) {
+            throw "ProductVersion '$($metadata.ProductVersion)' does not match '$env:VERSION'"
+          }
+          if ($metadata.FileDescription -ne "Sawer Whiteboard") {
+            throw "Sawer.exe is missing its Windows resource metadata"
+          }
+          $icon = [System.Drawing.Icon]::ExtractAssociatedIcon((Resolve-Path $asset))
+          if ($null -eq $icon) {
+            throw "Sawer.exe is missing its embedded application icon"
+          }
+          $icon.Dispose()
+
+      - name: Upload tested Windows assets
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: Sawer-${{ steps.release.outputs.version }}-Windows-AMD64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attest Windows executable
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/Sawer-${{ steps.release.outputs.version }}-Windows-AMD64.exe
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: msys2 {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          release_flags=()
+          if [[ "$VERSION" == 0.* ]]; then
+            release_flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/Sawer-${VERSION}-Windows-AMD64.exe" \
+            "dist/Sawer-${VERSION}-Windows-AMD64.exe.sha256" \
+            "dist/THIRD_PARTY_NOTICES.md" \
+            --verify-tag \
+            --generate-notes \
+            --title "Sawer ${VERSION}" \
+            "${release_flags[@]}"

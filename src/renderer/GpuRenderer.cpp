@@ -2,7 +2,9 @@
 
 #include "canvas/Camera.hpp"
 #include "canvas/Selection.hpp"
+#include "core/BuildInfo.hpp"
 #include "core/Log.hpp"
+#include "core/ThirdPartyNotices.hpp"
 #include "document/Document.hpp"
 #include "document/Object.hpp"
 #include "geometry/StrokeProcessing.hpp"
@@ -6583,6 +6585,8 @@ void GpuRenderer::build_text_geometry(
                 title = "Canvas settings";
             } else if (toolbar.settings_page() == SettingsPage::view) {
                 title = "Zoom and framing";
+            } else if (toolbar.settings_page() == SettingsPage::about) {
+                title = "About Sawer";
             } else if (toolbar.settings_page() == SettingsPage::color_editor) {
                 if (toolbar.custom_color_target()
                     == CustomColorTarget::stroke) {
@@ -6625,6 +6629,147 @@ void GpuRenderer::build_text_geometry(
             section_label(UiAction::custom_hue_field, "Hue");
             section_label(
                 UiAction::custom_sv_field, "Saturation / brightness");
+        }
+
+        if (toolbar.settings_page() == SettingsPage::about
+            && toolbar.panels().size() >= 2U) {
+            struct NoticeLine final {
+                std::string text;
+                TextStyle style{TextStyle::regular};
+            };
+            std::vector<NoticeLine> lines;
+            lines.reserve(384U);
+
+            const UiRect panel =
+                toolbar.panels()[toolbar.panels().size() - 2U].bounds;
+            const double body_x = panel.x + 20.0 * scale;
+            const double body_width = std::max(
+                panel.width - 40.0 * scale, 1.0);
+            const double body_top = panel.y + 62.0 * scale;
+            const double body_bottom = panel.y + panel.height - 34.0 * scale;
+            const double line_height = font_line_height + 4.0 * scale;
+
+            const auto append_wrapped = [&](std::string_view raw,
+                                            const TextStyle line_style) {
+                while (!raw.empty() && raw.front() == '>') {
+                    raw.remove_prefix(1U);
+                    if (!raw.empty() && raw.front() == ' ') {
+                        raw.remove_prefix(1U);
+                    }
+                }
+                if (raw.empty()) {
+                    lines.push_back({});
+                    return;
+                }
+
+                std::istringstream words{std::string{raw}};
+                std::string word;
+                std::string current;
+                while (words >> word) {
+                    const std::string candidate = current.empty()
+                        ? word
+                        : current + ' ' + word;
+                    if (measure_text_width(candidate, line_style)
+                        <= body_width) {
+                        current = candidate;
+                        continue;
+                    }
+                    if (!current.empty()) {
+                        lines.push_back({std::move(current), line_style});
+                        current.clear();
+                    }
+                    while (measure_text_width(word, line_style)
+                           > body_width && word.size() > 1U) {
+                        std::size_t count = word.size() - 1U;
+                        while (count > 1U
+                               && measure_text_width(
+                                      std::string_view{word}.substr(0U, count),
+                                      line_style) > body_width) {
+                            --count;
+                        }
+                        lines.push_back({word.substr(0U, count), line_style});
+                        word.erase(0U, count);
+                    }
+                    current = std::move(word);
+                }
+                if (!current.empty()) {
+                    lines.push_back({std::move(current), line_style});
+                }
+            };
+
+            append_wrapped(
+                std::string{BuildInfo::name} + " "
+                    + std::string{BuildInfo::version} + " ("
+                    + std::string{build_configuration()} + ")",
+                TextStyle::bold);
+            append_wrapped(
+                "Third-party licenses are embedded in this executable. "
+                "Scroll with the mouse wheel, arrow keys, Page Up/Down, "
+                "Home, or End.",
+                TextStyle::regular);
+            lines.push_back({});
+
+            const std::string_view notices = third_party_notices();
+            std::size_t offset = 0U;
+            while (offset <= notices.size()) {
+                const std::size_t end = notices.find('\n', offset);
+                std::string_view raw = notices.substr(
+                    offset,
+                    end == std::string_view::npos
+                        ? notices.size() - offset
+                        : end - offset);
+                TextStyle line_style = TextStyle::regular;
+                if (raw.starts_with('#')) {
+                    while (!raw.empty()
+                           && (raw.front() == '#' || raw.front() == ' ')) {
+                        raw.remove_prefix(1U);
+                    }
+                    line_style = TextStyle::bold;
+                }
+                append_wrapped(raw, line_style);
+                if (end == std::string_view::npos) {
+                    break;
+                }
+                offset = end + 1U;
+            }
+
+            const auto visible_count = static_cast<std::size_t>(std::max(
+                1.0,
+                std::floor((body_bottom - body_top) / line_height)));
+            const std::size_t maximum_start = lines.size() > visible_count
+                ? lines.size() - visible_count
+                : 0U;
+            const std::size_t first = static_cast<std::size_t>(std::llround(
+                toolbar.about_scroll()
+                * static_cast<double>(maximum_start)));
+            const std::size_t last = std::min(
+                lines.size(), first + visible_count);
+            double line_y = body_top + settings_shift(body_top);
+            for (std::size_t index = first; index < last; ++index) {
+                queue_text(
+                    lines[index].text,
+                    body_x,
+                    line_y,
+                    lines[index].style == TextStyle::bold
+                        ? settings_text
+                        : settings_muted,
+                    lines[index].style);
+                line_y += line_height;
+            }
+
+            std::array<char, 48> progress{};
+            static_cast<void>(std::snprintf(
+                progress.data(),
+                progress.size(),
+                "Licenses  %d%%",
+                static_cast<int>(std::lround(
+                    toolbar.about_scroll() * 100.0))));
+            queue_text(
+                progress.data(),
+                body_x,
+                panel.y + panel.height - font_line_height - 10.0 * scale
+                    + settings_shift(panel.y),
+                settings_muted);
         }
 
         constexpr std::array label_actions{

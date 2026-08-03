@@ -985,7 +985,7 @@ void Toolbar::update(
 
     // View and appearance controls stay at the lower-right canvas edge.
     const double bottom_y = viewport_height_ - 48.0 * scale_;
-    constexpr double estimated_view_width = 216.0;
+    constexpr double estimated_view_width = 258.0;
     x = std::max(
         72.0 * scale_,
         viewport_width_ - (estimated_view_width + 12.0) * scale_);
@@ -1021,6 +1021,14 @@ void Toolbar::update(
         "Light or dark theme  T",
         true,
         false);
+    add(
+        UiAction::about,
+        button,
+        UiIcon::info,
+        "",
+        "About Sawer",
+        true,
+        settings_open_ && settings_page_ == SettingsPage::about);
     finish_panel(zoom_start);
 
     if (!error_message_.empty()) {
@@ -1099,15 +1107,20 @@ void Toolbar::build_settings_panel()
     const double pad = 16.0 * scale_;
     const double header = 30.0 * scale_;
     const double gap = 6.0 * scale_;
-    const double preferred_panel_width = 304.0 * scale_;
+    const bool about_page = settings_page_ == SettingsPage::about;
+    const double preferred_panel_width =
+        (about_page ? 720.0 : 304.0) * scale_;
     const double panel_width = std::min(
         preferred_panel_width,
         std::max(viewport_width_ - 24.0 * scale_, 1.0));
-    const double panel_height = settings_page_ == SettingsPage::canvas
+    const double desired_panel_height = settings_page_ == SettingsPage::canvas
         ? 446.0 * scale_
         : (settings_page_ == SettingsPage::color_editor
             ? 360.0 * scale_
-            : 216.0 * scale_);
+            : (about_page ? 620.0 * scale_ : 216.0 * scale_));
+    const double panel_height = std::min(
+        desired_panel_height,
+        std::max(viewport_height_ - 24.0 * scale_, 1.0));
     const bool style_color_editor =
         settings_page_ == SettingsPage::color_editor
         && (custom_color_target_ == CustomColorTarget::stroke
@@ -1115,7 +1128,7 @@ void Toolbar::build_settings_panel()
     const double rightmost_panel_x = std::max(
         16.0 * scale_,
         viewport_width_ - panel_width - 12.0 * scale_);
-    const double panel_x = style_color_editor
+    const double panel_x = style_color_editor || about_page
         ? std::clamp(
             (viewport_width_ - panel_width) * 0.5,
             12.0 * scale_,
@@ -1124,7 +1137,7 @@ void Toolbar::build_settings_panel()
     const double lowest_panel_y = std::max(
         16.0 * scale_,
         viewport_height_ - 60.0 * scale_ - panel_height);
-    const double panel_y = style_color_editor
+    const double panel_y = style_color_editor || about_page
         ? std::clamp(
             (viewport_height_ - panel_height) * 0.5,
             12.0 * scale_,
@@ -1274,7 +1287,7 @@ void Toolbar::build_settings_panel()
             {field_x, row_y, field_width, row_height},
             "Fit selection", "Frame selected objects", false,
             UiIcon::none, std::nullopt, has_selection_);
-    } else {
+    } else if (settings_page_ == SettingsPage::color_editor) {
         const double field_x = panel_x + pad;
         const double field_width = panel_width - pad * 2.0;
         const double hue_y = panel_y + pad + header + 24.0 * scale_;
@@ -1482,6 +1495,9 @@ void Toolbar::toggle_settings_panel(const SettingsPage page) noexcept
         return;
     }
     settings_page_ = page;
+    if (page == SettingsPage::about) {
+        about_scroll_ = 0.0;
+    }
     settings_open_ = true;
 }
 
@@ -1493,6 +1509,19 @@ void Toolbar::close_settings_panel() noexcept
 void Toolbar::set_settings_page(const SettingsPage page) noexcept
 {
     settings_page_ = page;
+}
+
+void Toolbar::scroll_about(const double delta) noexcept
+{
+    if (!settings_open_ || settings_page_ != SettingsPage::about) {
+        return;
+    }
+    about_scroll_ = std::clamp(about_scroll_ + delta, 0.0, 1.0);
+}
+
+void Toolbar::set_about_scroll(const double position) noexcept
+{
+    about_scroll_ = std::clamp(position, 0.0, 1.0);
 }
 
 void Toolbar::begin_custom_color(
@@ -1639,6 +1668,9 @@ bool Toolbar::is_active_settings_action(const UiAction action) const noexcept
             || action == UiAction::zoom_fit_content
             || action == UiAction::zoom_fit_selection;
     }
+    if (settings_page_ == SettingsPage::about) {
+        return false;
+    }
     if (settings_page_ == SettingsPage::color_editor) {
         return action == UiAction::custom_hue_field
             || action == UiAction::custom_sv_field
@@ -1778,6 +1810,11 @@ bool Toolbar::settings_scrim_visible() const noexcept
 SettingsPage Toolbar::settings_page() const noexcept
 {
     return settings_page_;
+}
+
+double Toolbar::about_scroll() const noexcept
+{
+    return about_scroll_;
 }
 
 CustomColorTarget Toolbar::custom_color_target() const noexcept

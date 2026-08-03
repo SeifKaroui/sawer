@@ -6,7 +6,21 @@ Sawer is a simple, fast, native whiteboard for Windows and Linux. It is built
 around local files: each board is one portable `.sawer` file that you can keep
 in any ordinary folder, copy, move, and share.
 
-> **Status:** Pre-release — build from source for now.
+> **Status:** Pre-release — automated Windows AMD64 release builds are
+> configured; Linux binaries still need to be built from source.
+
+## Download
+
+Tagged releases provide `Sawer-X.Y.Z-Windows-AMD64.exe` on the
+[GitHub Releases page](https://github.com/SeifKaroui/sawer/releases). Sawer is
+a self-contained executable: save it anywhere and run it without an installer
+or companion files.
+
+Each release includes a `.sha256` file. Verify a download from PowerShell with:
+
+    Get-FileHash .\Sawer-X.Y.Z-Windows-AMD64.exe -Algorithm SHA256
+
+Windows binaries are not yet code-signed, so SmartScreen may show a warning.
 
 ## Built around the essentials
 
@@ -155,11 +169,14 @@ Close the window normally to exit. Available non-interactive checks and
 diagnostics include:
 
     build/Sawer.exe --version
+    build/Sawer.exe --third-party-notices
     build/Sawer.exe --smoke-test
     build/Sawer.exe --gpu-info
     build/Sawer.exe --render-test
     build/Sawer.exe --export-diagnostics diagnostics.log
 
+`--third-party-notices` prints the complete license text embedded in the
+executable; the same text is available from the toolbar's About button.
 `--smoke-test` creates a hidden SDL window and exits. `--gpu-info` prints the
 selected GPU backend, adapter, and driver version. `--render-test` presents
 three frames before exiting. `--export-diagnostics` exports the local log and
@@ -175,6 +192,10 @@ The archive contains the statically linked `Sawer.exe`, this README, and
 [third-party notices](THIRD_PARTY_NOTICES.md). Extract it anywhere and run
 `Sawer.exe`; no installer is required. Linux builds produce an equivalent
 relocatable `.tar.gz` archive.
+
+Official Windows releases publish the versioned executable directly, together
+with its SHA-256 checksum and GitHub build-provenance attestation. Maintainer
+steps are documented in [docs/releasing.md](docs/releasing.md).
 
 ## Development
 

@@ -94,6 +94,19 @@ font_cache_dir = get_option('font_cache_dir')
 font_fetcher = files('tools/fetch_file.py')
 font_embedder = files('tools/embed_binary.py')
 
+embedded_notice_source = custom_target(
+  'embed-third-party-notices',
+  input: files('THIRD_PARTY_NOTICES.md'),
+  output: 'EmbeddedThirdPartyNotices.cpp',
+  command: [
+    python,
+    font_embedder,
+    '@INPUT@',
+    '@OUTPUT@',
+    'third_party_notices',
+  ],
+)
+
 font_specs = [
   [
     'SourceSans3-Regular.ttf',
@@ -147,6 +160,7 @@ core_sources = files(
   'src/canvas/Selection.cpp',
   'src/core/BuildInfo.cpp',
   'src/core/Log.cpp',
+  'src/core/ThirdPartyNotices.cpp',
   'src/document/Command.cpp',
   'src/document/Document.cpp',
   'src/document/Object.cpp',
@@ -176,10 +190,43 @@ storage_sources = files(
 
 renderer_sources = files('src/renderer/GpuRenderer.cpp')
 
+windows_resources = []
+if host_machine.system() == 'windows'
+  windows = import('windows')
+  version_parts = meson.project_version().split('.')
+  if version_parts.length() != 3
+    error('Windows metadata requires a three-part project version')
+  endif
+  windows_icon = files('assets/windows/Sawer.ico')
+  resource_configuration = configuration_data()
+  resource_configuration.set_quoted(
+    'ICON_PATH',
+    meson.project_source_root() / 'assets/windows/Sawer.ico',
+  )
+  resource_configuration.set(
+    'VERSION_COMMA',
+    version_parts[0] + ',' + version_parts[1] + ',' + version_parts[2] + ',0',
+  )
+  resource_configuration.set('VERSION', meson.project_version())
+  resource_configuration.set(
+    'FILE_FLAGS',
+    get_option('buildtype') == 'debug' ? 'VS_FF_DEBUG' : '0x0L',
+  )
+  windows_resource_file = configure_file(
+    input: 'assets/windows/Sawer.rc.in',
+    output: 'Sawer.rc',
+    configuration: resource_configuration,
+  )
+  windows_resources = windows.compile_resources(
+    windows_resource_file,
+    depend_files: windows_icon,
+  )
+endif
+
 sawer_core = static_library(
   'sawer_core',
-  core_sources,
-  include_directories: [source_includes, stb_includes],
+  core_sources + [embedded_notice_source],
+  include_directories: [source_includes, stb_includes, asset_includes],
   override_options: sawer_target_options,
 )
 sawer_core_dep = declare_dependency(
@@ -229,7 +276,8 @@ windows_release_subsystem = (
 
 sawer_executable = executable(
   'Sawer',
-  files('src/app/Application.cpp', 'src/app/Clipboard.cpp', 'src/app/main.cpp'),
+  files('src/app/Application.cpp', 'src/app/Clipboard.cpp', 'src/app/main.cpp')
+    + windows_resources,
   include_directories: source_includes,
   dependencies: [sawer_renderer_dep, sawer_storage_dep, sdl3_dep],
   cpp_args: ['-DSDL_MAIN_HANDLED'],
@@ -241,7 +289,7 @@ sawer_executable = executable(
 
 install_data(
   'README.md',
-  'banner.png',
+  'assets/banner.png',
   'THIRD_PARTY_NOTICES.md',
   install_dir: host_machine.system() == 'windows'
     ? '.'
@@ -262,7 +310,7 @@ portable_package = custom_target(
   input: [
     sawer_executable,
     files('README.md'),
-    files('banner.png'),
+    files('assets/banner.png'),
     files('THIRD_PARTY_NOTICES.md'),
   ],
   output: package_root + package_extension,
@@ -306,6 +354,7 @@ if get_option('tests')
       'tests/canvas/SelectionTests.cpp',
       'tests/core/BuildInfoTests.cpp',
       'tests/core/LogTests.cpp',
+      'tests/core/ThirdPartyNoticesTests.cpp',
       'tests/document/DocumentTests.cpp',
       'tests/geometry/StrokeProcessingTests.cpp',
       'tests/input/DrawingSettingsTests.cpp',
@@ -332,6 +381,11 @@ if get_option('tests')
 
   test('unit', sawer_tests, timeout: 180)
   test('version command', sawer_executable, args: ['--version'])
+  test(
+    'third-party notices command',
+    sawer_executable,
+    args: ['--third-party-notices'],
+  )
   test('window lifecycle', sawer_executable, args: ['--smoke-test'])
   test('GPU diagnostics', sawer_executable, args: ['--gpu-info'])
   test('GPU render submission', sawer_executable, args: ['--render-test'], timeout: 10)

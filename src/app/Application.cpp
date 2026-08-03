@@ -4051,6 +4051,16 @@ void Application::handle_event(const SDL_Event& event, bool& running)
             static_cast<double>(event.wheel.mouse_y),
         };
         toolbar_.set_pointer(screen_point);
+        const double direction =
+            event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1.0 : 1.0;
+        const double wheel_amount =
+            static_cast<double>(event.wheel.y) * direction;
+        if (toolbar_.settings_open()
+            && toolbar_.settings_page() == SettingsPage::about) {
+            toolbar_.scroll_about(-wheel_amount * 0.025);
+            sync_toolbar();
+            break;
+        }
         if (toolbar_.contains(screen_point)
             || left_button_down_
             || middle_button_down_
@@ -4058,11 +4068,9 @@ void Application::handle_event(const SDL_Event& event, bool& running)
             || selection_interaction_ != SelectionInteraction::none) {
             break;
         }
-        const double direction =
-            event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1.0 : 1.0;
         zoom_by_steps_at(
             screen_point,
-            static_cast<double>(event.wheel.y) * direction);
+            wheel_amount);
         break;
     }
 
@@ -4094,7 +4102,33 @@ void Application::handle_event(const SDL_Event& event, bool& running)
             const bool gui = (event.key.mod & SDL_KMOD_GUI) != 0U;
             const bool command = control && !alt && !gui;
             const bool plain = !control && !alt && !gui;
-            if (plain && event.key.scancode == SDL_SCANCODE_TAB) {
+            const bool about_open = toolbar_.settings_open()
+                && toolbar_.settings_page() == SettingsPage::about;
+            if (about_open && plain
+                && event.key.scancode == SDL_SCANCODE_HOME) {
+                toolbar_.set_about_scroll(0.0);
+                sync_toolbar();
+            } else if (about_open && plain
+                       && event.key.scancode == SDL_SCANCODE_END) {
+                toolbar_.set_about_scroll(1.0);
+                sync_toolbar();
+            } else if (about_open && plain
+                       && event.key.scancode == SDL_SCANCODE_PAGEUP) {
+                toolbar_.scroll_about(-0.12);
+                sync_toolbar();
+            } else if (about_open && plain
+                       && event.key.scancode == SDL_SCANCODE_PAGEDOWN) {
+                toolbar_.scroll_about(0.12);
+                sync_toolbar();
+            } else if (about_open && plain
+                       && event.key.scancode == SDL_SCANCODE_UP) {
+                toolbar_.scroll_about(-0.025);
+                sync_toolbar();
+            } else if (about_open && plain
+                       && event.key.scancode == SDL_SCANCODE_DOWN) {
+                toolbar_.scroll_about(0.025);
+                sync_toolbar();
+            } else if (plain && event.key.scancode == SDL_SCANCODE_TAB) {
                 toolbar_.focus_next(shift);
                 sync_toolbar();
             } else if (plain
@@ -5828,6 +5862,9 @@ void Application::activate_ui_action(const UiAction action)
         }
         break;
     }
+    case UiAction::about:
+        toolbar_.toggle_settings_panel(SettingsPage::about);
+        break;
     case UiAction::format_background:
         toolbar_.toggle_settings_panel(SettingsPage::canvas);
         break;

@@ -1,0 +1,33 @@
+#include <windows.h>
+
+#define IDI_SAWER_ICON 101
+
+IDI_SAWER_ICON ICON @ICON_PATH@
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION @VERSION_COMMA@
+ PRODUCTVERSION @VERSION_COMMA@
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS @FILE_FLAGS@
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Sawer\0"
+            VALUE "FileDescription", "Sawer Whiteboard\0"
+            VALUE "FileVersion", "@VERSION@\0"
+            VALUE "InternalName", "Sawer\0"
+            VALUE "OriginalFilename", "Sawer.exe\0"
+            VALUE "ProductName", "Sawer\0"
+            VALUE "ProductVersion", "@VERSION@\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

@@ -128,6 +128,8 @@ TEST_CASE("flat drawing workspace separates document tools and view controls")
         == sawer::UiIcon::background);
     REQUIRE(toolbar.find(sawer::UiAction::toggle_theme)->icon
         == sawer::UiIcon::theme);
+    REQUIRE(toolbar.find(sawer::UiAction::about)->icon
+        == sawer::UiIcon::info);
     REQUIRE(toolbar.find(sawer::UiAction::format_background)->icon
         != toolbar.find(sawer::UiAction::toggle_theme)->icon);
     const auto app_bar = toolbar.panels().front().bounds;
@@ -175,6 +177,51 @@ TEST_CASE("flat drawing workspace separates document tools and view controls")
     REQUIRE(toolbar.settings_page() == sawer::SettingsPage::canvas);
     REQUIRE(toolbar.find(sawer::UiAction::format_background)->selected);
     REQUIRE(toolbar.find(sawer::UiAction::grid_dot)->selected);
+}
+
+TEST_CASE("about flyout is responsive and its license scroll is bounded")
+{
+    sawer::Toolbar toolbar;
+    toolbar.update(
+        1280.0, 720.0, 1.0, sawer::Tool::pencil, {}, false, false, false,
+        1.0, "Untitled", false, {}, sawer::BackgroundStyle::dot, {});
+
+    const auto* const about = toolbar.find(sawer::UiAction::about);
+    REQUIRE(about != nullptr);
+    REQUIRE(about->bounds.width >= 32.0);
+
+    toolbar.toggle_settings_panel(sawer::SettingsPage::about);
+    toolbar.update(
+        1280.0, 720.0, 1.0, sawer::Tool::pencil, {}, false, false, false,
+        1.0, "Untitled", false, {}, sawer::BackgroundStyle::dot, {});
+
+    REQUIRE(toolbar.settings_open());
+    REQUIRE(toolbar.settings_page() == sawer::SettingsPage::about);
+    REQUIRE(toolbar.settings_scrim_visible());
+    REQUIRE(toolbar.find(sawer::UiAction::about)->selected);
+    REQUIRE(toolbar.find(sawer::UiAction::settings_close) != nullptr);
+    const auto panel = toolbar.panels()[toolbar.panels().size() - 2U].bounds;
+    REQUIRE(panel.x >= 0.0);
+    REQUIRE(panel.y >= 0.0);
+    REQUIRE(panel.x + panel.width <= toolbar.viewport_width() + 0.01);
+    REQUIRE(panel.y + panel.height <= toolbar.viewport_height() + 0.01);
+
+    toolbar.scroll_about(0.25);
+    REQUIRE(toolbar.about_scroll() == Catch::Approx(0.25));
+    toolbar.scroll_about(2.0);
+    REQUIRE(toolbar.about_scroll() == 1.0);
+    toolbar.set_about_scroll(-1.0);
+    REQUIRE(toolbar.about_scroll() == 0.0);
+
+    toolbar.update(
+        420.0, 360.0, 1.0, sawer::Tool::pencil, {}, false, false, false,
+        1.0, "Untitled", false, {}, sawer::BackgroundStyle::dot, {});
+    const auto narrow =
+        toolbar.panels()[toolbar.panels().size() - 2U].bounds;
+    REQUIRE(narrow.x >= 0.0);
+    REQUIRE(narrow.y >= 0.0);
+    REQUIRE(narrow.x + narrow.width <= toolbar.viewport_width() + 0.01);
+    REQUIRE(narrow.y + narrow.height <= toolbar.viewport_height() + 0.01);
 }
 
 TEST_CASE("filename pill expands while editing and compacts after commit")

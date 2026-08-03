@@ -1,6 +1,7 @@
 #include "app/Application.hpp"
 #include "core/BuildInfo.hpp"
 #include "core/Log.hpp"
+#include "core/ThirdPartyNotices.hpp"
 
 #include <exception>
 #include <filesystem>
@@ -14,6 +15,12 @@ int main(const int argc, char* argv[])
     if (argc == 2 && std::string_view{argv[1]} == "--version") {
         std::cout << sawer::BuildInfo::name << ' '
                   << sawer::BuildInfo::version << '\n';
+        return 0;
+    }
+
+    if (argc == 2
+        && std::string_view{argv[1]} == "--third-party-notices") {
+        std::cout << sawer::third_party_notices();
         return 0;
     }
 

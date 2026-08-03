@@ -34,6 +34,7 @@ enum class BackgroundStyle {
 enum class SettingsPage {
     canvas,
     view,
+    about,
     color_editor,
 };
 
@@ -122,6 +123,7 @@ enum class UiAction {
     zoom_fit_selection,
     zoom_in,
     toggle_theme,
+    about,
     format_background,
     settings_close,
     stabilization_off,
@@ -297,6 +299,8 @@ public:
     void toggle_settings_panel(SettingsPage page = SettingsPage::canvas) noexcept;
     void close_settings_panel() noexcept;
     void set_settings_page(SettingsPage page) noexcept;
+    void scroll_about(double delta) noexcept;
+    void set_about_scroll(double position) noexcept;
     void begin_custom_color(CustomColorTarget target, Color color) noexcept;
     [[nodiscard]] std::optional<Color> update_custom_color(
         UiAction field, Vec2d point) noexcept;
@@ -347,6 +351,7 @@ public:
     // previews can be judged against the actual board.
     [[nodiscard]] bool settings_scrim_visible() const noexcept;
     [[nodiscard]] SettingsPage settings_page() const noexcept;
+    [[nodiscard]] double about_scroll() const noexcept;
     [[nodiscard]] CustomColorTarget custom_color_target() const noexcept;
     [[nodiscard]] Color custom_color() const noexcept;
     [[nodiscard]] double custom_hue() const noexcept;
@@ -408,6 +413,7 @@ private:
     bool settings_open_{};
     bool inline_color_palette_{};
     SettingsPage settings_page_{SettingsPage::canvas};
+    double about_scroll_{};
     CustomColorTarget custom_color_target_{CustomColorTarget::background};
     double custom_hue_{};
     double custom_saturation_{1.0};
