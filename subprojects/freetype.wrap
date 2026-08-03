@@ -1,0 +1,8 @@
+[wrap-file]
+directory = freetype-VER-2-13-2-SDL
+source_url = https://github.com/libsdl-org/freetype/archive/refs/heads/VER-2-13-2-SDL.tar.gz
+source_filename = VER-2-13-2-SDL.tar.gz
+source_hash = 35dda4b5bae9c62840cfeb57bc26697dd6f1e7d02da7ef36876ed13f4003a311
+
+[provide]
+dependency_names = freetype2

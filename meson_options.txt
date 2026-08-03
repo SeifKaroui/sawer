@@ -1,0 +1,20 @@
+option(
+  'tests',
+  type: 'boolean',
+  value: true,
+  description: 'Build Sawer tests and application regression checks',
+)
+
+option(
+  'sawer_werror',
+  type: 'boolean',
+  value: false,
+  description: 'Treat warnings in Sawer sources as errors without affecting third-party subprojects',
+)
+
+option(
+  'font_cache_dir',
+  type: 'string',
+  value: '',
+  description: 'Optional directory containing the three hash-verified Source Sans 3 font files',
+)

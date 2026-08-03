@@ -1,0 +1,16 @@
+/build/
+/AGENTS.md
+/out/
+/.cache/
+/subprojects/packagecache/
+/subprojects/SDL3-*/
+/subprojects/SDL3_ttf-*/
+/subprojects/freetype-*/
+/subprojects/Catch2-*/
+/subprojects/json/
+/.vs/
+/.vscode/
+/.idea/
+*.user
+*.suo
+*.log
