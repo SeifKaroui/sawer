@@ -1,4 +1,6 @@
-![Sawer banner](assets/banner.png)
+<p align="center">
+  <img src="assets/banner.png" alt="Sawer banner" width="100%">
+</p>
 
 # Sawer
 
