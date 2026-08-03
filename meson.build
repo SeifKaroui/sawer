@@ -383,8 +383,14 @@ if get_option('tests')
   test('version command', sawer_executable, args: ['--version'])
   test(
     'third-party notices command',
-    sawer_executable,
-    args: ['--third-party-notices'],
+    python,
+    args: [
+      files('tools/check_release.py'),
+      '--source-root',
+      meson.project_source_root(),
+      '--executable',
+      sawer_executable,
+    ],
   )
   test('window lifecycle', sawer_executable, args: ['--smoke-test'])
   test('GPU diagnostics', sawer_executable, args: ['--gpu-info'])

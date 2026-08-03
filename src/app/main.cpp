@@ -3,12 +3,18 @@
 #include "core/Log.hpp"
 #include "core/ThirdPartyNotices.hpp"
 
+#include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 int main(const int argc, char* argv[])
 {
@@ -20,6 +26,12 @@ int main(const int argc, char* argv[])
 
     if (argc == 2
         && std::string_view{argv[1]} == "--third-party-notices") {
+#ifdef _WIN32
+        if (_setmode(_fileno(stdout), _O_BINARY) == -1) {
+            std::cerr << "Could not configure notice output" << '\n';
+            return 1;
+        }
+#endif
         std::cout << sawer::third_party_notices();
         return 0;
     }
