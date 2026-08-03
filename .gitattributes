@@ -1,0 +1,2 @@
+# Build-time embedded notices must be byte-identical on every platform.
+THIRD_PARTY_NOTICES.md text eol=lf
