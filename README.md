@@ -8,21 +8,33 @@ Sawer is a simple, fast, native whiteboard for Windows and Linux. It is built
 around local files: each board is one portable `.sawer` file that you can keep
 in any ordinary folder, copy, move, and share.
 
-> **Status:** Pre-release — automated Windows AMD64 release builds are
-> configured; Linux binaries still need to be built from source.
+> **Status:** Pre-release — automated Windows AMD64 installer and portable
+> builds are configured; Linux binaries still need to be built from source.
 
 ## Download
 
-Tagged releases provide `Sawer-X.Y.Z-Windows-AMD64.exe` on the
-[GitHub Releases page](https://github.com/SeifKaroui/sawer/releases). Sawer is
-a self-contained executable: save it anywhere and run it without an installer
-or companion files.
+### Installer (recommended)
 
-Each release includes a `.sha256` file. Verify a download from PowerShell with:
+Download `Sawer-Setup.exe` from the
+[GitHub Releases page](https://github.com/SeifKaroui/sawer/releases), run it,
+and choose **Install**. Sawer installs for your Windows account without an
+administrator prompt, adds Start Menu and desktop shortcuts, registers
+`.sawer` boards, and opens automatically. No account or restart is required.
 
-    Get-FileHash .\Sawer-X.Y.Z-Windows-AMD64.exe -Algorithm SHA256
+### Portable version
 
-Windows binaries are not yet code-signed, so SmartScreen may show a warning.
+Download `Sawer-Portable.exe` from the same release if you prefer not to
+install anything. Save it anywhere and run it directly; the application is
+self-contained and has no companion-file requirement.
+
+Each release includes `SHA256SUMS.txt`. Verify either download from PowerShell
+with:
+
+    Get-FileHash .\Sawer-Setup.exe -Algorithm SHA256
+    Get-FileHash .\Sawer-Portable.exe -Algorithm SHA256
+
+Compare the result with the matching line in `SHA256SUMS.txt`. Windows binaries
+are not yet code-signed, so SmartScreen may show a warning.
 
 ## Built around the essentials
 
@@ -51,8 +63,7 @@ Windows binaries are not yet code-signed, so SmartScreen may show a warning.
 
 - SDL Render fallback, complete device-loss recovery, and broad mixed-DPI
   validation are still in progress.
-- Windows installer/file associations and Linux Flatpak/AppImage packaging
-  remain future milestones.
+- Linux Flatpak/AppImage packaging remains a future milestone.
 - Pen, touch, text, images, PDF import, sync, collaboration, and plugins are
   intentionally deferred until after the mouse-first 1.0 release.
 
@@ -195,9 +206,11 @@ The archive contains the statically linked `Sawer.exe`, this README, and
 `Sawer.exe`; no installer is required. Linux builds produce an equivalent
 relocatable `.tar.gz` archive.
 
-Official Windows releases publish the versioned executable directly, together
-with its SHA-256 checksum and GitHub build-provenance attestation. Maintainer
-steps are documented in [docs/releasing.md](docs/releasing.md).
+Official Windows releases publish `Sawer-Setup.exe` as the recommended
+one-click installer and `Sawer-Portable.exe` as the no-install alternative.
+Both come from the same tested executable and include SHA-256 checksums and
+GitHub build-provenance attestations. Maintainer steps are documented in
+[docs/releasing.md](docs/releasing.md).
 
 ## Development
 

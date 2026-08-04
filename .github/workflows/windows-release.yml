@@ -54,6 +54,7 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-meson
             mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-nsis
             mingw-w64-ucrt-x86_64-python
 
       - name: Validate source version
@@ -85,16 +86,13 @@ jobs:
           "version command"
           "third-party notices command"
 
-      - name: Prepare direct-download assets
+      - name: Prepare portable asset
         shell: msys2 {0}
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
         run: |
           mkdir -p dist
-          asset="Sawer-${VERSION}-Windows-AMD64.exe"
+          asset="Sawer-Portable.exe"
           cp build/Sawer.exe "dist/$asset"
           cp THIRD_PARTY_NOTICES.md dist/THIRD_PARTY_NOTICES.md
-          sha256sum "dist/$asset" > "dist/$asset.sha256"
           python tools/check_release.py \
             --source-root . \
             --executable "dist/$asset"
@@ -104,12 +102,13 @@ jobs:
             exit 1
           fi
 
-      - name: Verify Windows metadata
+      - name: Verify portable metadata
         shell: pwsh
         env:
           VERSION: ${{ steps.release.outputs.version }}
         run: |
-          $asset = "dist/Sawer-$env:VERSION-Windows-AMD64.exe"
+          Add-Type -AssemblyName System.Drawing
+          $asset = "dist/Sawer-Portable.exe"
           $metadata = (Get-Item -LiteralPath $asset).VersionInfo
           if ($metadata.ProductVersion -ne $env:VERSION) {
             throw "ProductVersion '$($metadata.ProductVersion)' does not match '$env:VERSION'"
@@ -123,6 +122,56 @@ jobs:
           }
           $icon.Dispose()
 
+      - name: Build one-click installer
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          package="$(pacman -Q mingw-w64-ucrt-x86_64-nsis)"
+          if [[ "$package" != "mingw-w64-ucrt-x86_64-nsis 3.12-1" ]]; then
+            echo "Unexpected NSIS package: $package" >&2
+            exit 1
+          fi
+          if [[ "$(makensis -VERSION)" != "v3.12" ]]; then
+            echo "Unexpected NSIS compiler version" >&2
+            exit 1
+          fi
+          portable="$(cygpath -w "$(pwd)/dist/Sawer-Portable.exe")"
+          output="$(cygpath -w "$(pwd)/dist")"
+          script="$(cygpath -w "$(pwd)/packaging/windows/Sawer.nsi")"
+          MSYS2_ARG_CONV_EXCL='*' makensis \
+            /WX \
+            "/DAPP_VERSION=$VERSION" \
+            "/DAPP_EXE=$portable" \
+            "/DOUTPUT_DIR=$output" \
+            "$script"
+
+      - name: Test install, upgrade, and uninstall
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: >-
+          ./tools/test_windows_installer.ps1
+          -Installer dist/Sawer-Setup.exe
+          -PortableExecutable dist/Sawer-Portable.exe
+          -Version $env:VERSION
+          -SourceRoot .
+
+      - name: Create release checksums
+        shell: pwsh
+        run: |
+          $names = @("Sawer-Setup.exe", "Sawer-Portable.exe")
+          $lines = foreach ($name in $names) {
+            $hash = (Get-FileHash -LiteralPath "dist/$name" -Algorithm SHA256).Hash
+            "$($hash.ToLowerInvariant())  $name"
+          }
+          $encoding = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllLines(
+            (Join-Path (Resolve-Path "dist") "SHA256SUMS.txt"),
+            $lines,
+            $encoding
+          )
+
       - name: Upload tested Windows assets
         uses: actions/upload-artifact@v7.0.1
         with:
@@ -131,11 +180,11 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Attest Windows executable
+      - name: Attest Windows executables
         if: startsWith(github.ref, 'refs/tags/')
         uses: actions/attest@v4
         with:
-          subject-path: dist/Sawer-${{ steps.release.outputs.version }}-Windows-AMD64.exe
+          subject-path: dist/Sawer-*.exe
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -149,8 +198,9 @@ jobs:
             release_flags+=(--prerelease)
           fi
           gh release create "$GITHUB_REF_NAME" \
-            "dist/Sawer-${VERSION}-Windows-AMD64.exe" \
-            "dist/Sawer-${VERSION}-Windows-AMD64.exe.sha256" \
+            "dist/Sawer-Setup.exe" \
+            "dist/Sawer-Portable.exe" \
+            "dist/SHA256SUMS.txt" \
             "dist/THIRD_PARTY_NOTICES.md" \
             --verify-tag \
             --generate-notes \

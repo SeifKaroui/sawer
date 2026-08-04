@@ -348,6 +348,32 @@ SOFTWARE.
 
 Source: https://github.com/nothings/stb/tree/2c980bb59875b0d32144a71867fbdebb2f77cd20
 
+## NSIS 3.12 (Windows installer only)
+
+Sawer's Windows setup executable is built with the Nullsoft Scriptable Install
+System and its zlib compression module. NSIS is not included in the portable
+Sawer executable.
+
+Copyright (C) 1999-2026 Contributors
+
+This software is provided 'as-is', without any express or implied warranty. In
+no event will the authors be held liable for any damages arising from the use
+of this software.
+
+Permission is granted to anyone to use this software for any purpose, including
+commercial applications, and to alter it and redistribute it freely, subject
+to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not claim
+   that you wrote the original software. If you use this software in a product,
+   an acknowledgment in the product documentation would be appreciated but is
+   not required.
+2. Altered source versions must be plainly marked as such, and must not be
+   misrepresented as being the original software.
+3. This notice may not be removed or altered from any source distribution.
+
+Source: https://nsis.sourceforge.io/
+
 ## Catch2 3.15.0 (development only)
 
 Catch2 is used by Sawer's automated tests and is not linked into the
