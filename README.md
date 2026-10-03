@@ -9,7 +9,7 @@ around local files: each board is one portable `.sawer` file that you can keep
 in any ordinary folder, copy, move, and share.
 
 > **Status:** Sawer 0.9.0 is prerelease software. A Windows AMD64 release
-> workflow is configured; Linux currently requires a source build.
+> workflow and a Linux x86_64 executable/AppImage build workflow are configured.
 
 ## Download
 
@@ -35,6 +35,34 @@ with:
 
 Compare the result with the matching line in `SHA256SUMS.txt`. Windows binaries
 are not yet code-signed, so SmartScreen may show a warning.
+
+### Linux downloads
+
+The **Linux release** workflow generates two x86_64 downloads:
+
+- **Sawer-x86_64.AppImage** bundles the C++ runtime libraries and needs no
+  application installation.
+- **Sawer** is the plain executable. SDL and application assets are embedded,
+  but compatible system C++ runtime libraries are required.
+
+Until Linux assets are published, download the
+`Sawer-<version>-Linux-x86_64` artifact from a successful workflow run and
+extract it. In that directory, verify the files, make the chosen download
+executable, and run it:
+
+    sha256sum --check SHA256SUMS-Linux-x86_64.txt
+    chmod +x Sawer-x86_64.AppImage
+    ./Sawer-x86_64.AppImage
+
+For the plain executable, use `chmod +x Sawer` followed by `./Sawer`.
+Both builds target glibc-based Linux distributions with Ubuntu 22.04 as the
+build baseline and require a working Vulkan driver. AppImage does not bundle
+graphics drivers. On systems that restrict FUSE mounting, run
+`./Sawer-x86_64.AppImage --appimage-extract-and-run`.
+
+The workflow runs Debug and Release checks on X11 and Wayland with software
+Vulkan, then checks both downloads on Ubuntu 24.04. CI artifacts do not
+automatically publish a Linux release.
 
 ## Built around the essentials
 
@@ -65,7 +93,7 @@ are not yet code-signed, so SmartScreen may show a warning.
 
 - SDL Render fallback, complete device-loss recovery, and broad mixed-DPI
   validation are still in progress.
-- Linux Flatpak/AppImage packaging remains a future milestone.
+- Linux Flatpak packaging and broad distribution/hardware validation remain future milestones.
 - Pen, touch, text, PDF import, sync, collaboration, and plugins are
   intentionally deferred until after the mouse-first 1.0 release.
 
@@ -185,6 +213,15 @@ For a debug build:
     meson test -C build --print-errorlogs
 
 For an optimized build, use `meson setup build --wipe --buildtype=release`.
+
+On Ubuntu 22.04/24.04, install the display and graphics development packages
+listed in [the Linux pipeline](https://github.com/SeifKaroui/sawer/blob/main/.github/workflows/linux-release.yml).
+Headless checks can run without a display:
+
+    meson test -C build --suite headless --print-errorlogs
+
+The `graphics` suite needs a functioning X11 or Wayland session and Vulkan.
+The `performance` suite should run on real supported graphics hardware.
 
 ## Run and diagnose
 

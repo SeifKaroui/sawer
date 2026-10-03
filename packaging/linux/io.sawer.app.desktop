@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Sawer
+Comment=A fast, local-first whiteboard
+Exec=Sawer %f
+Icon=io.sawer.app
+Terminal=false
+Categories=Graphics;
+MimeType=application/x-sawer;
+StartupWMClass=io.sawer.app

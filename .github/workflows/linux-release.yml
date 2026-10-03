@@ -1,0 +1,300 @@
+name: Linux release
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+concurrency:
+  group: linux-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x64:
+    name: Linux x86_64 (${{ matrix.buildtype }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        buildtype: [debug, release]
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    env:
+      CC: gcc-12
+      CXX: g++-12
+      PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Restore dependency downloads
+        id: dependency-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: |
+            subprojects/packagecache
+            .cache/fonts
+            .cache/pip
+          key: ${{ runner.os }}-sawer-linux-downloads-v1-${{ hashFiles('subprojects/*.wrap', 'subprojects/packagefiles/**', 'meson.build', 'tools/fetch_file.py', 'tools/linux-ci-requirements.txt', '.github/workflows/linux-release.yml') }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Install Linux build and display dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential gcc-12 g++-12 ninja-build pkg-config \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
+            libxi-dev libxss-dev libxtst-dev libxkbcommon-dev \
+            libwayland-dev libdecor-0-dev libdrm-dev libgbm-dev \
+            libegl1-mesa-dev libgl1-mesa-dev libgles2-mesa-dev \
+            libdbus-1-dev libudev-dev libvulkan-dev \
+            mesa-vulkan-drivers vulkan-tools vulkan-validationlayers \
+            dbus-x11 xvfb x11-utils openbox weston desktop-file-utils
+          python -m pip install --disable-pip-version-check \
+            --only-binary=:all: -r tools/linux-ci-requirements.txt
+
+      - name: Validate source version
+        id: release
+        env:
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+        run: |
+          arguments=(--source-root . --print-version)
+          if [[ -n "$RELEASE_TAG" ]]; then
+            arguments+=(--tag "$RELEASE_TAG")
+          fi
+          version="$(python tools/check_release.py "${arguments[@]}")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Source commit: $GITHUB_SHA; Linux x86_64 $version (${{ matrix.buildtype }})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure build
+        env:
+          BUILD_TYPE: ${{ matrix.buildtype }}
+        run: |
+          meson setup build --buildtype=debug -Dsawer_werror=true \
+            -Dfont_cache_dir="$PWD/.cache/fonts"
+          if [[ "$BUILD_TYPE" == release ]]; then
+            meson setup build --wipe --buildtype=release -Dsawer_werror=true \
+              -Dfont_cache_dir="$PWD/.cache/fonts"
+          fi
+
+      - name: Build all targets
+        run: meson compile -C build
+
+      - name: Retain verified fonts
+        run: |
+          mkdir -p .cache/fonts
+          cp build/Inter-{Regular,Medium,SemiBold}.ttf .cache/fonts/
+
+      - name: Save dependency downloads
+        if: steps.dependency-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: |
+            subprojects/packagecache
+            .cache/fonts
+            .cache/pip
+          key: ${{ steps.dependency-cache.outputs.cache-primary-key }}
+
+      - name: Run headless tests
+        run: meson test -C build --no-rebuild --suite headless --print-errorlogs
+
+      - name: Test X11 with software Vulkan
+        run: >-
+          dbus-run-session -- python tools/test_linux_display.py
+          --log-dir build/display-logs x11 --
+          meson test -C build --no-rebuild --suite graphics
+          --num-processes 1 --timeout-multiplier 3 --print-errorlogs
+
+      - name: Test Wayland with software Vulkan
+        run: >-
+          dbus-run-session -- python tools/test_linux_display.py
+          --log-dir build/display-logs wayland --
+          meson test -C build --no-rebuild --suite graphics
+          --num-processes 1 --timeout-multiplier 3 --print-errorlogs
+
+      - name: Restore AppImage tooling
+        if: matrix.buildtype == 'release'
+        id: appimage-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .cache/appimage
+          key: Linux-appimage-1.9.1-20251108-ed4ce84f-2fca8b44-v1
+
+      - name: Fetch verified AppImage tooling
+        if: matrix.buildtype == 'release'
+        run: |
+          python tools/fetch_file.py \
+            --url https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage \
+            --sha256 ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0 \
+            --output .cache/appimage/appimagetool-1.9.1-x86_64.AppImage
+          python tools/fetch_file.py \
+            --url https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64 \
+            --sha256 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d \
+            --output .cache/appimage/runtime-20251108-x86_64
+          chmod +x .cache/appimage/appimagetool-1.9.1-x86_64.AppImage
+          mkdir -p build/appimagetool
+          cd build/appimagetool
+          ../../.cache/appimage/appimagetool-1.9.1-x86_64.AppImage --appimage-extract
+
+      - name: Save verified AppImage tooling
+        if: matrix.buildtype == 'release' && steps.appimage-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .cache/appimage
+          key: ${{ steps.appimage-cache.outputs.cache-primary-key }}
+
+      - name: Prepare executable and AppDir
+        if: matrix.buildtype == 'release'
+        run: |
+          mkdir -p build/linux-dist
+          strip --strip-unneeded build/Sawer
+          install -m 755 build/Sawer build/linux-dist/Sawer
+          python tools/check_release.py --source-root . --executable build/linux-dist/Sawer
+          ldd build/linux-dist/Sawer > build/linux-dist/DEPENDENCIES-Linux-x86_64.txt
+          python tools/package_linux.py --executable build/linux-dist/Sawer --appdir build/Sawer.AppDir
+          desktop-file-validate build/Sawer.AppDir/io.sawer.app.desktop
+          cp --dereference /usr/share/doc/gcc-12-base/copyright \
+            build/Sawer.AppDir/usr/share/doc/Sawer/GCC-runtime-copyright.txt
+          cp /usr/share/common-licenses/GPL-3 \
+            build/Sawer.AppDir/usr/share/doc/Sawer/GNU-GPL-3.txt
+          cp /usr/share/common-licenses/LGPL-2.1 \
+            build/Sawer.AppDir/usr/share/doc/Sawer/GNU-LGPL-2.1.txt
+          cat THIRD_PARTY_NOTICES.md packaging/linux/AppImage-runtime-LICENSE.txt \
+            /usr/share/doc/gcc-12-base/copyright /usr/share/common-licenses/GPL-3 \
+            /usr/share/common-licenses/LGPL-2.1 \
+            > build/linux-dist/THIRD_PARTY_NOTICES-Linux.md
+
+      - name: Build AppImage without FUSE or unpinned downloads
+        if: matrix.buildtype == 'release'
+        env:
+          ARCH: x86_64
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          build/appimagetool/squashfs-root/AppRun --no-appstream \
+            --runtime-file .cache/appimage/runtime-20251108-x86_64 \
+            build/Sawer.AppDir build/linux-dist/Sawer-x86_64.AppImage
+          chmod +x build/linux-dist/Sawer-x86_64.AppImage
+
+      - name: Validate extracted AppImage payload
+        if: matrix.buildtype == 'release'
+        run: |
+          mkdir -p build/appimage-check
+          cd build/appimage-check
+          ../linux-dist/Sawer-x86_64.AppImage --appimage-extract
+          cmp squashfs-root/usr/bin/Sawer ../linux-dist/Sawer
+          cmp squashfs-root/usr/share/doc/Sawer/THIRD_PARTY_NOTICES.md ../../THIRD_PARTY_NOTICES.md
+          test -x squashfs-root/AppRun
+          test -x squashfs-root/usr/bin/Sawer
+          test -f squashfs-root/io.sawer.app.desktop
+          test -f squashfs-root/io.sawer.app.png
+
+      - name: Check AppImage runtime version and notices
+        if: matrix.buildtype == 'release'
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: >-
+          python tools/check_release.py --source-root .
+          --executable build/linux-dist/Sawer-x86_64.AppImage
+
+      - name: Test both downloads on X11 and Wayland
+        if: matrix.buildtype == 'release'
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          for backend in x11 wayland; do
+            for executable in Sawer Sawer-x86_64.AppImage; do
+              dbus-run-session -- python tools/test_linux_display.py \
+                --log-dir "build/download-logs/$executable" "$backend" -- \
+                "$PWD/build/linux-dist/$executable" --render-test
+            done
+          done
+
+      - name: Create Linux checksums
+        if: matrix.buildtype == 'release'
+        run: |
+          cd build/linux-dist
+          sha256sum Sawer Sawer-x86_64.AppImage THIRD_PARTY_NOTICES-Linux.md \
+            DEPENDENCIES-Linux-x86_64.txt > SHA256SUMS-Linux-x86_64.txt
+          sha256sum --check SHA256SUMS-Linux-x86_64.txt
+
+      - name: Upload tested Linux assets
+        if: matrix.buildtype == 'release'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: Sawer-${{ steps.release.outputs.version }}-Linux-x86_64
+          path: build/linux-dist/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build and display logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: Linux-${{ matrix.buildtype }}-logs
+          path: |
+            build/meson-logs/
+            build/display-logs/
+            build/download-logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  compatibility:
+    name: Check downloads on Ubuntu 24.04
+    needs: linux-x64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download tested Linux assets
+        uses: actions/download-artifact@v8.0.1
+        with:
+          name: Sawer-${{ needs.linux-x64.outputs.version }}-Linux-x86_64
+          path: build/linux-dist
+
+      - name: Install display test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            mesa-vulkan-drivers libvulkan1 libdecor-0-0 \
+            dbus-x11 xvfb x11-utils openbox weston
+
+      - name: Verify checksums, versions, and graphics
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          (cd build/linux-dist && sha256sum --check SHA256SUMS-Linux-x86_64.txt)
+          chmod +x build/linux-dist/Sawer build/linux-dist/Sawer-x86_64.AppImage
+          for executable in Sawer Sawer-x86_64.AppImage; do
+            python3 tools/check_release.py --source-root . --executable "build/linux-dist/$executable"
+            for backend in x11 wayland; do
+              dbus-run-session -- python3 tools/test_linux_display.py \
+                --log-dir "build/download-logs/$executable" "$backend" -- \
+                "$PWD/build/linux-dist/$executable" --render-test
+            done
+          done
+
+      - name: Upload compatibility logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: Linux-compatibility-logs
+          path: build/download-logs/
+          if-no-files-found: ignore
+          retention-days: 14

@@ -58,6 +58,13 @@ sdl_options.add_cmake_defines({
   'SDL_SHARED': false,
   'SDL_STATIC': true,
 })
+if host_machine.system() == 'linux'
+  sdl_options.add_cmake_defines({
+    'SDL_X11': true,
+    'SDL_WAYLAND': true,
+    'SDL_VULKAN': true,
+  })
+endif
 sdl_project = cmake.subproject('sdl3', options: sdl_options)
 sdl3_dep = declare_dependency(
   dependencies: [sdl_project.dependency('SDL3-static')] + platform_deps,
@@ -417,23 +424,26 @@ if get_option('tests')
     override_options: sawer_target_options,
   )
 
-  test('unit', sawer_tests, timeout: 180)
-  test('font fetch recovery', python, args: files('tests/tools/FetchFileTests.py'))
-  test('portable documentation layout', python,
+  test('unit', sawer_tests, timeout: 180, suite: 'headless')
+  test('font fetch recovery', python, suite: 'headless', args: files('tests/tools/FetchFileTests.py'))
+  test('portable documentation layout', python, suite: 'headless',
     args: files('tests/tools/PortablePackageTests.py'))
-  test('Unicode file commands', python,
+  test('Unicode file commands', python, suite: 'headless',
     args: [files('tests/tools/UnicodeFileCommands.py'), sawer_format])
   if host_machine.system() == 'windows'
     powershell = find_program('pwsh', 'powershell')
-    test('installer preservation helpers', powershell, args: [
+    test('installer preservation helpers', powershell, suite: 'headless', args: [
       '-NoProfile', '-File', files('tests/tools/InstallerPreservationTests.ps1'),
       '-InstallerScript', files('tools/test_windows_installer.ps1'),
     ])
   endif
-  test('version command', sawer_executable, args: ['--version'])
+  test('Linux package payload', python, suite: 'headless',
+    args: files('tests/tools/LinuxPackageTests.py'))
+  test('version command', sawer_executable, suite: 'headless', args: ['--version'])
   test(
     'third-party notices command',
     python,
+    suite: 'headless',
     args: [
       files('tools/check_release.py'),
       '--source-root',
@@ -442,21 +452,22 @@ if get_option('tests')
       sawer_executable,
     ],
   )
-  test('window lifecycle', sawer_executable, args: ['--smoke-test'])
-  test('GPU diagnostics', sawer_executable, args: ['--gpu-info'])
-  test('GPU render submission', sawer_executable, args: ['--render-test'], timeout: 10)
-  test('board image loading reuse', sawer_executable,
+  test('window lifecycle', sawer_executable, suite: 'graphics', args: ['--smoke-test'])
+  test('GPU diagnostics', sawer_executable, suite: 'graphics', args: ['--gpu-info'])
+  test('GPU render submission', sawer_executable, suite: 'graphics', args: ['--render-test'], timeout: 10)
+  test('board image loading reuse', sawer_executable, suite: 'graphics',
     args: ['--board-loading-test'], timeout: 30)
   test(
     'GPU renderer recovery',
     sawer_executable,
+    suite: 'graphics',
     args: ['--renderer-recovery-test'],
     timeout: 15,
   )
-  test('window resize lifecycle', sawer_executable, args: ['--resize-test'], timeout: 15)
-  test('mouse tools input', sawer_executable, args: ['--input-test'])
-  test('toolbar input isolation', sawer_executable, args: ['--ui-test'], timeout: 10)
-  test('selection editing input', sawer_executable, args: ['--selection-test'], timeout: 10)
+  test('window resize lifecycle', sawer_executable, suite: 'graphics', args: ['--resize-test'], timeout: 15)
+  test('mouse tools input', sawer_executable, suite: 'graphics', args: ['--input-test'])
+  test('toolbar input isolation', sawer_executable, suite: 'graphics', args: ['--ui-test'], timeout: 10)
+  test('selection editing input', sawer_executable, suite: 'graphics', args: ['--selection-test'], timeout: 10)
   test(
     'large board regression',
     sawer_executable,
@@ -483,18 +494,19 @@ if get_option('tests')
   )
   test('rendering navigation performance', sawer_executable,
     args: ['--rendering-performance-test'], timeout: 90, suite: 'performance', is_parallel: false)
-  test('Home recent navigation', sawer_executable, args: ['--home-test'], timeout: 10)
+  test('Home recent navigation', sawer_executable, suite: 'graphics', args: ['--home-test'], timeout: 10)
   test(
-    'Home board transition rendering', sawer_executable,
+    'Home board transition rendering', sawer_executable, suite: 'graphics',
     args: ['--navigation-transition-test'], timeout: 30,
   )
   test(
     'busy board stroke visibility',
     sawer_executable,
+    suite: 'graphics',
     args: ['--stroke-visibility-test'],
     timeout: 60,
   )
-  test('per-board zoom state', sawer_executable, args: ['--zoom-state-test'])
+  test('per-board zoom state', sawer_executable, suite: 'graphics', args: ['--zoom-state-test'])
 
   loading_benchmark = executable(
     'sawer-loading-benchmark',
@@ -508,6 +520,7 @@ if get_option('tests')
   test(
     'diagnostic log export',
     sawer_executable,
+    suite: 'graphics',
     args: ['--export-diagnostics', diagnostic_output],
   )
 endif

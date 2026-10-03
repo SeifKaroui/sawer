@@ -1,2 +1,5 @@
 # Build-time embedded notices must be byte-identical on every platform.
 THIRD_PARTY_NOTICES.md text eol=lf
+
+# The AppImage launcher must remain executable by a Linux shell.
+packaging/linux/AppRun text eol=lf
