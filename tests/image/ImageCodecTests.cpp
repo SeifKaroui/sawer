@@ -106,3 +106,54 @@ TEST_CASE("decoded image cache evicts least recently used pixels within budget")
     REQUIRE_FALSE(cache.find(first));
     REQUIRE(cache.find(second) == b);
 }
+
+TEST_CASE("decoded image cache transfers ownership and releases replaced pixels")
+{
+    sawer::AssetId id{};
+    auto image = std::make_shared<sawer::DecodedImage>(
+        sawer::DecodedImage{2U, 1U, std::vector<std::uint8_t>(8U, 5U)});
+    sawer::ImageDecodeCache prepared{12U};
+    prepared.insert(id, image);
+    sawer::ImageDecodeCache transfer{std::move(prepared)};
+    REQUIRE(prepared.bytes() == 0U);
+    REQUIRE_FALSE(prepared.find(id));
+    REQUIRE(transfer.find(id) == image);
+    REQUIRE(transfer.bytes() == 8U);
+
+    sawer::ImageDecodeCache renderer{4U};
+    sawer::AssetId old_id{};
+    old_id[0] = 1U;
+    auto old = std::make_shared<sawer::DecodedImage>(
+        sawer::DecodedImage{1U, 1U, std::vector<std::uint8_t>(4U, 1U)});
+    std::weak_ptr<const sawer::DecodedImage> replaced = old;
+    renderer.insert(old_id, std::move(old));
+    renderer = std::move(transfer);
+    REQUIRE(replaced.expired());
+    REQUIRE(transfer.bytes() == 0U);
+    REQUIRE_FALSE(transfer.find(id));
+    REQUIRE(renderer.find(id) == image);
+    REQUIRE(renderer.budget() == 12U);
+    prepared.insert(id, image);
+    REQUIRE(prepared.bytes() == 8U);
+    renderer.clear();
+    REQUIRE(renderer.bytes() == 0U);
+}
+
+TEST_CASE("decoded image cache declines oversized images and survives repeated transfers")
+{
+    sawer::ImageDecodeCache renderer{4U};
+    sawer::AssetId id{};
+    const auto oversized = std::make_shared<sawer::DecodedImage>(
+        sawer::DecodedImage{2U, 1U, std::vector<std::uint8_t>(8U, 0U)});
+    renderer.insert(id, oversized);
+    REQUIRE(renderer.bytes() == 0U);
+    REQUIRE_FALSE(renderer.find(id));
+    for (unsigned index = 0U; index < 100U; ++index) {
+        sawer::ImageDecodeCache incoming{4U};
+        incoming.insert(id, std::make_shared<sawer::DecodedImage>(
+            sawer::DecodedImage{1U, 1U, std::vector<std::uint8_t>(4U, 1U)}));
+        renderer = std::move(incoming);
+        REQUIRE(renderer.bytes() == 4U);
+        REQUIRE(incoming.bytes() == 0U);
+    }
+}

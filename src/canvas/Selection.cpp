@@ -235,6 +235,16 @@ void Selection::select(std::vector<ObjectId> ids)
     marquee_.reset();
 }
 
+void Selection::toggle(const ObjectId id)
+{
+    if (const auto found = std::ranges::find(ids_, id); found != ids_.end()) {
+        ids_.erase(found);
+    } else {
+        ids_.push_back(id);
+        std::ranges::sort(ids_);
+    }
+}
+
 void Selection::prune(const Document& document)
 {
     std::erase_if(ids_, [&](const ObjectId id) {

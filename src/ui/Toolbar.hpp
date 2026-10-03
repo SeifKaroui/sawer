@@ -32,6 +32,8 @@ enum class BackgroundStyle {
 };
 
 enum class SettingsPage {
+    file,
+    preferences,
     canvas,
     view,
     about,
@@ -78,6 +80,8 @@ enum class UiAction {
     save_as,
     go_home,
     rename_board,
+    rename_button,
+    rename_file,
     home_new_board,
     home_open_board,
     select,
@@ -126,10 +130,6 @@ enum class UiAction {
     about,
     format_background,
     settings_close,
-    stabilization_off,
-    stabilization_light,
-    stabilization_default,
-    stabilization_strong,
     edit_background_custom,
     edit_grid_custom,
     grid_color_auto,
@@ -165,6 +165,18 @@ enum class UiAction {
     grid_wide_rule,
     grid_triangle,
     grid_narrow_rule,
+    file_menu,
+    preferences_menu,
+    properties_menu,
+    save_copy,
+    custom_hex_field,
+    custom_color_cancel,
+    recent_color_0,
+    recent_color_1,
+    recent_color_2,
+    recent_color_3,
+    recent_color_4,
+    recent_color_5,
     count,
 };
 
@@ -194,6 +206,7 @@ enum class UiIcon {
     zoom_reset,
     zoom_in,
     theme,
+    moon,
     background,
     custom_color,
     back,
@@ -207,6 +220,13 @@ enum class UiIcon {
     grid_wide_rule,
     grid_triangle,
     grid_narrow_rule,
+    settings,
+    close,
+    check,
+    chevron_left,
+    chevron_right,
+    chevron_down,
+    rename,
 };
 
 struct UiRect final {
@@ -282,7 +302,9 @@ public:
         const SelectionStyleSummary& selection_style = {},
         StyleColorTarget color_target = StyleColorTarget::stroke,
         bool stroke_width_editing = false,
-        std::string_view stroke_width_edit_text = {});
+        std::string_view stroke_width_edit_text = {},
+        std::string status_message = {},
+        bool loading = false);
 
     void set_pointer(Vec2d point) noexcept;
     void clear_pointer() noexcept;
@@ -301,6 +323,20 @@ public:
     void set_settings_page(SettingsPage page) noexcept;
     void scroll_about(double delta) noexcept;
     void set_about_scroll(double position) noexcept;
+    void toggle_properties() noexcept;
+    void close_properties() noexcept;
+    void scroll_properties(double delta) noexcept;
+    [[nodiscard]] bool properties_open() const noexcept;
+    [[nodiscard]] bool compact_properties() const noexcept;
+    [[nodiscard]] UiRect properties_bounds() const noexcept;
+    [[nodiscard]] UiRect properties_surface_bounds() const noexcept;
+    [[nodiscard]] double properties_reveal() const noexcept;
+    [[nodiscard]] UiRect properties_clip() const noexcept;
+    // Focus outlines need a small margin outside the input/scrolling clip.
+    [[nodiscard]] UiRect properties_render_clip() const noexcept;
+    [[nodiscard]] double properties_scroll() const noexcept;
+    [[nodiscard]] double properties_scroll_limit() const noexcept;
+    [[nodiscard]] bool is_property_control(UiAction action) const noexcept;
     void begin_custom_color(CustomColorTarget target, Color color) noexcept;
     [[nodiscard]] std::optional<Color> update_custom_color(
         UiAction field, Vec2d point) noexcept;
@@ -311,6 +347,7 @@ public:
     [[nodiscard]] UiRect filename_bounds() const noexcept;
     // Bounds of the inline save-error notice, or an empty rectangle.
     [[nodiscard]] UiRect error_bounds() const noexcept;
+    [[nodiscard]] UiRect status_bounds() const noexcept;
     [[nodiscard]] Color current_color() const noexcept;
     [[nodiscard]] double context_stroke_width() const noexcept;
     [[nodiscard]] bool context_stroke_width_mixed() const noexcept;
@@ -321,12 +358,15 @@ public:
     // Keyboard focus may describe a control without pointer hover. Mouse
     // focus retains its focus ring but must not pin a tooltip after exit.
     [[nodiscard]] const UiControl* focused_tooltip_control() const noexcept;
+    [[nodiscard]] const UiControl* tooltip_control() const noexcept;
     [[nodiscard]] const std::vector<UiControl>& controls() const noexcept;
     [[nodiscard]] const std::vector<UiPanel>& panels() const noexcept;
     [[nodiscard]] const std::vector<UiDivider>& dividers() const noexcept;
     [[nodiscard]] const UiAnimation& animation(UiAction action) const noexcept;
     [[nodiscard]] std::string_view filename() const noexcept;
     [[nodiscard]] std::string_view error_message() const noexcept;
+    [[nodiscard]] std::string_view status_message() const noexcept;
+    [[nodiscard]] std::string_view document_status() const noexcept;
     [[nodiscard]] double height() const noexcept;
     [[nodiscard]] double scale() const noexcept;
     [[nodiscard]] double viewport_width() const noexcept;
@@ -357,6 +397,22 @@ public:
     [[nodiscard]] double custom_hue() const noexcept;
     [[nodiscard]] double custom_saturation() const noexcept;
     [[nodiscard]] double custom_value() const noexcept;
+    [[nodiscard]] UiRect custom_color_preview_bounds() const noexcept;
+    // Shared visible track bounds keep picker handles and pointer mapping aligned.
+    [[nodiscard]] UiRect color_field_bounds(UiAction field) const noexcept;
+    void set_custom_color(Color color) noexcept;
+    void remember_custom_color() noexcept;
+    [[nodiscard]] Color initial_custom_color() const noexcept;
+    void begin_hex_edit();
+    void insert_hex_text(std::string_view text);
+    void erase_hex_text(bool all = false);
+    void select_hex_text() noexcept;
+    [[nodiscard]] bool finish_hex_edit();
+    void cancel_hex_edit() noexcept;
+    [[nodiscard]] bool hex_editing() const noexcept;
+    [[nodiscard]] bool hex_valid() const noexcept;
+    [[nodiscard]] bool hex_selected() const noexcept;
+    [[nodiscard]] std::string_view hex_text() const noexcept;
     [[nodiscard]] BackgroundStyle background_style() const noexcept;
     [[nodiscard]] Color background_color() const noexcept;
     [[nodiscard]] std::optional<Color> grid_color() const noexcept;
@@ -370,6 +426,10 @@ public:
 
 private:
     void build_settings_panel();
+    void set_properties_scroll(double position) noexcept;
+    void set_properties_open(bool open) noexcept;
+    void apply_properties_animation() noexcept;
+    [[nodiscard]] bool property_controls_active() const noexcept;
     [[nodiscard]] bool is_active_settings_action(
         UiAction action) const noexcept;
 
@@ -377,7 +437,29 @@ private:
     std::vector<UiPanel> panels_;
     std::vector<UiDivider> dividers_;
     UiRect error_bounds_;
+    UiRect status_bounds_;
     UiRect settings_bounds_;
+    UiRect custom_color_preview_bounds_;
+    UiRect properties_bounds_;
+    UiRect properties_clip_;
+    std::size_t property_begin_{};
+    std::size_t property_end_{};
+    double properties_scroll_{};
+    double properties_scroll_limit_{};
+    bool compact_properties_{};
+    bool properties_open_{true};
+    bool properties_laid_out_{};
+    double properties_reveal_{1.0};
+    double properties_animation_start_{1.0};
+    double properties_animation_elapsed_{0.18};
+    double properties_content_offset_{};
+    std::optional<std::size_t> properties_panel_index_;
+    UiRect properties_expanded_bounds_;
+    UiRect properties_expanded_clip_;
+    UiRect properties_expanded_toggle_;
+    UiRect properties_tab_bounds_;
+    UiRect properties_tab_toggle_;
+    Tool properties_tool_{Tool::pencil};
     Color current_color_{31U, 41U, 55U, 255U};
     bool current_color_mixed_{};
     double context_stroke_width_{4.0};
@@ -391,16 +473,23 @@ private:
     bool focus_from_keyboard_{};
     double press_hold_time_{};
     double press_repeat_accumulator_{};
+    std::optional<UiAction> tooltip_action_;
+    double tooltip_elapsed_{};
+    bool tooltip_dismissed_{};
     std::array<UiAnimation, static_cast<std::size_t>(UiAction::count)>
         animations_{};
     std::string filename_{"Untitled"};
     std::string error_message_;
+    std::string status_message_;
+    std::string document_status_;
     double height_{56.0};
     double scale_{1.0};
     double viewport_width_{1280.0};
     double viewport_height_{720.0};
     double zoom_{1.0};
     bool dirty_{};
+    bool loading_{};
+    bool has_file_{};
     bool filename_editing_{};
     bool has_selection_{};
     std::size_t filename_cursor_{};
@@ -418,10 +507,16 @@ private:
     double custom_hue_{};
     double custom_saturation_{1.0};
     double custom_value_{1.0};
+    Color initial_custom_color_;
+    std::array<Color, 6> recent_colors_{};
+    std::size_t recent_color_count_{};
+    bool hex_editing_{};
+    bool hex_replace_all_{};
+    bool hex_valid_{true};
+    std::string hex_text_;
     BackgroundStyle background_style_{BackgroundStyle::dot};
     Color background_color_{240U, 242U, 247U, 255U};
     std::optional<Color> grid_color_;
-    DrawingSettings drawing_settings_;
 };
 
 } // namespace sawer

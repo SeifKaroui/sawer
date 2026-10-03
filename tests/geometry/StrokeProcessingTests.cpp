@@ -197,4 +197,26 @@ TEST_CASE("drawing constraints remain inside finite board bounds")
     REQUIRE(unclamped.x == sawer::board_half_extent);
 }
 
+TEST_CASE("incremental stroke curve retains its preview on completion")
+{
+    sawer::IncrementalStrokeCurve curve;
+    std::vector<sawer::Vec2d> points{{0.0, 0.0}};
+    curve.reset(points.front(), 0.01);
+    REQUIRE(curve.push({8.0, 0.0}, points));
+    const auto preview = points;
+    REQUIRE(curve.finish({8.0, 0.0}, points) == false);
+    REQUIRE(points == preview);
+    REQUIRE(curve.finished());
+}
+
+TEST_CASE("incremental stroke curve preserves the release endpoint")
+{
+    sawer::IncrementalStrokeCurve curve;
+    std::vector<sawer::Vec2d> points{{0.0, 0.0}};
+    curve.reset(points.front(), 0.01);
+    static_cast<void>(curve.push({4.0, 1.0}, points));
+    REQUIRE(curve.finish({6.0, -2.0}, points));
+    REQUIRE(points.back() == (sawer::Vec2d{6.0, -2.0}));
+}
+
 } // namespace

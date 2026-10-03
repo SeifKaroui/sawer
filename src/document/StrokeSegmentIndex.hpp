@@ -35,6 +35,10 @@ private:
     std::unordered_map<ChunkKey, std::vector<std::uint32_t>, ChunkKeyHash>
         chunks_;
     std::vector<std::uint32_t> oversized_segments_;
+    // Pathological zigzags use conservative blocks instead of duplicating
+    // every segment into dozens of chunks. No source-point pointers escape.
+    std::vector<Aabb> segment_blocks_;
+    std::size_t block_segment_count_{};
     double average_segment_length_{1.0};
 };
 

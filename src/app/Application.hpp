@@ -7,16 +7,18 @@
 #include "document/Document.hpp"
 #include "document/Object.hpp"
 #include "image/ImageCodec.hpp"
+#include "geometry/StrokeProcessing.hpp"
 #include "input/PointerSample.hpp"
 #include "input/PointerResampler.hpp"
+#include "input/AdaptiveStrokeFilter.hpp"
 #include "input/DrawingSettings.hpp"
 #include "input/Tool.hpp"
-#include "input/VelocityGaussianStabilizer.hpp"
 #include "renderer/GpuRenderer.hpp"
 #include "storage/BoardFile.hpp"
 #include "storage/ClipboardFragment.hpp"
 #include "storage/RecentFiles.hpp"
 #include "ui/HomeView.hpp"
+#include "ui/NavigationTransition.hpp"
 #include "ui/Toolbar.hpp"
 #include "ui/UnsavedDialog.hpp"
 
@@ -51,14 +53,19 @@ public:
     [[nodiscard]] int run_frame_test(std::uint32_t frame_count);
     [[nodiscard]] int run_resize_test();
     [[nodiscard]] int run_line_test();
+    [[nodiscard]] int run_board_loading_test();
     [[nodiscard]] int run_renderer_recovery_test();
     [[nodiscard]] int run_input_test();
     [[nodiscard]] int run_ui_input_test();
     [[nodiscard]] int run_selection_input_test();
     [[nodiscard]] int run_large_board_test();
     [[nodiscard]] int run_drawing_performance_test();
+    [[nodiscard]] int run_rendering_performance_test();
     [[nodiscard]] int run_buffer_growth_test();
+    [[nodiscard]] int run_stroke_visibility_test(
+        const std::filesystem::path& board_path = {});
     [[nodiscard]] int run_home_test();
+    [[nodiscard]] int run_navigation_transition_test();
     [[nodiscard]] int run_zoom_state_test();
     [[nodiscard]] std::string_view gpu_diagnostics() const noexcept;
     void new_board();
@@ -103,6 +110,7 @@ private:
     void cancel_selection_gesture() noexcept;
     void delete_selection();
     void duplicate_selection();
+    void nudge_selection(Vec2d delta);
     [[nodiscard]] bool copy_selection();
     void paste_clipboard();
     [[nodiscard]] bool poll_clipboard_paste();
@@ -179,6 +187,8 @@ private:
     void commit_width_edit();
     void cancel_width_edit();
     [[nodiscard]] bool handle_width_edit_event(const SDL_Event& event);
+    [[nodiscard]] bool handle_color_edit_event(const SDL_Event& event);
+    void cancel_custom_color();
 
     enum class ViewMode {
         board,
@@ -210,6 +220,7 @@ private:
     struct BackgroundOpenResult final {
         std::filesystem::path path;
         Document document;
+        ImageDecodeCache decoded_images;
         std::optional<BoardFileSession> session;
         bool recovered_final_line{};
     };
@@ -232,11 +243,12 @@ private:
     std::vector<ObjectId> selection_edit_ids_;
     std::optional<Aabb> selection_original_bounds_;
     std::optional<SelectionPreview> selection_preview_;
+    bool selection_additive_{};
     Tool current_tool_{Tool::pencil};
     DrawingSettings drawing_settings_;
-    VelocityGaussianStabilizer velocity_gaussian_stabilizer_;
+    AdaptiveStrokeFilter adaptive_stroke_filter_;
     PointerResampler pointer_resampler_;
-    std::vector<Vec2d> active_raw_stroke_points_;
+    IncrementalStrokeCurve incremental_stroke_curve_;
     Style current_style_;
     double rectangle_roundness_{};
     StyleColorTarget style_color_target_{StyleColorTarget::stroke};
@@ -267,6 +279,7 @@ private:
     bool rename_pointer_selecting_{};
     std::filesystem::path rename_path_;
     bool width_editing_{};
+    std::optional<Color> color_editor_original_grid_;
     bool width_edit_replace_all_{};
     std::string width_edit_text_;
 
@@ -286,6 +299,7 @@ private:
     Toolbar toolbar_;
     UnsavedDialog unsaved_dialog_;
     std::string status_error_;
+    std::string status_notice_;
     bool middle_button_down_{};
     bool left_button_down_{};
     bool hand_dragging_{};
@@ -310,11 +324,13 @@ private:
     std::optional<UnsavedDialogChoice> next_unsaved_choice_for_test_;
     std::uint64_t lifecycle_generation_{};
     std::uint64_t background_open_origin_generation_{};
+    std::optional<std::filesystem::path> background_open_home_path_;
     std::future<BackgroundOpenResult> background_open_;
     std::uint64_t last_ui_tick_{};
     // View whose entrance animation is currently playing or settled; a
     // mismatch with view_mode_ restarts the entrance for the new view.
     std::optional<ViewMode> animated_view_mode_;
+    NavigationTransition navigation_transition_;
     bool live_resize_rendering_{};
     std::uint64_t last_live_resize_render_{};
 };

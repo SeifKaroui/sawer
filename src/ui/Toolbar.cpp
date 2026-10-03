@@ -21,7 +21,14 @@ constexpr std::array<Color, 7> palette{{
     {30U, 34U, 42U, 255U},
 }};
 
-constexpr std::array<double, 4> widths{{2.5, 4.0, 7.0, 14.0}};
+constexpr std::array<double, 4> widths{{3.0, 5.0, 9.0, 18.0}};
+constexpr std::array<std::string_view, 7> color_tooltips{{
+    "White  1", "Red  2", "Amber  3", "Green  4",
+    "Blue  5", "Violet  6", "Black  7",
+}};
+constexpr std::array<std::string_view, 4> width_tooltips{{
+    "Fine - 3 px", "Regular - 5 px", "Bold - 9 px", "Heavy - 18 px",
+}};
 constexpr std::array<double, 4> roundness_presets{{0.0, 0.12, 0.25, 0.5}};
 
 constexpr std::array<std::string_view, 4> roundness_tooltips{{
@@ -82,16 +89,27 @@ constexpr std::array<UiIcon, static_cast<std::size_t>(BackgroundStyle::count)>
 constexpr std::array<std::string_view,
     static_cast<std::size_t>(BackgroundStyle::count)>
     grid_tooltips{{
-        "Solid",
-        "Dot",
-        "Square",
-        "Graph",
-        "Hybrid",
-        "Diamond",
-        "Wide rule",
-        "Triangle",
-        "Narrow rule",
+        "No pattern",
+        "Dots",
+        "Square grid",
+        "Graph paper",
+        "Ruled dots",
+        "Diamond grid",
+        "Wide ruled lines",
+        "Triangle grid",
+        "Narrow ruled lines",
     }};
+
+// Keep both canvas palettes in the same visual order without changing the
+// action-to-color mapping used by persisted settings.
+constexpr std::array<std::size_t, 10> canvas_color_order{{6U, 7U, 8U, 9U, 0U, 1U, 2U, 3U, 4U, 5U}};
+constexpr std::array<std::string_view, 10> canvas_color_names{{
+    "Cream", "Peach", "Rose", "Lavender", "Sky", "Mint",
+    "White", "Light gray", "Gray", "Graphite",
+}};
+constexpr std::array<std::string_view, 9> grid_labels{{
+    "None", "Dots", "Squares", "Graph", "Mixed", "Diamond", "Ruled", "Triangles", "Lines",
+}};
 
 struct Hsv final {
     double hue{};
@@ -163,7 +181,6 @@ struct ContextCapabilities final {
     bool width{};
     bool fill{};
     bool color_target{};
-    bool stabilization{};
     bool roundness{};
     bool selection_actions{};
 };
@@ -178,7 +195,6 @@ ContextCapabilities context_capabilities(
         return {
             .palette = true,
             .width = true,
-            .stabilization = true,
         };
     case Tool::line:
         return {
@@ -241,7 +257,7 @@ void Toolbar::update(
     const BackgroundStyle background_style,
     const Color background_color,
     const std::optional<Color> grid_color,
-    const DrawingSettings& drawing_settings,
+    const DrawingSettings&,
     const bool filename_editing,
     const std::size_t filename_cursor,
     const std::size_t filename_anchor,
@@ -253,7 +269,9 @@ void Toolbar::update(
     const SelectionStyleSummary& selection_style,
     const StyleColorTarget color_target,
     const bool stroke_width_editing,
-    const std::string_view stroke_width_edit_text)
+    const std::string_view stroke_width_edit_text,
+    std::string status_message,
+    const bool loading)
 {
     viewport_width_ = std::max(viewport_width, 1.0);
     viewport_height_ = std::max(viewport_height, 1.0);
@@ -261,19 +279,31 @@ void Toolbar::update(
         0.82,
         std::min(viewport_width_ / 760.0, viewport_height_ / 470.0));
     scale_ = std::min(std::clamp(display_scale, 0.82, 1.5), available_scale);
-    height_ = 56.0 * scale_;
+    const bool single_header_row = viewport_width_ >= 1040.0 * scale_;
+    height_ = (single_header_row ? 72.0 : 56.0) * scale_;
+    compact_properties_ = viewport_width_ < 900.0 * scale_
+        || viewport_height_ < 560.0 * scale_;
+    if (properties_tool_ != current_tool) {
+        properties_scroll_ = 0.0;
+        properties_tool_ = current_tool;
+    }
     zoom_ = zoom;
     filename_ = std::move(filename);
     dirty_ = dirty;
+    loading_ = loading;
+    has_file_ = has_file;
     filename_editing_ = filename_editing;
     has_selection_ = has_selection;
     filename_cursor_ = std::min(filename_cursor, filename_.size());
     filename_anchor_ = std::min(filename_anchor, filename_.size());
     error_message_ = std::move(error_message);
+    status_message_ = std::move(status_message);
+    document_status_ = loading ? "Opening..."
+        : !error_message_.empty() ? "Needs attention"
+        : (!has_file ? "Not saved" : (dirty ? "Autosave pending" : "Saved"));
     background_style_ = background_style;
     background_color_ = background_color;
     grid_color_ = grid_color;
-    drawing_settings_ = drawing_settings;
 
     const bool selection_context =
         current_tool == Tool::select && has_selection;
@@ -325,6 +355,15 @@ void Toolbar::update(
     dividers_.clear();
     dividers_.reserve(4U);
     error_bounds_ = {};
+    status_bounds_ = {};
+    properties_bounds_ = {};
+    properties_panel_index_.reset();
+    properties_expanded_bounds_ = {};
+    properties_content_offset_ = 0.0;
+    custom_color_preview_bounds_ = {};
+    properties_clip_ = {};
+    property_begin_ = property_end_ = 0U;
+    properties_scroll_limit_ = 0.0;
     settings_bounds_ = {};
     current_color_mixed_ = selection_context
         && (effective_color_target == StyleColorTarget::fill
@@ -375,9 +414,9 @@ void Toolbar::update(
         stroke_width_label_ = width_label.data();
     }
 
-    const double button = std::max(36.0 * scale_, 32.0);
-    const double gap = 3.0 * scale_;
-    const double panel_pad = 6.0 * scale_;
+    const double button = std::max(40.0 * scale_, 32.0);
+    const double gap = 8.0 * scale_;
+    const double panel_pad = 8.0 * scale_;
     double x = 0.0;
     double y = 0.0;
 
@@ -396,7 +435,7 @@ void Toolbar::update(
             .label = label,
             .tooltip = tooltip,
             .icon = icon,
-            .enabled = enabled,
+            .enabled = enabled && !loading,
             .selected = selected,
             .accent = accent,
             .partial = partial,
@@ -424,56 +463,48 @@ void Toolbar::update(
         }});
     };
 
-    // A full-width application bar anchors file actions and document state.
+    // Header bounds reserve file and utility controls without painting a full-width strip.
     panels_.push_back({{0.0, 0.0, viewport_width_, height_}});
-    x = 12.0 * scale_;
-    y = 10.0 * scale_;
+    x = 16.0 * scale_;
+    y = (height_ - button) * 0.5;
     add(
         UiAction::go_home, button, UiIcon::home, "",
-        "Home - all boards", true, false);
-    add(UiAction::new_board, button, UiIcon::file_new, "", "New board  Ctrl+N", true, false);
-    add(UiAction::open_board, button, UiIcon::folder_open, "", "Open board  Ctrl+O", true, false);
-    if (has_file) {
-        add(
-            UiAction::save, button, UiIcon::save, "",
-            "Save  Ctrl+S", true, false);
-        add(
-            UiAction::save_as, 76.0 * scale_, UiIcon::none, "Save as...",
-            "Save a copy in another location  Ctrl+Shift+S", true, false);
-    } else {
-        add(
-            UiAction::save_as, 76.0 * scale_, UiIcon::none, "Save...",
-            "Choose where to save this board  Ctrl+S", true, false);
-    }
-    const double filename_x = x + 6.0 * scale_;
+        "Home - recent boards", true, false);
+    add(UiAction::file_menu, std::max(64.0 * scale_, 56.0),
+        UiIcon::chevron_down, "File", "New, Open, Rename, and Save as",
+        true, settings_open_ && settings_page_ == SettingsPage::file);
+    const double filename_x = x + 8.0 * scale_;
 
-    const double history_width = button * 2.0 + gap;
-    x = viewport_width_ - 12.0 * scale_ - history_width;
-    const double history_x = x;
-    add(UiAction::undo, button, UiIcon::undo, "", "Undo  Ctrl+Z", can_undo, false);
-    add(UiAction::redo, button, UiIcon::redo, "", "Redo  Ctrl+Shift+Z", can_redo, false);
+    const double header_actions_width = button * 2.0 + gap;
+    x = viewport_width_ - 16.0 * scale_ - header_actions_width;
+    const double utility_x = x;
+    add(UiAction::toggle_theme, button,
+        theme_ == Theme::light ? UiIcon::moon : UiIcon::theme, "",
+        theme_ == Theme::light ? "Switch to dark theme  T" : "Switch to light theme  T",
+        true, false);
+    add(UiAction::preferences_menu, button, UiIcon::settings, "",
+        "Board settings and appearance", true,
+        settings_open_ && settings_page_ == SettingsPage::preferences);
 
-    // Primary tools live in a stable left rail, separate from file commands.
-    const double tool_panel_x = 10.0 * scale_;
-    const double tool_panel_height =
-        button * 6.0 + gap * 5.0 + 6.0 * scale_ + panel_pad * 2.0;
-    const double tool_panel_y = std::max(
-        height_ + 8.0 * scale_,
-        height_ + (viewport_height_ - height_ - tool_panel_height) * 0.5);
-    const double tool_x = tool_panel_x + panel_pad;
-    double tool_y = tool_panel_y + panel_pad;
-    double active_tool_center_y = tool_y + button * 0.5;
+    // Keep the drawing tools centered and stable while their options change.
+    const std::size_t tool_count = 8U;
+    const double tool_panel_width = static_cast<double>(tool_count) * button
+        + static_cast<double>(tool_count - 1U) * gap
+        + 24.0 * scale_ + panel_pad * 2.0;
+    const double tool_panel_x = (viewport_width_ - tool_panel_width) * 0.5;
+    const double tool_panel_y = single_header_row ? 8.0 * scale_ : height_ + 12.0 * scale_;
+    const double tool_panel_height = button + panel_pad * 2.0;
+    double tool_x = tool_panel_x + panel_pad;
+    const double tool_y = tool_panel_y + panel_pad;
     const auto add_tool = [&](const UiAction action,
                               const UiIcon icon,
                               const std::string_view tooltip,
-                              const bool selected) {
+                              const bool selected,
+                              const bool enabled = true) {
         add_at(
             action, {tool_x, tool_y, button, button}, icon, "",
-            tooltip, true, selected);
-        if (selected) {
-            active_tool_center_y = tool_y + button * 0.5;
-        }
-        tool_y += button + gap;
+            tooltip, enabled, selected);
+        tool_x += button + gap;
     };
     add_tool(
         UiAction::select, UiIcon::cursor, "Select and edit  V",
@@ -482,7 +513,7 @@ void Toolbar::update(
         UiAction::hand, UiIcon::hand,
         "Hand / Pan  H - hold Space or drag with middle mouse",
         current_tool == Tool::hand);
-    tool_y += 6.0 * scale_;
+    tool_x += 12.0 * scale_;
     add_tool(
         UiAction::pencil, UiIcon::pencil, "Pencil  P",
         current_tool == Tool::pencil);
@@ -495,16 +526,18 @@ void Toolbar::update(
     add_tool(
         UiAction::ellipse, UiIcon::ellipse, "Ellipse  E",
         current_tool == Tool::ellipse);
+    tool_x += 12.0 * scale_;
+    add_tool(UiAction::undo, UiIcon::undo, "Undo  Ctrl+Z", false, can_undo);
+    add_tool(UiAction::redo, UiIcon::redo, "Redo  Ctrl+Shift+Z", false, can_redo);
     panels_.push_back({{
         tool_panel_x,
         tool_panel_y,
-        button + panel_pad * 2.0,
-        tool_y - tool_panel_y - gap + panel_pad,
+        tool_panel_width,
+        tool_panel_height,
     }});
 
-    // Capabilities determine the rail instead of exposing generic controls
+    // Capabilities determine the options instead of exposing generic controls
     // that the active tool or selection cannot use.
-    const double sidecar_gap = 8.0 * scale_;
     const bool width_mixed = selection_context
         && effective_selection.stroke_width == PropertyValueState::mixed;
     const double displayed_width = selection_context
@@ -526,15 +559,16 @@ void Toolbar::update(
     const bool roundness_partial = selection_context
         && effective_selection.roundness_partial;
     const double compact_button = std::max(32.0 * scale_, 32.0);
-    const double context_label_height = 18.0 * scale_;
+    const double color_button = std::max(40.0 * scale_, 32.0);
+    const double context_label_height = 24.0 * scale_;
     const double minimum_color_target_width =
         std::max(68.0 * scale_, 60.0);
-    const double color_target_content_width = capabilities.color_target
-        ? minimum_color_target_width * 2.0
-            + compact_button + gap * 2.0
-        : 0.0;
+    // Reserve the same readable Stroke / Fill / No fill row for every tool,
+    // including when responsive scaling reaches its minimum.
+    const double color_target_content_width = minimum_color_target_width * 2.0
+        + std::max(60.0 * scale_, 60.0) + gap * 2.0;
     const double context_content_width = std::max({
-        156.0 * scale_,
+        224.0 * scale_,
         compact_button * 4.0 + gap * 3.0,
         color_target_content_width,
     });
@@ -553,9 +587,9 @@ void Toolbar::update(
     };
     const double appearance_height = stacked_height({
         inline_color_palette_
-            ? context_label_height + compact_button * 2.0 + gap
+            ? context_label_height + color_button * 2.0 + gap
             : 0.0,
-        capabilities.color_target ? button : 0.0,
+        capabilities.palette ? button : 0.0,
         capabilities.width
             ? context_label_height + compact_button + gap + button
             : 0.0,
@@ -563,36 +597,52 @@ void Toolbar::update(
             ? context_label_height + compact_button
             : 0.0,
     });
-    const double behavior_height =
-        capabilities.stabilization
-        ? context_label_height + button * 2.0 + gap
-        : 0.0;
     const double action_height =
-        capabilities.selection_actions ? button * 2.0 + gap : 0.0;
+        capabilities.selection_actions
+            ? compact_button + button + gap + 12.0 * scale_ : 0.0;
     const std::size_t group_count =
         static_cast<std::size_t>(appearance_height > 0.0)
-        + static_cast<std::size_t>(behavior_height > 0.0)
         + static_cast<std::size_t>(action_height > 0.0);
-    if (group_count > 0U) {
-        const double context_panel_x =
-            tool_panel_x + button + panel_pad * 2.0 + sidecar_gap;
-        const double section_gap = 13.0 * scale_;
-        const double context_panel_height =
+    const double context_top = tool_panel_y + tool_panel_height + 16.0 * scale_;
+    const double footer_reserve = 64.0 * scale_;
+    const double available_height = std::max(96.0,
+        viewport_height_ - context_top - footer_reserve);
+    const double context_panel_y = context_top
+        + (available_height - std::min(440.0 * scale_, available_height)) * 0.5;
+    const double panel_header_height = button + gap;
+    properties_tab_bounds_ = {16.0 * scale_, context_panel_y,
+        std::max(104.0 * scale_, 96.0), button + 16.0 * scale_};
+    properties_tab_toggle_ = {properties_tab_bounds_.x + 8.0 * scale_,
+        properties_tab_bounds_.y + 8.0 * scale_,
+        properties_tab_bounds_.width - 16.0 * scale_, button};
+    if (group_count == 0U) {
+        properties_reveal_ = properties_open_ ? 1.0 : 0.0;
+        properties_animation_elapsed_ = 0.18;
+    }
+    if (group_count > 0U && !properties_open_ && properties_reveal_ == 0.0) {
+        const UiRect tab{16.0 * scale_, context_panel_y,
+            std::max(104.0 * scale_, 96.0), button + 16.0 * scale_};
+        properties_panel_index_ = panels_.size();
+        panels_.push_back({tab});
+        add_at(UiAction::properties_menu,
+            {tab.x + 8.0 * scale_, tab.y + 8.0 * scale_,
+                tab.width - 16.0 * scale_, button},
+            UiIcon::chevron_right, "Style", "Expand style panel", true, false);
+    }
+    if (group_count > 0U && (properties_open_ || properties_reveal_ > 0.0)) {
+        const double context_panel_x = 16.0 * scale_;
+        const double section_gap = 24.0 * scale_;
+        const double context_horizontal_pad = 12.0 * scale_;
+        const double context_content_height =
             appearance_height
-            + behavior_height
             + action_height
             + static_cast<double>(group_count - 1U) * section_gap
-            + panel_pad * 2.0;
-        const double minimum_context_y = height_ + 8.0 * scale_;
-        const double maximum_context_y = std::max(
-            minimum_context_y,
-            viewport_height_ - context_panel_height - 8.0 * scale_);
-        const double context_panel_y = std::clamp(
-            active_tool_center_y - context_panel_height * 0.5,
-            minimum_context_y,
-            maximum_context_y);
-        const double context_horizontal_pad = panel_pad;
-        const double pair_width = button * 2.0 + gap;
+            + context_horizontal_pad * 2.0 + panel_header_height;
+        const double context_panel_height = std::min(context_content_height,
+            available_height);
+        // A fixed anchor keeps color and width targets still when sections change.
+        const double visible_panel_height = std::min(context_panel_height,
+            viewport_height_ - footer_reserve - context_panel_y);
         const double preset_width =
             (context_content_width - gap * 3.0) * 0.25;
         const double width_value_width = std::max(42.0 * scale_, 40.0);
@@ -601,11 +651,29 @@ void Toolbar::update(
         const double content_width = std::max(
             context_content_width, minimum_stepper_width);
         const double context_x = context_panel_x + context_horizontal_pad;
-        const double pair_x =
-            context_x + (content_width - pair_width) * 0.5;
         const double width_value_actual =
             content_width - button * 2.0 - gap * 2.0;
-        double context_y = context_panel_y + panel_pad;
+        properties_bounds_ = {context_panel_x, context_panel_y,
+            content_width + context_horizontal_pad * 2.0, visible_panel_height};
+        properties_clip_ = {context_panel_x + context_horizontal_pad,
+            context_panel_y + context_horizontal_pad + panel_header_height, content_width,
+            visible_panel_height - context_horizontal_pad * 2.0 - panel_header_height};
+        properties_expanded_bounds_ = properties_bounds_;
+        properties_expanded_clip_ = properties_clip_;
+        properties_scroll_limit_ = std::max(0.0,
+            context_content_height - visible_panel_height);
+        properties_scroll_ = std::clamp(properties_scroll_, 0.0,
+            properties_scroll_limit_);
+        // The collapse control stays outside the scrolling content.
+        add_at(UiAction::properties_menu,
+            {context_x + content_width - button,
+                context_panel_y + context_horizontal_pad, button, button},
+            properties_open_ ? UiIcon::chevron_left : UiIcon::chevron_right,
+            properties_open_ ? "" : "Style",
+            properties_open_ ? "Collapse style panel" : "Expand style panel", true, false);
+        properties_expanded_toggle_ = controls_.back().bounds;
+        property_begin_ = controls_.size();
+        double context_y = properties_clip_.y - properties_scroll_;
         bool appearance_started = false;
 
         const auto add_section_divider = [&] {
@@ -626,7 +694,8 @@ void Toolbar::update(
             appearance_started = true;
         };
 
-        if (capabilities.color_target) {
+        // The color target belongs immediately above its palette.
+        if (capabilities.palette) {
             begin_appearance_block();
             const std::optional<Color> stroke_accent = selection_context
                 ? (effective_selection.stroke_color
@@ -642,18 +711,19 @@ void Toolbar::update(
                         effective_selection.fill_color_value}
                         : std::nullopt)
                 : style.fill;
-            const double target_width =
-                (content_width - compact_button - gap * 2.0) * 0.5;
+            const double no_fill_width = std::max(60.0 * scale_, 60.0);
+            const double target_width = capabilities.color_target
+                ? (content_width - no_fill_width - gap * 2.0) * 0.5 : content_width;
             add_at(
                 UiAction::color_target_stroke,
                 {context_x, context_y, target_width, button},
                 UiIcon::none,
                 "Stroke",
-                "",
+                "Choose the stroke color",
                 true,
                 effective_color_target == StyleColorTarget::stroke,
                 stroke_accent);
-            add_at(
+            if (capabilities.color_target) add_at(
                 UiAction::color_target_fill,
                 {
                     context_x + target_width + gap,
@@ -665,30 +735,16 @@ void Toolbar::update(
                 "Fill",
                 fill_partial
                     ? "Fill color - applies to shapes only"
-                    : "",
+                    : "Choose the fill color",
                 capabilities.fill,
                 effective_color_target == StyleColorTarget::fill,
                 fill_accent,
                 fill_partial);
-            add_at(
-                UiAction::fill_none,
-                {
-                    context_x + (target_width + gap) * 2.0,
-                    context_y + (button - compact_button) * 0.5,
-                    compact_button,
-                    compact_button,
-                },
-                UiIcon::ban,
-                "",
-                fill_mixed
-                    ? "Mixed fill - remove fill from shapes"
-                    : (fill_partial
-                        ? "No fill - applies to shapes only"
-                        : "No fill"),
-                capabilities.fill,
-                no_fill_selected,
-                std::nullopt,
-                fill_partial);
+            if (capabilities.color_target) add_at(UiAction::fill_none,
+                {context_x + (target_width + gap) * 2.0, context_y, no_fill_width, button},
+                UiIcon::none, "No fill", fill_mixed ? "Remove mixed fills" : "Remove fill from shapes",
+                capabilities.fill, no_fill_selected,
+                std::nullopt, fill_partial);
             context_y += button;
         }
 
@@ -722,13 +778,13 @@ void Toolbar::update(
                                 * (preset_width + gap),
                         context_y
                             + static_cast<double>(row)
-                                * (compact_button + gap),
+                                * (color_button + gap),
                         preset_width,
-                        compact_button,
+                        color_button,
                     },
                     UiIcon::none,
                     "",
-                    "",
+                    color_tooltips[index],
                     true,
                     color_value_present
                         && !current_color_mixed_
@@ -749,9 +805,9 @@ void Toolbar::update(
                 UiAction::edit_stroke_custom,
                 {
                     context_x + 3.0 * (preset_width + gap),
-                    context_y + compact_button + gap,
+                    context_y + color_button + gap,
                     preset_width,
-                    compact_button,
+                    color_button,
                 },
                 UiIcon::custom_color,
                 "",
@@ -764,7 +820,7 @@ void Toolbar::update(
                         && settings_page_ == SettingsPage::color_editor
                         && custom_color_target_ == custom_target),
                 current_color_);
-            context_y += compact_button * 2.0 + gap;
+            context_y += color_button * 2.0 + gap;
         }
 
         if (capabilities.width) {
@@ -790,7 +846,7 @@ void Toolbar::update(
                     },
                     UiIcon::line,
                     "",
-                    "",
+                    width_tooltips[index],
                     true,
                     !stroke_width_editing_
                         && !width_mixed
@@ -803,7 +859,7 @@ void Toolbar::update(
                 {context_x, context_y, button, button},
                 UiIcon::minus,
                 " ",
-                "",
+                "Decrease width  [ - hold Shift for smaller steps",
                 width_mixed || displayed_width > 0.5 + 0.001,
                 false);
             add_at(
@@ -816,7 +872,7 @@ void Toolbar::update(
                 },
                 UiIcon::none,
                 stroke_width_label_,
-                "",
+                "Click to enter a stroke width",
                 true,
                 stroke_width_editing_);
             add_at(
@@ -830,7 +886,7 @@ void Toolbar::update(
                 },
                 UiIcon::plus,
                 " ",
-                "",
+                "Increase width  ] - hold Shift for smaller steps",
                 width_mixed || displayed_width < 64.0 - 0.001,
                 false);
             context_y += button;
@@ -873,58 +929,7 @@ void Toolbar::update(
             context_y += compact_button;
         }
 
-        if (appearance_height > 0.0
-            && (behavior_height > 0.0 || action_height > 0.0)) {
-            add_section_divider();
-        }
-
-        if (capabilities.stabilization) {
-            context_y += context_label_height;
-            constexpr std::array stabilization_actions{
-                UiAction::stabilization_off,
-                UiAction::stabilization_light,
-                UiAction::stabilization_default,
-                UiAction::stabilization_strong,
-            };
-            constexpr std::array<std::string_view, 4> stabilization_labels{{
-                "Off",
-                "Light",
-                "Medium",
-                "Strong",
-            }};
-            constexpr std::array<std::string_view, 4> stabilization_tooltips{{
-                "",
-                "",
-                "",
-                "",
-            }};
-            const double stabilization_width =
-                (content_width - gap) / 2.0;
-            for (std::size_t index = 0U;
-                 index < stabilization_actions.size(); ++index) {
-                const std::size_t column = index % 2U;
-                const std::size_t row = index / 2U;
-                add_at(
-                    stabilization_actions[index],
-                    {
-                        context_x
-                            + static_cast<double>(column)
-                                * (stabilization_width + gap),
-                        context_y
-                            + static_cast<double>(row) * (button + gap),
-                        stabilization_width,
-                        button,
-                    },
-                    UiIcon::none,
-                    stabilization_labels[index],
-                    stabilization_tooltips[index],
-                    true,
-                    drawing_settings_.stabilization
-                        == static_cast<StrokeStabilization>(index));
-            }
-            context_y += button * 2.0 + gap;
-        }
-        if (behavior_height > 0.0 && action_height > 0.0) {
+        if (appearance_height > 0.0 && action_height > 0.0) {
             add_section_divider();
         }
 
@@ -958,9 +963,12 @@ void Toolbar::update(
                 true,
                 false);
             context_y += compact_button + gap;
+            context_y += 12.0 * scale_;
+            const double selection_button_width =
+                (content_width - 16.0 * scale_) * 0.5;
             add_at(
                 UiAction::duplicate,
-                {pair_x, context_y, button, button},
+                {context_x, context_y, selection_button_width, button},
                 UiIcon::duplicate,
                 "",
                 "Duplicate selection  Ctrl+D",
@@ -968,81 +976,57 @@ void Toolbar::update(
                 false);
             add_at(
                 UiAction::delete_selection,
-                {pair_x + button + gap, context_y, button, button},
+                {context_x + selection_button_width + 16.0 * scale_,
+                 context_y, selection_button_width, button},
                 UiIcon::trash,
                 "",
                 "Delete selection  Delete",
                 true,
                 false);
         }
-        panels_.push_back({{
-            context_panel_x,
-            context_panel_y,
-            content_width + context_horizontal_pad * 2.0,
-            context_panel_height,
-        }});
+        property_end_ = controls_.size();
+        properties_panel_index_ = panels_.size();
+        panels_.push_back({properties_bounds_});
+        apply_properties_animation();
     }
+    properties_laid_out_ |= group_count > 0U;
 
-    // View and appearance controls stay at the lower-right canvas edge.
-    const double bottom_y = viewport_height_ - 48.0 * scale_;
-    constexpr double estimated_view_width = 258.0;
-    x = std::max(
-        72.0 * scale_,
-        viewport_width_ - (estimated_view_width + 12.0) * scale_);
+    // Zoom has its own quiet group. Appearance belongs in the header settings.
+    const double bottom_y = viewport_height_ - button - 16.0 * scale_;
+    const double zoom_width = std::max(60.0 * scale_, 52.0);
+    x = viewport_width_ - 16.0 * scale_
+        - (button * 2.0 + zoom_width + gap * 2.0);
     y = bottom_y;
     const double zoom_start = x;
     add(UiAction::zoom_out, button, UiIcon::zoom_out, "", "Zoom out  Ctrl+-", true, false);
     add(
         UiAction::zoom_menu,
-        button * 1.25,
+        zoom_width,
         UiIcon::zoom_reset,
         "100%",
         "Zoom and framing",
         true,
         settings_open_ && settings_page_ == SettingsPage::view);
     add(UiAction::zoom_in, button, UiIcon::zoom_in, "", "Zoom in  Ctrl++", true, false);
-    add(
-        UiAction::format_background,
-        button,
-        UiIcon::background,
-        "",
-        "Format background",
-        true,
-        settings_open_
-            && (settings_page_ == SettingsPage::canvas
-                || (settings_page_ == SettingsPage::color_editor
-                    && custom_color_target_ != CustomColorTarget::stroke
-                    && custom_color_target_ != CustomColorTarget::fill)));
-    add(
-        UiAction::toggle_theme,
-        button,
-        UiIcon::theme,
-        "",
-        "Light or dark theme  T",
-        true,
-        false);
-    add(
-        UiAction::about,
-        button,
-        UiIcon::info,
-        "",
-        "About Sawer",
-        true,
-        settings_open_ && settings_page_ == SettingsPage::about);
     finish_panel(zoom_start);
 
-    if (!error_message_.empty()) {
-        error_bounds_ = {
+    if (!error_message_.empty() || !status_message_.empty()) {
+        UiRect message_bounds{
             12.0 * scale_,
             std::max(
                 height_ + 6.0 * scale_,
-                bottom_y - 44.0 * scale_),
+                bottom_y),
             std::min(
                 420.0 * scale_,
-                std::max(viewport_width_ - 24.0 * scale_, 1.0)),
+                std::max(zoom_start - panel_pad - 24.0 * scale_, 1.0)),
             button,
         };
-        panels_.push_back({error_bounds_});
+        if (!error_message_.empty()) {
+            error_bounds_ = message_bounds;
+        } else {
+            status_bounds_ = message_bounds;
+        }
+        panels_.push_back({message_bounds});
     }
 
     if (settings_open_) {
@@ -1051,41 +1035,33 @@ void Toolbar::update(
 
     // The document title sits inside the application bar. It is pushed last so
     // filename_bounds() and the renderer retain their stable lookup.
-    const double estimated_filename_width =
-        (52.0 + static_cast<double>(filename_.size()) * 7.6) * scale_;
     const double available_filename_width = std::max(
-        96.0 * scale_,
-        history_x - filename_x - 10.0 * scale_);
-    const double completed_maximum =
-        std::min(280.0 * scale_, available_filename_width);
-    const double minimum_filename_width =
-        std::min(116.0 * scale_, completed_maximum);
-    const double maximum_filename_width = filename_editing_
-        ? std::min(620.0 * scale_, available_filename_width)
-        : completed_maximum;
+        64.0,
+        (single_header_row ? tool_panel_x : utility_x) - filename_x - 16.0 * scale_);
+    // Reserve stable document space so names, editing, and autosave feedback
+    // cannot move the surrounding controls. File retains Rename on narrow bars.
+    const double document_width = std::min(220.0 * scale_, available_filename_width);
+    const bool show_rename_button = document_width >= 160.0 * scale_;
+    const double rename_gap = 4.0 * scale_;
     const UiRect status_bounds{
         filename_x,
-        10.0 * scale_,
-        std::clamp(
-            estimated_filename_width,
-            minimum_filename_width,
-            maximum_filename_width),
+        (height_ - button) * 0.5,
+        document_width - (show_rename_button ? button + rename_gap : 0.0),
         button,
     };
-    const double rename_size = std::max(28.0 * scale_, 32.0);
+    if (show_rename_button) {
+        add_at(UiAction::rename_button,
+            {status_bounds.x + status_bounds.width + rename_gap,
+                status_bounds.y, button, button},
+            UiIcon::rename, {}, "Rename board  F2", !filename_editing_, false);
+    }
     controls_.push_back(UiControl{
         .action = UiAction::rename_board,
-        .bounds = {
-            status_bounds.x + status_bounds.width
-                - rename_size - 4.0 * scale_,
-            status_bounds.y + (status_bounds.height - rename_size) * 0.5,
-            rename_size,
-            rename_size,
-        },
+        .bounds = status_bounds,
         .label = {},
-        .tooltip = "Rename board",
-        .icon = UiIcon::pencil,
-        .enabled = true,
+        .tooltip = filename_editing_ ? std::string{} : filename_,
+        .icon = UiIcon::none,
+        .enabled = !loading_,
         .selected = false,
         .accent = std::nullopt,
     });
@@ -1106,18 +1082,42 @@ void Toolbar::build_settings_panel()
 {
     const double pad = 16.0 * scale_;
     const double header = 30.0 * scale_;
-    const double gap = 6.0 * scale_;
+    const double gap = 8.0 * scale_;
     const bool about_page = settings_page_ == SettingsPage::about;
+    const bool view_page = settings_page_ == SettingsPage::view;
+    const bool canvas_page = settings_page_ == SettingsPage::canvas;
+    const double view_row_height = std::max(36.0 * scale_, 32.0);
+    const bool header_menu = settings_page_ == SettingsPage::file
+        || settings_page_ == SettingsPage::preferences;
     const double preferred_panel_width =
-        (about_page ? 720.0 : 304.0) * scale_;
+        (view_page ? 280.0 : about_page ? 720.0
+            : (settings_page_ == SettingsPage::color_editor ? 320.0 : (header_menu ? 288.0 : 320.0))) * scale_;
     const double panel_width = std::min(
         preferred_panel_width,
         std::max(viewport_width_ - 24.0 * scale_, 1.0));
-    const double desired_panel_height = settings_page_ == SettingsPage::canvas
-        ? 446.0 * scale_
+    const UiControl* const zoom_anchor = find(UiAction::zoom_menu);
+    const double navigation_clearance = 20.0 * scale_;
+    const double canvas_room = zoom_anchor == nullptr
+        ? viewport_height_ - 24.0 * scale_
+        : zoom_anchor->bounds.y - navigation_clearance - 16.0 * scale_;
+    const bool compact_canvas = canvas_room < 510.0 * scale_;
+    const double canvas_swatch = std::max((compact_canvas ? 32.0 : 40.0) * scale_, 32.0);
+    const double canvas_gap = (compact_canvas ? 6.0 : 8.0) * scale_;
+    const double canvas_palette_height = canvas_swatch * 2.0 + canvas_gap;
+    const double canvas_section_gap = (compact_canvas ? 28.0 : 36.0) * scale_;
+    const double canvas_first_row = (compact_canvas ? 66.0 : 74.0) * scale_;
+    const double canvas_pattern_height = std::max((compact_canvas ? 48.0 : 52.0) * scale_, 32.0);
+    const double canvas_height = canvas_first_row
+        + (canvas_palette_height + canvas_section_gap) * 2.0
+        + canvas_pattern_height * 3.0 + canvas_gap * 2.0 + pad;
+    const double desired_panel_height = view_page
+        ? pad * 2.0 + header + 18.0 * scale_ + view_row_height * 3.0 + gap * 2.0
+        : settings_page_ == SettingsPage::canvas
+        ? canvas_height
         : (settings_page_ == SettingsPage::color_editor
-            ? 360.0 * scale_
-            : (about_page ? 620.0 * scale_ : 216.0 * scale_));
+            ? 440.0 * scale_
+            : (about_page ? 620.0 * scale_
+                : (header_menu ? (settings_page_ == SettingsPage::preferences ? 132.0 : 220.0) : 240.0) * scale_));
     const double panel_height = std::min(
         desired_panel_height,
         std::max(viewport_height_ - 24.0 * scale_, 1.0));
@@ -1127,38 +1127,68 @@ void Toolbar::build_settings_panel()
             || custom_color_target_ == CustomColorTarget::fill);
     const double rightmost_panel_x = std::max(
         16.0 * scale_,
-        viewport_width_ - panel_width - 12.0 * scale_);
-    const double panel_x = style_color_editor || about_page
+        viewport_width_ - panel_width - ((view_page || canvas_page) ? 8.0 : 12.0) * scale_);
+    const UiControl* const color_trigger = find(UiAction::edit_stroke_custom);
+    const UiRect color_anchor = color_trigger == nullptr
+        ? properties_bounds_ : color_trigger->bounds;
+    const UiControl* const file_trigger = find(UiAction::file_menu);
+    double panel_x = settings_page_ == SettingsPage::file
+        ? std::clamp(file_trigger != nullptr ? file_trigger->bounds.x : 16.0 * scale_,
+            12.0 * scale_, rightmost_panel_x)
+        : (style_color_editor
+            ? std::clamp(properties_bounds_.x + properties_bounds_.width
+                    + 12.0 * scale_, 12.0 * scale_, rightmost_panel_x)
+            : (about_page
         ? std::clamp(
             (viewport_width_ - panel_width) * 0.5,
             12.0 * scale_,
             rightmost_panel_x)
-        : rightmost_panel_x;
+        : rightmost_panel_x));
+    const double above_zoom_y = zoom_anchor == nullptr ? 16.0 * scale_
+        : zoom_anchor->bounds.y - navigation_clearance - panel_height;
+    // A tall canvas picker can fit beside navigation in a short window.
+    // Keep its complete controls visible rather than covering the zoom bar.
+    if (canvas_page && above_zoom_y < 16.0 * scale_) {
+        if (const UiControl* zoom_left = find(UiAction::zoom_out)) {
+            const double beside_zoom_x = zoom_left->bounds.x
+                - navigation_clearance - panel_width;
+            if (beside_zoom_x >= 16.0 * scale_) panel_x = beside_zoom_x;
+        }
+    }
     const double lowest_panel_y = std::max(
         16.0 * scale_,
-        viewport_height_ - 60.0 * scale_ - panel_height);
-    const double panel_y = style_color_editor || about_page
+        ((view_page || canvas_page) && zoom_anchor != nullptr
+            ? zoom_anchor->bounds.y - navigation_clearance
+            : viewport_height_ - 60.0 * scale_) - panel_height);
+    const double panel_y = header_menu
+        ? height_ + 8.0 * scale_
+        : (style_color_editor
+            ? std::clamp(color_anchor.y, height_ + 8.0 * scale_,
+                std::max(height_ + 8.0 * scale_,
+                    viewport_height_ - panel_height - 12.0 * scale_))
+            : (about_page
         ? std::clamp(
             (viewport_height_ - panel_height) * 0.5,
             12.0 * scale_,
             std::max(12.0 * scale_,
                 viewport_height_ - panel_height - 12.0 * scale_))
-        : lowest_panel_y;
+        : lowest_panel_y));
 
+    const double close_size = std::max(header * 0.9, 32.0);
     controls_.push_back(UiControl{
         .action = UiAction::settings_close,
         .bounds = {
-            panel_x + pad,
+            panel_x + panel_width - pad - close_size,
             panel_y + pad * 0.5,
-            std::max(header * 0.9, 32.0),
-            std::max(header * 0.9, 32.0),
+            close_size,
+            close_size,
         },
         .label = {},
         .tooltip = settings_page_ == SettingsPage::color_editor
-            ? "Back"
+            ? "Cancel color change"
             : "Close",
-        .icon = UiIcon::back,
-        .enabled = true,
+        .icon = UiIcon::close,
+        .enabled = !loading_,
         .selected = false,
         .accent = std::nullopt,
     });
@@ -1177,13 +1207,37 @@ void Toolbar::build_settings_panel()
             .label = label,
             .tooltip = tooltip,
             .icon = icon,
-            .enabled = enabled,
+            .enabled = enabled && !loading_,
             .selected = selected,
             .accent = accent,
         });
     };
 
-    if (settings_page_ == SettingsPage::canvas) {
+    if (header_menu) {
+        const double field_x = panel_x + pad;
+        const double field_width = panel_width - pad * 2.0;
+        const double row_height = std::max(36.0 * scale_, 32.0);
+        double row_y = panel_y + 44.0 * scale_;
+        const auto row = [&](const UiAction action, const std::string_view label,
+                             const std::string_view tooltip, const UiIcon icon) {
+            add_control(action, {field_x, row_y, field_width, row_height},
+                label, tooltip, false, icon);
+            row_y += row_height + gap;
+        };
+        if (settings_page_ == SettingsPage::file) {
+            row(UiAction::new_board, "New board", "New board  Ctrl+N", UiIcon::file_new);
+            row(UiAction::open_board, "Open board...", "Open board  Ctrl+O", UiIcon::folder_open);
+            row(UiAction::rename_file, "Rename...", "Rename board  F2", UiIcon::rename);
+            row(has_file_ ? UiAction::save_copy : UiAction::save_as,
+                has_file_ ? "Save as..." : "Save...",
+                has_file_ ? "Save in another location  Ctrl+Shift+S"
+                    : "Choose where to save this board  Ctrl+S", UiIcon::save);
+        } else {
+            row(UiAction::format_background, "Canvas background",
+                "Background color, grid color, and pattern", UiIcon::background);
+            row(UiAction::about, "About Sawer", "Version and licenses", UiIcon::info);
+        }
+    } else if (settings_page_ == SettingsPage::canvas) {
         constexpr std::array background_actions{
             UiAction::bg_color_0, UiAction::bg_color_1, UiAction::bg_color_2,
             UiAction::bg_color_3, UiAction::bg_color_4, UiAction::bg_color_5,
@@ -1197,85 +1251,69 @@ void Toolbar::build_settings_panel()
             UiAction::grid_color_6, UiAction::grid_color_7,
             UiAction::grid_color_8, UiAction::grid_color_9,
         };
-        const double swatch = std::max(36.0 * scale_, 32.0);
-        const double swatch_gap = 6.0 * scale_;
+        const double swatch = canvas_swatch;
+        const double field_width = panel_width - pad * 2.0;
+        const double stride = (field_width - swatch) / 5.0;
         const double row_x = panel_x + pad;
-        double row_y = panel_y + pad + header + 28.0 * scale_;
-        for (std::size_t index = 0U; index < background_actions.size(); ++index) {
-            const std::size_t row = index / 6U;
-            const std::size_t column = index % 6U;
-            add_control(
-                background_actions[index],
-                {row_x + static_cast<double>(column) * (swatch + swatch_gap),
-                 row_y + static_cast<double>(row) * (swatch + swatch_gap),
-                 swatch, swatch},
-                {}, "Background color",
+        double row_y = panel_y + canvas_first_row;
+        const auto swatch_bounds = [&](const std::size_t slot) {
+            return UiRect{row_x + static_cast<double>(slot % 6U) * stride,
+                row_y + static_cast<double>(slot / 6U) * (swatch + canvas_gap),
+                swatch, swatch};
+        };
+        for (std::size_t position = 0U; position < canvas_color_order.size(); ++position) {
+            const std::size_t index = canvas_color_order[position];
+            // Four neutrals on the first row, six pastels on the second.
+            const std::size_t slot = position < 4U ? position : position + 2U;
+            add_control(background_actions[index], swatch_bounds(slot),
+                {}, canvas_color_names[index],
                 same_rgb(background_color_, background_palette[index]),
                 UiIcon::none, background_palette[index]);
         }
-        add_control(
-            UiAction::edit_background_custom,
-            {row_x + 4.0 * (swatch + swatch_gap), row_y + swatch + swatch_gap,
-             swatch, swatch},
-            {}, "Custom background color",
+        UiRect custom_background = swatch_bounds(4U);
+        custom_background.width += stride;
+        add_control(UiAction::edit_background_custom, custom_background,
+            "Custom", "Custom background color",
             std::ranges::none_of(background_palette, [&](const Color color) {
                 return same_rgb(background_color_, color);
-            }),
-            UiIcon::custom_color);
+            }), UiIcon::custom_color, background_color_);
 
-        row_y += 2.0 * (swatch + swatch_gap) + 30.0 * scale_;
-        add_control(
-            UiAction::grid_color_auto,
-            {row_x, row_y, swatch, swatch},
-            "Auto", "Automatic grid color", !grid_color_.has_value());
-        for (std::size_t index = 0U; index < grid_color_actions.size(); ++index) {
-            const std::size_t slot = index + 1U;
-            const std::size_t row = slot / 6U;
-            const std::size_t column = slot % 6U;
-            add_control(
-                grid_color_actions[index],
-                {row_x + static_cast<double>(column) * (swatch + swatch_gap),
-                 row_y + static_cast<double>(row) * (swatch + swatch_gap),
-                 swatch, swatch},
-                {}, "Grid color",
-                grid_color_.has_value()
-                    && same_rgb(*grid_color_, background_palette[index]),
+        row_y += canvas_palette_height + canvas_section_gap;
+        for (std::size_t position = 0U; position < canvas_color_order.size(); ++position) {
+            const std::size_t index = canvas_color_order[position];
+            const std::size_t slot = position < 4U ? position : position + 2U;
+            add_control(grid_color_actions[index], swatch_bounds(slot),
+                {}, canvas_color_names[index],
+                grid_color_.has_value() && same_rgb(*grid_color_, background_palette[index]),
                 UiIcon::none, background_palette[index]);
         }
-        add_control(
-            UiAction::edit_grid_custom,
-            {row_x + 5.0 * (swatch + swatch_gap), row_y + swatch + swatch_gap,
-             swatch, swatch},
-            {}, "Custom grid color",
-            grid_color_.has_value()
-                && std::ranges::none_of(
-                    background_palette, [&](const Color color) {
-                        return same_rgb(*grid_color_, color);
-                    }),
-            UiIcon::custom_color);
+        add_control(UiAction::edit_grid_custom, swatch_bounds(4U),
+            {}, "Custom grid color", grid_color_.has_value()
+                && std::ranges::none_of(background_palette, [&](const Color color) {
+                    return same_rgb(*grid_color_, color);
+                }), UiIcon::custom_color, grid_color_.value_or(background_color_));
+        add_control(UiAction::grid_color_auto, swatch_bounds(5U),
+            "Auto", "Automatically contrast the grid with the background", !grid_color_.has_value());
 
-        row_y += 2.0 * (swatch + swatch_gap) + 30.0 * scale_;
-        const double tile = 44.0 * scale_;
+        row_y += canvas_palette_height + canvas_section_gap;
+        const double tile_width = (field_width - canvas_gap * 2.0) / 3.0;
         for (std::size_t index = 0U; index < grid_actions.size(); ++index) {
-            const std::size_t row = index / 5U;
-            const std::size_t column = index % 5U;
-            add_control(
-                grid_actions[index],
-                {row_x + static_cast<double>(column) * (tile + gap),
-                 row_y + static_cast<double>(row) * (tile + gap), tile, tile},
-                {}, grid_tooltips[index],
-                static_cast<std::size_t>(background_style_) == index,
-                grid_icons[index]);
+            add_control(grid_actions[index],
+                {row_x + static_cast<double>(index % 3U) * (tile_width + canvas_gap),
+                 row_y + static_cast<double>(index / 3U) * (canvas_pattern_height + canvas_gap),
+                 tile_width, canvas_pattern_height},
+                grid_labels[index], grid_tooltips[index],
+                static_cast<std::size_t>(background_style_) == index, grid_icons[index]);
         }
     } else if (settings_page_ == SettingsPage::view) {
         const double field_x = panel_x + pad;
         const double field_width = panel_width - pad * 2.0;
-        const double row_height = std::max(36.0 * scale_, 32.0);
+        const double row_height = view_row_height;
         double row_y = panel_y + pad + header + 18.0 * scale_;
         add_control(
             UiAction::zoom_reset,
             {field_x, row_y, field_width, row_height},
-            "100%", "Reset zoom to 100%", false);
+            "Reset to 100%", "Reset zoom to 100%", false);
         row_y += row_height + gap;
         add_control(
             UiAction::zoom_fit_content,
@@ -1290,24 +1328,42 @@ void Toolbar::build_settings_panel()
     } else if (settings_page_ == SettingsPage::color_editor) {
         const double field_x = panel_x + pad;
         const double field_width = panel_width - pad * 2.0;
-        const double hue_y = panel_y + pad + header + 24.0 * scale_;
+        const double button_height = std::max(40.0 * scale_, 32.0);
+        const double preview_height = std::max(44.0 * scale_, 40.0);
+        const double hue_height = std::max(32.0 * scale_, 32.0);
+        const double done_y = panel_y + panel_height - pad - button_height;
+        const double recent_y = done_y - 40.0 * scale_;
+        const double preview_y = recent_y - 8.0 * scale_ - preview_height;
+        const double hue_y = preview_y - 12.0 * scale_ - hue_height;
+        const double sv_y = panel_y + 80.0 * scale_;
+        const double sv_height = hue_y - 32.0 * scale_ - sv_y;
         add_control(
             UiAction::custom_hue_field,
-            {field_x, hue_y, field_width, std::max(24.0 * scale_, 32.0)},
+            {field_x, hue_y, field_width, hue_height},
             {}, "Hue", false);
         add_control(
             UiAction::custom_sv_field,
-            {field_x, hue_y + 48.0 * scale_, field_width, 150.0 * scale_},
+            {field_x, sv_y, field_width, std::max(32.0, sv_height)},
             {}, "Saturation and brightness", false);
+        custom_color_preview_bounds_ = {field_x, preview_y, field_width, preview_height};
+        add_control(UiAction::custom_hex_field,
+            {field_x + preview_height + 8.0 * scale_, preview_y,
+                field_width - preview_height - 8.0 * scale_, preview_height},
+            {}, "Enter a HEX color, such as #2563EB", hex_editing_);
+        for (std::size_t index = 0U; index < recent_color_count_; ++index) {
+            add_control(static_cast<UiAction>(static_cast<int>(UiAction::recent_color_0) + static_cast<int>(index)),
+                {field_x + static_cast<double>(index) * (32.0 + 8.0) * scale_, recent_y,
+                    std::max(32.0 * scale_, 32.0), std::max(32.0 * scale_, 32.0)},
+                {}, "Use a recent custom color", same_rgb(custom_color(), recent_colors_[index]),
+                UiIcon::none, recent_colors_[index]);
+        }
+        const double footer_width = (field_width - 8.0 * scale_) * 0.5;
+        add_control(UiAction::custom_color_cancel,
+            {field_x, done_y, footer_width, button_height}, "Cancel", "Cancel this color change", false);
         add_control(
             UiAction::custom_color_done,
-            {
-                field_x,
-                hue_y + 222.0 * scale_,
-                field_width,
-                std::max(36.0 * scale_, 32.0),
-            },
-            "Done", "Use this color", true);
+            {field_x + footer_width + 8.0 * scale_, done_y, footer_width, button_height},
+            "Apply", "Use this color", hex_valid_, UiIcon::none, std::nullopt, hex_valid_);
     }
 
     settings_bounds_ = {panel_x, panel_y, panel_width, panel_height};
@@ -1317,11 +1373,21 @@ void Toolbar::build_settings_panel()
 void Toolbar::set_pointer(const Vec2d point) noexcept
 {
     pointer_ = point;
+    const UiControl* hovered = hovered_control();
+    const auto action = hovered == nullptr ? std::optional<UiAction>{} : std::optional<UiAction>{hovered->action};
+    if (action != tooltip_action_) {
+        tooltip_action_ = action;
+        tooltip_elapsed_ = 0.0;
+        tooltip_dismissed_ = false;
+    }
 }
 
 void Toolbar::clear_pointer() noexcept
 {
     pointer_.reset();
+    tooltip_action_.reset();
+    tooltip_elapsed_ = 0.0;
+    tooltip_dismissed_ = false;
     pressed_action_.reset();
     repeated_action_.reset();
     press_hold_time_ = 0.0;
@@ -1331,6 +1397,7 @@ void Toolbar::clear_pointer() noexcept
 void Toolbar::pointer_down(const Vec2d point) noexcept
 {
     pointer_ = point;
+    tooltip_dismissed_ = true;
     pressed_action_ = action_at(point);
     focus_from_keyboard_ = false;
     repeated_action_.reset();
@@ -1365,12 +1432,14 @@ std::optional<UiAction> Toolbar::take_repeated_action() noexcept
 
 void Toolbar::focus_next(const bool reverse) noexcept
 {
+    tooltip_dismissed_ = false;
     std::vector<UiAction> focusable;
     focusable.reserve(controls_.size());
     for (const auto& control : controls_) {
         if (control.enabled
             && (!settings_open_
                 || is_active_settings_action(control.action))
+            && (!is_property_control(control.action) || property_controls_active())
             && control.action != UiAction::custom_hue_field
             && control.action != UiAction::custom_sv_field) {
             focusable.push_back(control.action);
@@ -1394,6 +1463,16 @@ void Toolbar::focus_next(const bool reverse) noexcept
     focused_action_ = reverse
         ? focusable[(index + focusable.size() - 1U) % focusable.size()]
         : focusable[(index + 1U) % focusable.size()];
+    if (is_property_control(*focused_action_)) {
+        const UiRect bounds = find(*focused_action_)->bounds;
+        if (bounds.y < properties_clip_.y) {
+            set_properties_scroll(properties_scroll_ + bounds.y - properties_clip_.y);
+        } else if (bounds.y + bounds.height
+                > properties_clip_.y + properties_clip_.height) {
+            set_properties_scroll(properties_scroll_ + bounds.y + bounds.height
+                - properties_clip_.y - properties_clip_.height);
+        }
+    }
 }
 
 void Toolbar::clear_focus() noexcept
@@ -1404,8 +1483,27 @@ void Toolbar::clear_focus() noexcept
 
 void Toolbar::tick(const double elapsed_seconds) noexcept
 {
-    const double elapsed = std::clamp(elapsed_seconds, 0.0, 0.1);
+    const double elapsed = std::isfinite(elapsed_seconds)
+        ? std::clamp(elapsed_seconds, 0.0, 0.1) : 0.0;
+    if (properties_reveal_ != (properties_open_ ? 1.0 : 0.0)) {
+        properties_animation_elapsed_ = std::min(0.18,
+            properties_animation_elapsed_ + elapsed);
+        const double remaining = 1.0 - properties_animation_elapsed_ / 0.18;
+        const double eased = 1.0 - remaining * remaining * remaining;
+        const double target = properties_open_ ? 1.0 : 0.0;
+        properties_reveal_ = properties_animation_elapsed_ >= 0.18 ? target
+            : properties_animation_start_ + (target - properties_animation_start_) * eased;
+        apply_properties_animation();
+    }
     const UiControl* const hovered = hovered_control();
+    const auto action = hovered == nullptr ? std::optional<UiAction>{}
+        : std::optional<UiAction>{hovered->action};
+    if (action != tooltip_action_) {
+        tooltip_action_ = action;
+        tooltip_elapsed_ = 0.0;
+        tooltip_dismissed_ = false;
+    }
+    if (hovered != nullptr && !tooltip_dismissed_) tooltip_elapsed_ = std::min(0.45, tooltip_elapsed_ + elapsed);
     const auto approach = [elapsed](double& value, const double target, const double speed) {
         const double blend = 1.0 - std::exp(-speed * elapsed);
         value += (target - value) * blend;
@@ -1453,10 +1551,12 @@ bool Toolbar::animating() const noexcept
 {
     if (reveal_ < 1.0 || theme_transition_ < 1.0
         || settings_reveal_ != (settings_open_ ? 1.0 : 0.0)
+        || properties_reveal_ != (properties_open_ ? 1.0 : 0.0)
         || pressed_action_.has_value()) {
         return true;
     }
     const UiControl* const hovered = hovered_control();
+    if (hovered != nullptr && !tooltip_dismissed_ && tooltip_elapsed_ < 0.45) return true;
     for (const auto& control : controls_) {
         const UiAnimation& state =
             animations_[static_cast<std::size_t>(control.action)];
@@ -1524,17 +1624,218 @@ void Toolbar::set_about_scroll(const double position) noexcept
     about_scroll_ = std::clamp(position, 0.0, 1.0);
 }
 
+void Toolbar::toggle_properties() noexcept
+{
+    set_properties_open(!properties_open_);
+    close_settings_panel();
+}
+
+void Toolbar::close_properties() noexcept
+{
+    set_properties_open(false);
+}
+
+void Toolbar::set_properties_open(const bool open) noexcept
+{
+    if (properties_open_ == open) return;
+    properties_open_ = open;
+    properties_animation_start_ = properties_reveal_;
+    properties_animation_elapsed_ = 0.0;
+    if (!properties_laid_out_ || !properties_panel_index_.has_value()) {
+        properties_reveal_ = open ? 1.0 : 0.0;
+        properties_animation_elapsed_ = 0.18;
+    }
+    if (focused_action_.has_value() && is_property_control(*focused_action_)) clear_focus();
+    pressed_action_.reset();
+    repeated_action_.reset();
+    tooltip_dismissed_ = true;
+}
+
+bool Toolbar::property_controls_active() const noexcept
+{
+    return properties_open_ && properties_reveal_ == 1.0;
+}
+
+void Toolbar::apply_properties_animation() noexcept
+{
+    if (!properties_panel_index_.has_value() || properties_expanded_bounds_.width <= 0.0) return;
+    const auto mix = [&](const double closed, const double expanded) {
+        return closed + (expanded - closed) * properties_reveal_;
+    };
+    const auto interpolate = [&](const UiRect closed, const UiRect expanded) {
+        return UiRect{mix(closed.x, expanded.x), mix(closed.y, expanded.y),
+            mix(closed.width, expanded.width), mix(closed.height, expanded.height)};
+    };
+    const UiRect surface = interpolate(properties_tab_bounds_, properties_expanded_bounds_);
+    panels_[*properties_panel_index_].bounds = surface;
+    properties_bounds_ = properties_reveal_ > 0.0 ? surface : UiRect{};
+    for (auto& control : controls_) {
+        if (control.action == UiAction::properties_menu) {
+            control.bounds = interpolate(properties_tab_toggle_, properties_expanded_toggle_);
+            break;
+        }
+    }
+    const double offset = -16.0 * scale_ * (1.0 - properties_reveal_);
+    const double delta = offset - properties_content_offset_;
+    for (std::size_t i = property_begin_; i < property_end_; ++i) controls_[i].bounds.x += delta;
+    for (auto& divider : dividers_) {
+        divider.first.x += delta;
+        divider.second.x += delta;
+    }
+    properties_content_offset_ = offset;
+    const double pad = 12.0 * scale_;
+    properties_clip_ = {surface.x + pad, properties_expanded_clip_.y,
+        std::max(0.0, surface.width - 2.0 * pad),
+        std::max(0.0, std::min(properties_expanded_clip_.height,
+            surface.y + surface.height - pad - properties_expanded_clip_.y))};
+}
+
+void Toolbar::set_properties_scroll(const double position) noexcept
+{
+    const double next = std::clamp(position, 0.0, properties_scroll_limit_);
+    const double shift = properties_scroll_ - next;
+    properties_scroll_ = next;
+    for (std::size_t index = property_begin_; index < property_end_; ++index) {
+        controls_[index].bounds.y += shift;
+    }
+    for (auto& divider : dividers_) {
+        divider.first.y += shift;
+        divider.second.y += shift;
+    }
+    // Scrolling during a held click must not activate a newly exposed control.
+    pressed_action_.reset();
+    repeated_action_.reset();
+}
+
+void Toolbar::scroll_properties(const double delta) noexcept
+{
+    if (property_controls_active() && std::isfinite(delta)) {
+        set_properties_scroll(properties_scroll_ + delta);
+    }
+}
+
+bool Toolbar::properties_open() const noexcept { return properties_open_; }
+bool Toolbar::compact_properties() const noexcept { return compact_properties_; }
+UiRect Toolbar::properties_bounds() const noexcept { return properties_bounds_; }
+UiRect Toolbar::properties_surface_bounds() const noexcept
+{
+    return properties_panel_index_.has_value() ? panels_[*properties_panel_index_].bounds : UiRect{};
+}
+double Toolbar::properties_reveal() const noexcept { return properties_reveal_; }
+UiRect Toolbar::properties_clip() const noexcept { return properties_clip_; }
+UiRect Toolbar::properties_render_clip() const noexcept
+{
+    if (properties_clip_.width <= 0.0 || properties_clip_.height <= 0.0) return {};
+    const double margin = 2.0 * scale_;
+    return {properties_clip_.x - margin, properties_clip_.y - margin,
+        properties_clip_.width + margin * 2.0, properties_clip_.height + margin * 2.0};
+}
+double Toolbar::properties_scroll() const noexcept { return properties_scroll_; }
+double Toolbar::properties_scroll_limit() const noexcept
+{
+    return properties_reveal_ > 0.0 ? properties_scroll_limit_ : 0.0;
+}
+
+bool Toolbar::is_property_control(const UiAction action) const noexcept
+{
+    for (std::size_t index = property_begin_; index < property_end_; ++index) {
+        if (controls_[index].action == action) return true;
+    }
+    return false;
+}
+
 void Toolbar::begin_custom_color(
     const CustomColorTarget target, const Color color) noexcept
 {
     custom_color_target_ = target;
+    initial_custom_color_ = color;
+    cancel_hex_edit();
+    set_custom_color(color);
+    settings_page_ = SettingsPage::color_editor;
+    settings_open_ = true;
+}
+
+void Toolbar::set_custom_color(const Color color) noexcept
+{
     const Hsv hsv = to_hsv(color);
     custom_hue_ = hsv.hue;
     custom_saturation_ = hsv.saturation;
     custom_value_ = hsv.value;
-    settings_page_ = SettingsPage::color_editor;
-    settings_open_ = true;
 }
+
+Color Toolbar::initial_custom_color() const noexcept { return initial_custom_color_; }
+
+void Toolbar::remember_custom_color() noexcept
+{
+    const Color color = custom_color();
+    std::size_t existing = recent_color_count_;
+    for (std::size_t i = 0; i < recent_color_count_; ++i) {
+        if (same_rgb(recent_colors_[i], color)) { existing = i; break; }
+    }
+    const std::size_t last = std::min(existing, recent_colors_.size() - 1U);
+    for (std::size_t i = last; i > 0U; --i) recent_colors_[i] = recent_colors_[i - 1U];
+    recent_colors_[0] = color;
+    recent_color_count_ = std::min(recent_color_count_ + (existing == recent_color_count_ ? 1U : 0U),
+        recent_colors_.size());
+}
+
+void Toolbar::begin_hex_edit()
+{
+    const Color color = custom_color();
+    std::array<char, 8> text{};
+    static_cast<void>(std::snprintf(text.data(), text.size(), "#%02X%02X%02X",
+        static_cast<unsigned>(color.red), static_cast<unsigned>(color.green), static_cast<unsigned>(color.blue)));
+    hex_text_ = text.data();
+    hex_editing_ = true;
+    hex_replace_all_ = true;
+    hex_valid_ = true;
+}
+
+void Toolbar::insert_hex_text(const std::string_view text)
+{
+    if (!hex_editing_) return;
+    if (hex_replace_all_) { hex_text_.clear(); hex_replace_all_ = false; }
+    // Keep invalid input visible instead of silently changing the requested color.
+    hex_text_.append(text.substr(0U, 9U - std::min<std::size_t>(hex_text_.size(), 9U)));
+    hex_valid_ = true;
+}
+
+void Toolbar::erase_hex_text(const bool all)
+{
+    if (all || hex_replace_all_) hex_text_.clear();
+    else if (!hex_text_.empty()) hex_text_.pop_back();
+    hex_replace_all_ = false;
+    hex_valid_ = true;
+}
+
+void Toolbar::select_hex_text() noexcept { hex_replace_all_ = true; }
+bool Toolbar::finish_hex_edit()
+{
+    if (!hex_editing_) return true;
+    std::string_view text = hex_text_;
+    if (text.starts_with('#')) text.remove_prefix(1U);
+    hex_valid_ = text.size() == 6U || text.size() == 3U;
+    unsigned value = 0U;
+    for (const char digit : text) {
+        const int number = digit >= '0' && digit <= '9' ? digit - '0'
+            : (digit >= 'a' && digit <= 'f' ? digit - 'a' + 10
+                : (digit >= 'A' && digit <= 'F' ? digit - 'A' + 10 : -1));
+        if (number < 0) { hex_valid_ = false; break; }
+        value = value * 16U + static_cast<unsigned>(number);
+    }
+    if (!hex_valid_) return false;
+    if (text.size() == 3U) value = ((value >> 8U) & 15U) * 0x110000U
+        + ((value >> 4U) & 15U) * 0x1100U + (value & 15U) * 0x11U;
+    set_custom_color({static_cast<std::uint8_t>(value >> 16U),
+        static_cast<std::uint8_t>(value >> 8U), static_cast<std::uint8_t>(value), 255U});
+    cancel_hex_edit();
+    return true;
+}
+void Toolbar::cancel_hex_edit() noexcept { hex_editing_ = false; hex_valid_ = true; hex_replace_all_ = false; }
+bool Toolbar::hex_editing() const noexcept { return hex_editing_; }
+bool Toolbar::hex_valid() const noexcept { return hex_valid_; }
+bool Toolbar::hex_selected() const noexcept { return hex_replace_all_; }
+std::string_view Toolbar::hex_text() const noexcept { return hex_text_; }
 
 std::optional<Color> Toolbar::update_custom_color(
     const UiAction field, const Vec2d point) noexcept
@@ -1545,15 +1846,17 @@ std::optional<Color> Toolbar::update_custom_color(
         return std::nullopt;
     }
     if (field == UiAction::custom_hue_field) {
+        const UiRect track = color_field_bounds(field);
         custom_hue_ = std::clamp(
-            (point.x - control->bounds.x) / control->bounds.width,
+            (point.x - track.x) / track.width,
             0.0, 1.0);
     } else if (field == UiAction::custom_sv_field) {
+        const UiRect track = color_field_bounds(field);
         custom_saturation_ = std::clamp(
-            (point.x - control->bounds.x) / control->bounds.width,
+            (point.x - track.x) / track.width,
             0.0, 1.0);
         custom_value_ = 1.0 - std::clamp(
-            (point.y - control->bounds.y) / control->bounds.height,
+            (point.y - track.y) / track.height,
             0.0, 1.0);
     } else {
         return std::nullopt;
@@ -1569,6 +1872,8 @@ std::optional<UiAction> Toolbar::action_at(const Vec2d point) const noexcept
         if (control.enabled
             && (!settings_only
                 || is_active_settings_action(control.action))
+            && (!is_property_control(control.action)
+                || (property_controls_active() && properties_clip_.contains(point)))
             && control.bounds.contains(point)) {
             return control.action;
         }
@@ -1594,6 +1899,11 @@ UiRect Toolbar::error_bounds() const noexcept
     return error_bounds_;
 }
 
+UiRect Toolbar::status_bounds() const noexcept
+{
+    return status_bounds_;
+}
+
 Color Toolbar::current_color() const noexcept
 {
     return current_color_;
@@ -1616,6 +1926,7 @@ bool Toolbar::stroke_width_editing() const noexcept
 
 const UiControl* Toolbar::find(const UiAction action) const noexcept
 {
+    if (properties_reveal_ == 0.0 && is_property_control(action)) return nullptr;
     const auto found = std::find_if(
         controls_.begin(), controls_.end(),
         [action](const UiControl& control) { return control.action == action; });
@@ -1633,6 +1944,8 @@ const UiControl* Toolbar::hovered_control() const noexcept
     for (const auto& control : controls_) {
         if ((!settings_only
                 || is_active_settings_action(control.action))
+            && (!is_property_control(control.action)
+                || (property_controls_active() && properties_clip_.contains(*pointer_)))
             && control.bounds.contains(*pointer_)) {
             return &control;
         }
@@ -1655,6 +1968,13 @@ const UiControl* Toolbar::focused_tooltip_control() const noexcept
     return focus_from_keyboard_ ? focused_control() : nullptr;
 }
 
+const UiControl* Toolbar::tooltip_control() const noexcept
+{
+    if (tooltip_dismissed_) return nullptr;
+    if (focus_from_keyboard_) return focused_control();
+    return tooltip_elapsed_ >= 0.45 ? hovered_control() : nullptr;
+}
+
 bool Toolbar::is_active_settings_action(const UiAction action) const noexcept
 {
     if (!settings_open_) {
@@ -1662,6 +1982,15 @@ bool Toolbar::is_active_settings_action(const UiAction action) const noexcept
     }
     if (action == UiAction::settings_close) {
         return true;
+    }
+    if (settings_page_ == SettingsPage::file) {
+        return action == UiAction::new_board || action == UiAction::open_board
+            || action == UiAction::rename_file
+            || action == UiAction::save_copy || action == UiAction::save_as;
+    }
+    if (settings_page_ == SettingsPage::preferences) {
+        return action == UiAction::format_background
+            || action == UiAction::about;
     }
     if (settings_page_ == SettingsPage::view) {
         return action == UiAction::zoom_reset
@@ -1674,7 +2003,9 @@ bool Toolbar::is_active_settings_action(const UiAction action) const noexcept
     if (settings_page_ == SettingsPage::color_editor) {
         return action == UiAction::custom_hue_field
             || action == UiAction::custom_sv_field
-            || action == UiAction::custom_color_done;
+            || action == UiAction::custom_color_done || action == UiAction::custom_hex_field
+            || action == UiAction::custom_color_cancel
+            || (action >= UiAction::recent_color_0 && action <= UiAction::recent_color_5);
     }
     return action >= UiAction::edit_background_custom
         && action <= UiAction::grid_narrow_rule;
@@ -1714,6 +2045,13 @@ std::string_view Toolbar::error_message() const noexcept
 {
     return error_message_;
 }
+
+std::string_view Toolbar::status_message() const noexcept
+{
+    return status_message_;
+}
+
+std::string_view Toolbar::document_status() const noexcept { return document_status_; }
 
 double Toolbar::height() const noexcept
 {
@@ -1799,12 +2137,12 @@ bool Toolbar::style_color_editor_open() const noexcept
 
 bool Toolbar::settings_scrim_visible() const noexcept
 {
-    if (!settings_open_ || settings_page_ == SettingsPage::canvas) {
+    if (!settings_open_ || settings_page_ == SettingsPage::canvas
+        || settings_page_ == SettingsPage::file
+        || settings_page_ == SettingsPage::preferences) {
         return false;
     }
-    return settings_page_ != SettingsPage::color_editor
-        || custom_color_target_ == CustomColorTarget::stroke
-        || custom_color_target_ == CustomColorTarget::fill;
+    return settings_page_ != SettingsPage::color_editor;
 }
 
 SettingsPage Toolbar::settings_page() const noexcept
@@ -1842,6 +2180,27 @@ double Toolbar::custom_value() const noexcept
     return custom_value_;
 }
 
+UiRect Toolbar::custom_color_preview_bounds() const noexcept
+{
+    return custom_color_preview_bounds_;
+}
+
+UiRect Toolbar::color_field_bounds(const UiAction field) const noexcept
+{
+    if (field != UiAction::custom_hue_field && field != UiAction::custom_sv_field) return {};
+    const UiControl* const control = find(field);
+    if (control == nullptr) return {};
+    const double inset = (field == UiAction::custom_hue_field ? 6.0 : 2.0) * scale_;
+    UiRect track{control->bounds.x + inset, control->bounds.y + inset,
+        std::max(1.0, control->bounds.width - inset * 2.0),
+        std::max(1.0, control->bounds.height - inset * 2.0)};
+    if (field == UiAction::custom_hue_field) {
+        track.height = 18.0 * scale_;
+        track.y = control->bounds.y + (control->bounds.height - track.height) * 0.5;
+    }
+    return track;
+}
+
 BackgroundStyle Toolbar::background_style() const noexcept
 {
     return background_style_;
@@ -1856,6 +2215,8 @@ std::optional<Color> Toolbar::grid_color() const noexcept
 {
     return grid_color_;
 }
+
+
 
 Color Toolbar::color_for(const UiAction action)
 {

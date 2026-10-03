@@ -23,6 +23,8 @@ public:
         double zoom);
     [[nodiscard]] std::optional<double> zoom(
         const std::filesystem::path& board_path) const;
+    [[nodiscard]] bool light_theme() const noexcept;
+    void set_light_theme(bool light_theme);
     [[nodiscard]] const std::vector<std::filesystem::path>& entries() const noexcept;
 
 private:
@@ -34,6 +36,7 @@ private:
     std::size_t limit_;
     std::vector<std::filesystem::path> entries_;
     std::unordered_map<std::filesystem::path, double> zoom_levels_;
+    bool light_theme_{};
 };
 
 } // namespace sawer

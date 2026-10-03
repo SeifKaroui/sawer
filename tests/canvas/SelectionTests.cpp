@@ -24,6 +24,20 @@ sawer::Object line_object(
         });
 }
 
+TEST_CASE("selection toggle adds and removes an object")
+{
+    sawer::Selection selection;
+    const auto first = sawer::ObjectId::from_u64(1U);
+    const auto second = sawer::ObjectId::from_u64(2U);
+    selection.select(first);
+    selection.toggle(second);
+    REQUIRE(selection.contains(first));
+    REQUIRE(selection.contains(second));
+    selection.toggle(first);
+    REQUIRE_FALSE(selection.contains(first));
+    REQUIRE(selection.contains(second));
+}
+
 } // namespace
 
 TEST_CASE("hit testing chooses the topmost nearby segment")

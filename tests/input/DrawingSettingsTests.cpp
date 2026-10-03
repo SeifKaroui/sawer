@@ -49,3 +49,11 @@ TEST_CASE("drawing settings expose only meaningful stabilization levels")
     REQUIRE(settings.gaussian_sigma() == 0.0);
     REQUIRE(settings.sampling_distance() == 0.75);
 }
+
+TEST_CASE("mouse drawing always uses the Responsive filter")
+{
+    const sawer::DrawingSettings settings;
+    const auto responsive = settings.adaptive_stroke_settings();
+    REQUIRE(responsive.strength == Catch::Approx(0.32));
+    REQUIRE(responsive.max_trailing_pixels == 8.0);
+}

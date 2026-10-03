@@ -1,6 +1,7 @@
 #include "app/Application.hpp"
 
 #include "core/BuildInfo.hpp"
+#include "core/Filesystem.hpp"
 #include "core/Log.hpp"
 #include "geometry/StrokeProcessing.hpp"
 #include "image/Sha256.hpp"
@@ -169,7 +170,11 @@ void SDLCALL board_dialog_callback(
     if (filelist == nullptr) {
         result->error = SDL_GetError();
     } else if (filelist[0] != nullptr) {
-        result->path = std::filesystem::path{filelist[0]};
+        try {
+            result->path = path_from_utf8(filelist[0]);
+        } catch (const std::exception& error) {
+            result->error = error.what();
+        }
     }
 
     SDL_Event event{};
@@ -202,9 +207,13 @@ Application::Application(const bool hidden)
 
     if (char* const preference_path = SDL_GetPrefPath(
             BuildInfo::organization.data(), BuildInfo::name.data())) {
-        const std::filesystem::path preferences{preference_path};
+        const auto preferences = path_from_utf8(preference_path);
         recent_files_ = std::make_unique<RecentFiles>(
             preferences / "recent-files.json");
+        const Theme saved_theme = recent_files_->light_theme() ? Theme::light : Theme::dark;
+        if (toolbar_.theme() != saved_theme) {
+            toolbar_.toggle_theme();
+        }
         preview_cache_directory_ = preferences / "previews";
         if (!log::set_file(preferences / "Sawer.log")) {
             log::write(
@@ -337,7 +346,8 @@ void Application::render_during_live_resize(
                 view_mode_ == ViewMode::home ? &home_view_ : nullptr,
                 selection_preview_ ? &*selection_preview_ : nullptr,
                 unsaved_dialog_.visible() ? &unsaved_dialog_ : nullptr,
-                drawing_cursor ? &*drawing_cursor : nullptr));
+                drawing_cursor ? &*drawing_cursor : nullptr,
+                navigation_transition_.opacity()));
         }
     } catch (const std::exception& error) {
         log::write(log::Level::error, error.what());
@@ -354,7 +364,8 @@ int Application::run()
     bool renderer_recovery_pending = false;
     while (running) {
         const bool animations_active =
-            unsaved_dialog_.animating()
+            navigation_transition_.animating()
+            || unsaved_dialog_.animating()
             || (view_mode_ == ViewMode::home
                 ? home_view_.animating()
                 : toolbar_.animating());
@@ -415,11 +426,14 @@ int Application::run()
         // so restore vsync presentation. MSAA remains active throughout.
         renderer_->end_live_resize();
         const bool animate_frame =
-            unsaved_dialog_.animating()
+            navigation_transition_.animating()
+            || unsaved_dialog_.animating()
             || (view_mode_ == ViewMode::home
                 ? home_view_.animating()
                 : toolbar_.animating());
-        if (running && (redraw_requested || animate_frame)) {
+        // Present the tick that finishes an animation too: a tooltip can become
+        // visible on that tick even though the UI no longer needs more frames.
+        if (running && (redraw_requested || animations_active || animate_frame)) {
             try {
                 const auto drawing_cursor = drawing_cursor_preview();
                 if (!renderer_->render(
@@ -433,7 +447,8 @@ int Application::run()
                         unsaved_dialog_.visible()
                             ? &unsaved_dialog_
                             : nullptr,
-                        drawing_cursor ? &*drawing_cursor : nullptr)) {
+                        drawing_cursor ? &*drawing_cursor : nullptr,
+                        navigation_transition_.opacity())) {
                     SDL_Delay(16U);
                 }
                 renderer_recovery_pending = false;
@@ -681,7 +696,7 @@ int Application::run_input_test()
     SDL_Event down{};
     down.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
     down.button.button = SDL_BUTTON_LEFT;
-    down.button.x = 320.0F;
+    down.button.x = 360.0F;
     down.button.y = 240.0F;
     handle_event(down, running);
 
@@ -724,7 +739,7 @@ int Application::run_input_test()
         SDL_Event tool_down{};
         tool_down.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
         tool_down.button.button = SDL_BUTTON_LEFT;
-        tool_down.button.x = 300.0F + offset;
+        tool_down.button.x = 360.0F + offset;
         tool_down.button.y = 220.0F;
         handle_event(tool_down, running);
 
@@ -737,11 +752,9 @@ int Application::run_input_test()
             const auto* const preview = active_draft_.has_value()
                 ? std::get_if<Stroke>(&active_draft_->geometry)
                 : nullptr;
-            if (preview == nullptr
-                || preview->points.size()
-                    <= active_raw_stroke_points_.size()) {
+            if (preview == nullptr || preview->points.size() < 2U) {
                 throw std::runtime_error{
-                    "Live pencil preview was not curve-interpolated"};
+                    "Live pencil preview did not extend incrementally"};
             }
         }
 
@@ -893,6 +906,13 @@ int Application::run_input_test()
 
 int Application::run_ui_input_test()
 {
+    if (recent_files_ && (toolbar_.theme() == Theme::light) != recent_files_->light_theme()) {
+        log::write(log::Level::error, "Saved theme was not restored on startup");
+        return 1;
+    }
+    // Exercising theme controls must not persist test choices
+    // into the user's preferences.
+    recent_files_.reset();
     const UiControl* const line_button = toolbar_.find(UiAction::line);
     if (line_button == nullptr) {
         log::write(log::Level::error, "Toolbar omitted the line control");
@@ -934,7 +954,7 @@ int Application::run_ui_input_test()
     SDL_Event canvas_down{};
     canvas_down.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
     canvas_down.button.button = SDL_BUTTON_LEFT;
-    canvas_down.button.x = 320.0F;
+    canvas_down.button.x = 360.0F;
     canvas_down.button.y = canvas_y;
     handle_event(canvas_down, running);
 
@@ -988,8 +1008,16 @@ int Application::run_ui_input_test()
     }
 
     const auto click_control = [&](const UiAction action) {
-        const UiControl* const control = toolbar_.find(action);
+        const UiControl* control = toolbar_.find(action);
         if (control == nullptr) return false;
+        if (toolbar_.is_property_control(action)
+            && !toolbar_.properties_clip().contains({control->bounds.x + control->bounds.width * 0.5,
+                control->bounds.y + control->bounds.height * 0.5})) {
+            toolbar_.scroll_properties(control->bounds.y + control->bounds.height
+                - toolbar_.properties_clip().y - toolbar_.properties_clip().height);
+            sync_toolbar();
+            control = toolbar_.find(action);
+        }
         const float control_x = static_cast<float>(
             control->bounds.x + control->bounds.width * 0.5);
         const float control_y = static_cast<float>(
@@ -1002,26 +1030,85 @@ int Application::run_ui_input_test()
         handle_event(ui_up, running);
         return true;
     };
-    if (!click_control(UiAction::pencil)
-        || !click_control(UiAction::stabilization_light)
-        || drawing_settings_.stabilization
-            != StrokeStabilization::light
-        || !click_control(UiAction::stabilization_default)
-        || drawing_settings_.stabilization
-            != StrokeStabilization::standard
-        || !click_control(UiAction::stabilization_strong)
-        || drawing_settings_.stabilization
-            != StrokeStabilization::strong) {
-        log::write(
-            log::Level::error,
-            "Stroke stabilization preset control failed");
+    // Color editing is a pending change until Apply; invalid text, Cancel,
+    // theme changes, and dismissal must leave both drawing and canvas intact.
+    const Color original_stroke = current_style_.stroke;
+    activate_ui_action(UiAction::toggle_theme);
+    activate_ui_action(UiAction::toggle_theme);
+    if (current_style_.stroke != original_stroke || !toolbar_.properties_open()) {
+        log::write(log::Level::error, "Theme change altered drawing style or panel visibility");
         return 1;
     }
-    if (!click_control(UiAction::stabilization_off)
-        || drawing_settings_.stabilization != StrokeStabilization::off) {
-        log::write(
-            log::Level::error,
-            "Stroke stabilization controls failed");
+    if (!click_control(UiAction::pencil) || !click_control(UiAction::edit_stroke_custom)
+        || !click_control(UiAction::custom_hex_field)) return 1;
+    SDL_Event text_input{};
+    text_input.type = SDL_EVENT_TEXT_INPUT;
+    text_input.text.text = "#invalid";
+    handle_event(text_input, running);
+    SDL_Event enter{};
+    enter.type = SDL_EVENT_KEY_DOWN;
+    enter.key.scancode = SDL_SCANCODE_RETURN;
+    handle_event(enter, running);
+    if (toolbar_.hex_valid() || !toolbar_.hex_editing() || current_style_.stroke != original_stroke) {
+        log::write(log::Level::error, "Invalid HEX input changed the drawing color");
+        return 1;
+    }
+    if (!click_control(UiAction::custom_color_cancel) || toolbar_.settings_open()
+        || toolbar_.hex_editing() || current_style_.stroke != original_stroke) return 1;
+    if (!click_control(UiAction::edit_stroke_custom) || !click_control(UiAction::custom_hex_field)) return 1;
+    text_input.text.text = "#39c";
+    handle_event(text_input, running);
+    if (!click_control(UiAction::custom_color_done)
+        || current_style_.stroke != Color{51U, 153U, 204U, 255U}
+        || toolbar_.settings_open() || toolbar_.hex_editing() || document_.size() != 1U) {
+        log::write(log::Level::error, "HEX Apply failed or leaked into the canvas");
+        return 1;
+    }
+    const Color applied_stroke = current_style_.stroke;
+    if (!click_control(UiAction::edit_stroke_custom)) return 1;
+    toolbar_.set_custom_color({200U, 20U, 70U, 255U});
+    sync_toolbar();
+    canvas_down.button.x = 800.0F;
+    canvas_down.button.y = 600.0F;
+    canvas_up.button.x = canvas_down.button.x;
+    canvas_up.button.y = canvas_down.button.y;
+    handle_event(canvas_down, running);
+    handle_event(canvas_up, running);
+    if (toolbar_.settings_open() || active_draft_.has_value()
+        || current_style_.stroke != applied_stroke || document_.size() != 1U) {
+        log::write(log::Level::error, "Color popover dismissal applied color or started a drawing");
+        return 1;
+    }
+    const Color original_background = background_color_;
+    const auto original_grid = grid_color_;
+    activate_ui_action(UiAction::format_background);
+    activate_ui_action(UiAction::edit_background_custom);
+    toolbar_.begin_hex_edit();
+    text_input.text.text = "#123456";
+    handle_event(text_input, running);
+    handle_event(enter, running);
+    activate_ui_action(UiAction::custom_color_cancel);
+    if (background_color_ != original_background) {
+        log::write(log::Level::error, "Cancel did not restore background preview");
+        return 1;
+    }
+    activate_ui_action(UiAction::edit_grid_custom);
+    toolbar_.begin_hex_edit();
+    text_input.text.text = "#abcdef";
+    handle_event(text_input, running);
+    handle_event(enter, running);
+    activate_ui_action(UiAction::custom_color_cancel);
+    if (grid_color_ != original_grid) {
+        log::write(log::Level::error, "Cancel did not restore automatic grid color");
+        return 1;
+    }
+    activate_ui_action(UiAction::settings_close);
+    current_style_.stroke = original_stroke;
+    sync_toolbar();
+
+    const auto smoothing = drawing_settings_.adaptive_stroke_settings();
+    if (smoothing.strength != 0.32 || smoothing.max_trailing_pixels != 8.0) {
+        log::write(log::Level::error, "Drawing did not use Responsive smoothing");
         return 1;
     }
 
@@ -1052,7 +1139,311 @@ int Application::run_ui_input_test()
             "Second Escape did not return to Select");
         return 1;
     }
+
+    // All rename entry points share the editor and consume their input before
+    // the canvas sees it. Confirming an unchanged title performs no file rename.
+    const std::string original_title{toolbar_.filename()};
+    const std::size_t original_object_count = document_.size();
+    for (const UiAction action : {UiAction::rename_button, UiAction::rename_file}) {
+        if (action == UiAction::rename_file
+            && (!click_control(UiAction::file_menu) || run_frame_test(1U) != 0)) return 1;
+        if (!click_control(action) || !renaming_ || toolbar_.settings_open()
+            || rename_text_ != original_title || rename_anchor_ != 0U
+            || rename_cursor_ != rename_text_.size()) {
+            log::write(log::Level::error, "Rename control failed to open the inline editor");
+            return 1;
+        }
+        if (run_frame_test(1U) != 0) return 1;
+        handle_event(enter, running);
+        if (renaming_ || toolbar_.filename() != original_title
+            || document_.size() != original_object_count) {
+            log::write(log::Level::error, "Rename confirmation changed board content");
+            return 1;
+        }
+    }
+    SDL_Event rename_key{};
+    rename_key.type = SDL_EVENT_KEY_DOWN;
+    rename_key.key.scancode = SDL_SCANCODE_F2;
+    handle_event(rename_key, running);
+    if (!renaming_) {
+        log::write(log::Level::error, "F2 did not open board rename");
+        return 1;
+    }
+    text_input.text.text = "Canceled rename";
+    handle_event(text_input, running);
+    handle_event(escape, running);
+    if (renaming_ || toolbar_.filename() != original_title
+        || document_.size() != original_object_count) {
+        log::write(log::Level::error, "Escape did not cancel rename without changing the board");
+        return 1;
+    }
+
+    if (!click_control(UiAction::file_menu)
+        || toolbar_.settings_page() != SettingsPage::file
+        || toolbar_.find(board_file_.has_value() ? UiAction::save_copy : UiAction::save_as) == nullptr
+        || !click_control(UiAction::settings_close)
+        || !click_control(UiAction::preferences_menu)
+        || toolbar_.settings_page() != SettingsPage::preferences
+        || !click_control(UiAction::format_background)
+        || toolbar_.settings_page() != SettingsPage::canvas
+        || !click_control(UiAction::settings_close)
+        || !click_control(UiAction::zoom_menu)
+        || toolbar_.settings_page() != SettingsPage::view
+        || run_frame_test(1U) != 0
+        || !click_control(UiAction::settings_close)) {
+        log::write(log::Level::error, "Board header menu navigation failed");
+        return 1;
+    }
+    if (!SDL_SetWindowSize(window_.get(), 480, 420)
+        || !SDL_SyncWindow(window_.get())) {
+        throw_sdl("Compact toolbar test window-size change");
+    }
+    static_cast<void>(update_viewport());
+    current_tool_ = Tool::pencil;
+    toolbar_.close_properties();
+    sync_toolbar();
+    const auto render_properties_transition = [&] {
+        for (int frame = 0; frame < 4; ++frame) {
+            toolbar_.tick(0.05);
+            bool submitted = false;
+            for (int attempt = 0; attempt < 30 && !submitted; ++attempt) {
+                submitted = renderer_->render(camera_, document_, nullptr, toolbar_, selection_);
+                if (!submitted) SDL_Delay(16U);
+            }
+            if (!submitted) return false;
+        }
+        return true;
+    };
+    if (!render_properties_transition() || toolbar_.properties_reveal() != 0.0) {
+        log::write(log::Level::error, "Style retract animation failed to settle or render");
+        return 1;
+    }
+    if (!click_control(UiAction::properties_menu)
+        || !toolbar_.properties_open()
+        || !render_properties_transition()
+        || toolbar_.properties_reveal() != 1.0
+        || toolbar_.properties_scroll_limit() <= 0.0) {
+        log::write(log::Level::error, "Compact tool properties did not open");
+        return 1;
+    }
+    const double zoom_before_properties_scroll = camera_.zoom();
+    const UiRect properties = toolbar_.properties_bounds();
+    SDL_Event properties_wheel{};
+    properties_wheel.type = SDL_EVENT_MOUSE_WHEEL;
+    properties_wheel.wheel.mouse_x = static_cast<float>(properties.x + properties.width * 0.5);
+    properties_wheel.wheel.mouse_y = static_cast<float>(properties.y + properties.height * 0.5);
+    properties_wheel.wheel.y = -3.0F;
+    handle_event(properties_wheel, running);
+    if (camera_.zoom() != zoom_before_properties_scroll
+        || toolbar_.properties_scroll() <= 0.0 || document_.size() != 1U) {
+        log::write(log::Level::error, "Properties scrolling leaked into the canvas");
+        return 1;
+    }
+    const int compact_render_result = run_frame_test(1U);
+    if (compact_render_result != 0) return compact_render_result;
+    handle_event(escape, running);
+    if (toolbar_.properties_open() || current_tool_ != Tool::pencil) {
+        log::write(log::Level::error, "Escape did not dismiss compact properties");
+        return 1;
+    }
+    // Shape and submit the document fonts and a wrapped Unicode filename
+    // tooltip in the compact header, including an atlas rebuild at a new scale.
+    Toolbar header_fixture;
+    header_fixture.close_properties();
+    const std::string long_title = "Résumé — مخطط — 計画 — " + std::string(180U, 'W');
+    for (const double scale : {1.0, 1.5}) {
+        const Vec2d viewport = camera_.viewport();
+        header_fixture.update(viewport.x, viewport.y, scale, Tool::pencil, {},
+            false, false, false, camera_.zoom(), long_title, false, {},
+            BackgroundStyle::dot, {});
+        const UiRect title = header_fixture.filename_bounds();
+        header_fixture.set_pointer({title.x + title.width * 0.5,
+            title.y + title.height * 0.5});
+        for (int tick = 0; tick < 10; ++tick) header_fixture.tick(0.1);
+        const UiControl* tooltip = header_fixture.tooltip_control();
+        if (tooltip == nullptr || tooltip->tooltip != long_title) {
+            log::write(log::Level::error, "Document header lost its full filename tooltip");
+            return 1;
+        }
+        bool submitted = false;
+        for (int attempt = 0; attempt < 60 && !submitted; ++attempt) {
+            submitted = renderer_->render(camera_, document_, nullptr,
+                header_fixture, selection_);
+            if (!submitted) SDL_Delay(1U);
+        }
+        if (!submitted) {
+            log::write(log::Level::error, "Document header rendering failed");
+            return 1;
+        }
+        if (renderer_->stats().tooltip_draw_calls == 0U) {
+            log::write(log::Level::error, "Filename tooltip was omitted from the final overlay");
+            return 1;
+        }
+        header_fixture.toggle_theme();
+    }
+    // Named pattern previews and palette controls must render in both full
+    // and compact layouts, including font-atlas changes and dark surfaces.
+    for (const Vec2d size : {Vec2d{480.0, 420.0}, Vec2d{1280.0, 720.0}}) {
+        if (!SDL_SetWindowSize(window_.get(), static_cast<int>(size.x), static_cast<int>(size.y))
+            || !SDL_SyncWindow(window_.get())) throw_sdl("Canvas settings test resize");
+        static_cast<void>(update_viewport());
+        for (const double scale : {1.0, 1.5}) {
+            Toolbar canvas_fixture;
+            canvas_fixture.toggle_settings_panel(SettingsPage::canvas);
+            for (int theme = 0; theme < 2; ++theme) {
+                canvas_fixture.update(camera_.viewport().x, camera_.viewport().y, scale,
+                    Tool::pencil, {}, false, false, false, camera_.zoom(), "Board", false,
+                    {}, BackgroundStyle::dot, {240U, 242U, 247U, 255U});
+                for (int frame = 0; frame < 10; ++frame) canvas_fixture.tick(0.1);
+                bool submitted = false;
+                for (int attempt = 0; attempt < 60 && !submitted; ++attempt) {
+                    submitted = renderer_->render(camera_, document_, nullptr, canvas_fixture, selection_);
+                    if (!submitted) SDL_Delay(1U);
+                }
+                if (!submitted || renderer_->stats().text_draw_calls == 0U) {
+                    log::write(log::Level::error, "Canvas settings preview labels failed to render");
+                    return 1;
+                }
+                canvas_fixture.toggle_theme();
+            }
+        }
+    }
+    // Hovering the style header may place its tooltip over the Stroke label.
+    // Exercise the final geometry/text overlay and clearing it across frames.
+    Toolbar hover_fixture;
+    const Vec2d viewport = camera_.viewport();
+    hover_fixture.update(viewport.x, viewport.y, display_scale_, Tool::rectangle,
+        {}, false, false, false, camera_.zoom(), "Board", false, {}, BackgroundStyle::dot, {});
+    const UiRect hover_button = hover_fixture.find(UiAction::properties_menu)->bounds;
+    hover_fixture.set_pointer({hover_button.x + hover_button.width * 0.5,
+        hover_button.y + hover_button.height * 0.5});
+    for (int tick = 0; tick < 10; ++tick) hover_fixture.tick(0.1);
+    const auto render_hover_fixture = [&](const UnsavedDialog* dialog = nullptr) {
+        for (int attempt = 0; attempt < 60; ++attempt) {
+            if (renderer_->render(camera_, document_, nullptr, hover_fixture,
+                    selection_, nullptr, nullptr, dialog)) return true;
+            SDL_Delay(1U);
+        }
+        return false;
+    };
+    for (int theme = 0; theme < 2; ++theme) {
+        if (!render_hover_fixture() || renderer_->stats().tooltip_draw_calls == 0U) {
+            log::write(log::Level::error, "Style tooltip final overlay failed");
+            return 1;
+        }
+        hover_fixture.toggle_theme();
+        for (int tick = 0; tick < 10; ++tick) hover_fixture.tick(0.1);
+    }
+    UnsavedDialog modal;
+    modal.open(viewport.x, viewport.y, display_scale_, "Board");
+    modal.tick(0.1);
+    if (!render_hover_fixture(&modal) || renderer_->stats().tooltip_draw_calls != 0U) {
+        log::write(log::Level::error, "Toolbar tooltip covered an unsaved-work dialog");
+        return 1;
+    }
+    if (!render_hover_fixture() || renderer_->stats().tooltip_draw_calls == 0U) return 1;
+    hover_fixture.clear_pointer();
+    hover_fixture.clear_focus();
+    if (!render_hover_fixture() || renderer_->stats().tooltip_draw_calls != 0U) {
+        log::write(log::Level::error, "Dismissed tooltip remained in the final overlay");
+        return 1;
+    }
     return run_frame_test(1U);
+}
+
+int Application::run_navigation_transition_test()
+{
+    Document fixture;
+    static_cast<void>(fixture.insert(Object::make_rectangle(
+        ObjectId::from_u64(1U), 0, {{-80.0, -60.0}, {80.0, 60.0}},
+        {.stroke = {220U, 35U, 45U, 255U},
+            .fill = Color{220U, 35U, 45U, 255U}, .stroke_width = 4.0})));
+    set_zoom(1.0);
+    for (int tick = 0; tick < 20; ++tick) toolbar_.tick(0.1);
+
+    // Check the final composite, including UI labels, with and without MSAA.
+    // These fixtures never open a real board or write platform preferences.
+    for (const bool antialiasing : {true, false}) {
+        renderer_.reset();
+        renderer_ = std::make_unique<GpuRenderer>(*window_, antialiasing);
+        for (int theme = 0; theme < 2; ++theme) {
+            if (theme != 0) toolbar_.toggle_theme();
+            for (int tick = 0; tick < 20; ++tick) toolbar_.tick(0.1);
+            HomeView home;
+            home.update(camera_.viewport().x, camera_.viewport().y,
+                display_scale_, toolbar_.theme(), {});
+            for (int tick = 0; tick < 20; ++tick) home.tick(0.1);
+            for (const bool home_visible : {false, true}) {
+                Vec2d point = camera_.world_to_screen({0.0, 0.0});
+                if (home_visible) {
+                    for (const auto& control : home.controls()) {
+                        if (control.action == UiAction::home_new_board) {
+                            // Include the label as well as its primary surface.
+                            point = {control.bounds.x + control.bounds.width * 0.5,
+                                control.bounds.y + control.bounds.height * 0.5};
+                        }
+                    }
+                }
+                int pixel_width = 0;
+                int pixel_height = 0;
+                if (!SDL_GetWindowSizeInPixels(window_.get(), &pixel_width, &pixel_height)) return 1;
+                const auto x = static_cast<std::uint32_t>(
+                    point.x * static_cast<double>(pixel_width) / camera_.viewport().x);
+                const auto y = static_cast<std::uint32_t>(
+                    point.y * static_cast<double>(pixel_height) / camera_.viewport().y);
+                const auto capture = [&](const double opacity) {
+                    for (int retry = 0; retry < 30; ++retry) {
+                        renderer_->request_rendered_pixel(x, y);
+                        if (renderer_->render(camera_, fixture, nullptr, toolbar_, selection_,
+                                home_visible ? &home : nullptr, nullptr, nullptr, nullptr, opacity)) {
+                            return renderer_->read_rendered_pixel(x, y);
+                        }
+                        SDL_PumpEvents();
+                        SDL_Delay(1U);
+                    }
+                    return std::optional<std::array<std::uint8_t, 4>>{};
+                };
+                const auto covered = capture(1.0);
+                const auto revealed = capture(0.0);
+                const auto midpoint = capture(0.5);
+                if (!covered || !revealed || !midpoint) return 1;
+                const auto background = home_visible
+                    ? (toolbar_.theme() == Theme::light
+                        ? std::array<int, 3>{238, 240, 243}
+                        : std::array<int, 3>{15, 17, 20})
+                    : (toolbar_.theme() == Theme::light
+                        ? std::array<int, 3>{247, 248, 250}
+                        : std::array<int, 3>{17, 19, 21});
+                bool distinct = false;
+                for (std::size_t channel = 0; channel < 3U; ++channel) {
+                    const int start = (*covered)[channel];
+                    const int end = (*revealed)[channel];
+                    const int middle = (*midpoint)[channel];
+                    if (std::abs(start - background[channel]) > 3
+                        || std::abs(middle - (start + end) / 2) > 3) {
+                        std::ostringstream message;
+                        message << "Navigation fade pixel mismatch: home=" << home_visible
+                            << ", MSAA=" << antialiasing << ", theme=" << theme
+                            << ", channel=" << channel << ", covered=" << start
+                            << ", revealed=" << end << ", midpoint=" << middle
+                            << ", background=" << background[channel];
+                        log::write(log::Level::error, message.str());
+                        return 1;
+                    }
+                    distinct = distinct || std::abs(start - end) > 5;
+                }
+                if (!distinct || !capture(0.0)) return 1;
+                const auto& stats = renderer_->stats();
+                if (stats.scene_upload_bytes != 0U || stats.thumbnail_upload_bytes != 0U
+                    || stats.tessellated_objects != 0U) {
+                    log::write(log::Level::error,
+                        "Navigation fade rebuilt unchanged retained content");
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
 }
 
 int Application::run_home_test()
@@ -1067,9 +1458,26 @@ int Application::run_home_test()
     preview_cache_directory_ = directory / "preferences" / "previews";
     preview_cache_.clear();
 
+    const auto check_fresh_startup = [this]() {
+        start_session();
+        tick_ui();
+        return view_mode_ == ViewMode::board
+            && !board_file_.has_value() && document_.size() == 0U
+            && !document_.dirty() && !has_unsaved_untitled()
+            && toolbar_.filename() == "Untitled" && camera_.zoom() == 1.0
+            && navigation_history_.size() == 1U
+            && navigation_history_index_ == 0U
+            && preview_tasks_.empty();
+    };
+    if (!check_fresh_startup()) {
+        log::write(log::Level::error, "Startup without recent files did not create an Untitled board");
+        return 1;
+    }
+
     // The empty recent-files screen must render cleanly.
     view_mode_ = ViewMode::home;
     refresh_home();
+    tick_ui();
     static_cast<void>(renderer_->render(
         camera_, document_, nullptr, toolbar_, selection_, &home_view_));
 
@@ -1109,7 +1517,25 @@ int Application::run_home_test()
 
     recent_files_->touch(directory / "Board one.sawer");
     recent_files_->touch(directory / "Board two.sawer");
+    if (!check_fresh_startup() || recent_files_->entries().size() != 2U) {
+        log::write(log::Level::error, "Startup with recent files did not create an Untitled board");
+        return 1;
+    }
+    // An explicit launch path must take precedence over the fresh-board default.
+    open_board(directory / "Board one.sawer");
+    const ObjectId opened_board_identity = document_.cache_identity();
+    start_session();
+    if (view_mode_ != ViewMode::board || !board_file_.has_value()
+        || board_file_->path() != directory / "Board one.sawer"
+        || document_.size() != 702U
+        || document_.cache_identity() != opened_board_identity) {
+        log::write(log::Level::error, "Startup replaced the explicitly opened board");
+        return 1;
+    }
+    new_board();
+    recent_files_->touch(directory / "Board two.sawer");
     enter_home();
+    tick_ui();
     const Uint64 preview_deadline = SDL_GetTicks() + 5'000U;
     while (!preview_tasks_.empty() && SDL_GetTicks() < preview_deadline) {
         static_cast<void>(poll_background_previews());
@@ -1161,6 +1587,28 @@ int Application::run_home_test()
         log::write(log::Level::error, "Home did not list both recent boards");
         result = 1;
     }
+    // Full timestamps must composite above card labels in either theme and
+    // disappear without leaving extra draw work after hover ends.
+    for (const Theme theme : {Theme::light, Theme::dark}) {
+        home_view_.relayout(camera_.viewport().x, camera_.viewport().y,
+            display_scale_, theme);
+        const UiRect date = home_view_.board_date_bounds(0U);
+        home_view_.set_pointer({date.x + 4.0, date.y + 4.0});
+        for (int frame = 0; frame < 5; ++frame) home_view_.tick(0.1);
+        if (!renderer_->render(camera_, document_, nullptr, toolbar_, selection_, &home_view_)
+            || renderer_->stats().tooltip_draw_calls == 0U) {
+            log::write(log::Level::error, "Home timestamp tooltip did not render");
+            result = 1;
+        }
+        home_view_.clear_pointer();
+        if (!renderer_->render(camera_, document_, nullptr, toolbar_, selection_, &home_view_)
+            || renderer_->stats().tooltip_draw_calls != 0U) {
+            log::write(log::Level::error, "Home timestamp tooltip survived hover exit");
+            result = 1;
+        }
+    }
+    refresh_home();
+
     const bool any_preview = std::ranges::any_of(
         home_view_.boards(),
         [](const HomeBoard& board) {
@@ -1204,6 +1652,34 @@ int Application::run_home_test()
             "Home preview omitted objects after the old snapshot cap");
         result = 1;
     }
+
+    // Exercise card shadows and hover/press/focus outlines in both palettes.
+    // Feedback must reuse the cached preview rather than upload it again.
+    for (const Theme theme : {Theme::light, Theme::dark}) {
+        home_view_.relayout(
+            camera_.viewport().x, camera_.viewport().y, display_scale_, theme);
+        home_view_.clear_pointer();
+        home_view_.clear_focus();
+        const UiRect card = home_view_.controls().front().bounds;
+        const Vec2d point{card.x + 4.0, card.y + 4.0};
+        for (int state = 0; state < 4; ++state) {
+            if (state == 1) home_view_.set_pointer(point);
+            if (state == 2) home_view_.pointer_down(point);
+            if (state == 3) {
+                static_cast<void>(home_view_.pointer_up(point));
+                home_view_.clear_pointer();
+            }
+            for (int frame = 0; frame < 6; ++frame) home_view_.tick(0.1);
+            if (!renderer_->render(
+                    camera_, document_, nullptr, toolbar_, selection_, &home_view_)
+                || renderer_->stats().thumbnail_upload_bytes != 0U
+                || home_view_.controls().front().bounds != card) {
+                log::write(log::Level::error, "Home card feedback regression");
+                result = 1;
+            }
+        }
+    }
+    home_view_.clear_focus();
 
     // Responsive and DPI transitions rebuild the font atlas. Exercise several
     // generations in quick succession so stale GPU atlas reuse cannot return.
@@ -1401,9 +1877,8 @@ int Application::run_home_test()
         update_window_title();
     }
 
-    // Opening a recent board from home must fully
-    // load before the board view accepts input, so a quick first stroke is not
-    // discarded by the pending load swapping in the document.
+    // Home switches to the canvas immediately, but edits become available
+    // only after the worker installs the incoming document.
     const auto nav_dir = std::filesystem::temp_directory_path()
         / ("sawer-home-nav-" + ObjectId::random().to_string());
     std::filesystem::create_directories(nav_dir, error);
@@ -1423,20 +1898,41 @@ int Application::run_home_test()
     }
     recent_files_->touch(nav_dir / "Content.sawer");
     enter_home();
+    const auto wait_for_open = [this]() {
+        const Uint64 deadline = SDL_GetTicks() + 5'000U;
+        while (background_open_.valid() && SDL_GetTicks() < deadline) {
+            poll_background_open();
+            SDL_Delay(1U);
+        }
+        return !background_open_.valid();
+    };
     if (home_view_.boards().empty()) {
         log::write(log::Level::error, "Recent list showed no boards");
         result = 1;
     } else {
         open_board_from_home(0U);
-        // The synchronous open must leave the board fully loaded and ready to
-        // draw immediately, with no pending background open.
-        if (view_mode_ != ViewMode::board || !board_file_.has_value()
-            || background_open_.valid() || document_.size() != 1U) {
+        tick_ui();
+        if (view_mode_ != ViewMode::board || !background_open_.valid()
+            || board_file_.has_value() || document_.size() != 0U
+            || toolbar_.filename() != "Content"
+            || toolbar_.document_status() != "Opening..."
+            || toolbar_.status_message().empty()
+            || drawing_cursor_preview().has_value()
+            || navigation_transition_.opacity() != 1.0) {
             log::write(
-                log::Level::error, "Board did not load correctly from home");
+                log::Level::error, "Home did not show the loading canvas immediately");
             result = 1;
         } else {
-            const std::size_t before = document_.size();
+            static_cast<void>(renderer_->render(
+                camera_, document_, nullptr, toolbar_, selection_,
+                nullptr, nullptr, nullptr, nullptr, navigation_transition_.opacity()));
+            for (const auto& control : toolbar_.controls()) {
+                if (control.enabled) {
+                    log::write(log::Level::error, "Loading canvas exposed an active control");
+                    result = 1;
+                    break;
+                }
+            }
             current_tool_ = Tool::line;
             bool running = true;
             SDL_Event down{};
@@ -1455,8 +1951,36 @@ int Application::run_home_test()
             up.button.button = SDL_BUTTON_LEFT;
             up.button.x = 540.0F;
             up.button.y = 380.0F;
+            // Hold the mouse across completion. Neither the press nor its
+            // eventual release may create a stroke in the loaded board.
+            SDL_Event paste{};
+            paste.type = SDL_EVENT_KEY_DOWN;
+            paste.key.scancode = SDL_SCANCODE_V;
+            paste.key.mod = SDL_KMOD_CTRL;
+            handle_event(paste, running);
+            if (active_draft_.has_value() || left_button_down_
+                || clipboard_paste_.valid() || clipboard_fragment_paste_.valid()
+                || document_.size() != 0U) {
+                log::write(log::Level::error, "Loading canvas accepted an edit");
+                result = 1;
+            }
+            if (!wait_for_open()) {
+                log::write(log::Level::error, "Home background open timed out");
+                return 1;
+            }
             handle_event(up, running);
-            poll_background_open();
+            if (!board_file_.has_value() || document_.size() != 1U
+                || toolbar_.document_status() != "Saved"
+                || !toolbar_.status_message().empty()
+                || background_open_home_path_.has_value()
+                || !toolbar_.find(UiAction::line)->enabled) {
+                log::write(log::Level::error, "Loaded board did not become ready cleanly");
+                result = 1;
+            }
+            const std::size_t before = document_.size();
+            handle_event(down, running);
+            handle_event(motion, running);
+            handle_event(up, running);
             if (document_.size() != before + 1U) {
                 log::write(
                     log::Level::error,
@@ -1464,6 +1988,36 @@ int Application::run_home_test()
                 result = 1;
             }
         }
+    }
+
+    // A failed background open must restore Home with a visible error and
+    // must not add the failed board to navigation history.
+    enter_home();
+    tick_ui();
+    if (navigation_transition_.opacity() != 1.0) {
+        log::write(log::Level::error, "Returning to Home did not start its navigation fade");
+        result = 1;
+    }
+    const std::size_t before_failed_open = navigation_history_.size();
+    const std::size_t before_failed_index = navigation_history_index_;
+    begin_background_open(nav_dir / "Missing.sawer");
+    if (!wait_for_open()) {
+        log::write(log::Level::error, "Failed background open timed out");
+        return 1;
+    }
+    if (view_mode_ != ViewMode::home || status_error_.empty()
+        || background_open_home_path_.has_value() || board_file_.has_value()
+        || navigation_history_.size() != before_failed_open
+        || navigation_history_index_ != before_failed_index) {
+        log::write(log::Level::error, "Failed open did not return safely to Home");
+        result = 1;
+    }
+    static_cast<void>(renderer_->render(
+        camera_, document_, nullptr, toolbar_, selection_, &home_view_));
+    begin_background_open(nav_dir / "Content.sawer");
+    if (!wait_for_open()) {
+        log::write(log::Level::error, "Retry after failed open timed out");
+        return 1;
     }
 
     // Dedicated keyboard Back/Forward keys and their conventional Alt-arrow
@@ -1673,7 +2227,7 @@ int Application::run_home_test()
     // Drag-and-drop uses the same guarded background-open lifecycle as the
     // native picker.
     const std::string dropped_path =
-        (nav_dir / "Content.sawer").string();
+        path_to_utf8(nav_dir / "Content.sawer");
     bool drop_running = true;
     SDL_Event drop{};
     drop.type = SDL_EVENT_DROP_FILE;
@@ -2267,6 +2821,274 @@ int Application::run_drawing_performance_test()
     return 0;
 }
 
+int Application::run_stroke_visibility_test(const std::filesystem::path& board_path)
+{
+    if (!board_path.empty()) {
+        bool recovered = false;
+        static_cast<void>(BoardFileSession::open(board_path, document_, recovered));
+    } else {
+        // Individually modest strokes must not crowd later objects out of a
+        // shared scene buffer. Keep every stroke below the long-stroke cutoff.
+        if (!document_.insert(Object::make_rectangle(ObjectId::random(), document_.next_z_order(),
+                {{-280.0, -240.0}, {-240.0, -200.0}},
+                {{220U, 40U, 160U, 255U}, Color{220U, 40U, 160U, 255U}, 2.0}))) return 1;
+        for (std::size_t index = 0U; index < 32U; ++index) {
+            Stroke stroke;
+            stroke.points.reserve(4'000U);
+            for (std::size_t point = 0U; point < 4'000U; ++point) {
+                stroke.points.push_back({
+                    -300.0 + static_cast<double>(point) * 0.15,
+                    -160.0 + static_cast<double>(index) * 2.0
+                        + (point % 2U == 0U ? 0.25 : -0.25),
+                });
+            }
+            if (!document_.insert(Object::make_stroke(
+                    ObjectId::random(), document_.next_z_order(),
+                    std::move(stroke), current_style_))) {
+                return 1;
+            }
+        }
+    }
+    const Color blue{20U, 90U, 230U, 255U};
+    const Color green{20U, 180U, 80U, 255U};
+    const Color red{230U, 30U, 70U, 255U};
+    if (board_path.empty()) {
+        // Layers after the overflowing vector scene verify image/vector order.
+        const DecodedImage pixels{1U, 1U, {blue.red, blue.green, blue.blue, 255U}};
+        auto asset = std::make_shared<ImageAsset>();
+        asset->pixel_width = asset->pixel_height = 1U;
+        asset->png = encode_png_rgba(pixels);
+        asset->id = sha256(asset->png);
+        if (!document_.insert(Object::make_image(ObjectId::random(), document_.next_z_order(),
+                {asset, {-100.0, 40.0}, {100.0, 140.0}}))) return 1;
+        if (!document_.insert(Object::make_rectangle(ObjectId::random(), document_.next_z_order(),
+                {{-20.0, 60.0}, {20.0, 120.0}}, {green, green, 2.0}))) return 1;
+        // Average-distance modulo sampling used to skip every segment of this
+        // dense but visible long stroke at distant zoom.
+        Stroke tiny;
+        for (std::size_t point = 0U; point < 5'001U; ++point) {
+            tiny.points.push_back({200.0 + static_cast<double>(point) * 0.00001, 180.0});
+        }
+        if (!document_.insert(Object::make_stroke(ObjectId::random(), document_.next_z_order(),
+                std::move(tiny), {green, std::nullopt, 30.0}))) return 1;
+    }
+    const auto pixel_matches = [&](const Vec2d world, const Color color,
+                                   const ObjectDraft* preview = nullptr) {
+        const Vec2d screen = camera_.world_to_screen(world);
+        int width = 0;
+        int height = 0;
+        if (!SDL_GetWindowSizeInPixels(window_.get(), &width, &height)) return false;
+        const auto x = static_cast<std::uint32_t>(screen.x * width / camera_.viewport().x);
+        const auto y = static_cast<std::uint32_t>(screen.y * height / camera_.viewport().y);
+        renderer_->request_rendered_pixel(x, y);
+        if (!renderer_->render(camera_, document_, preview, toolbar_, selection_)) return false;
+        const auto pixel = renderer_->read_rendered_pixel(x, y);
+        if (!pixel) return false;
+        const bool matches = std::abs(static_cast<int>((*pixel)[0]) - color.red) <= 24
+            && std::abs(static_cast<int>((*pixel)[1]) - color.green) <= 24
+            && std::abs(static_cast<int>((*pixel)[2]) - color.blue) <= 24;
+        if (!matches) {
+            std::ostringstream error;
+            error << "GPU pixel mismatch at " << world.x << "," << world.y
+                << ": " << static_cast<int>((*pixel)[0]) << ","
+                << static_cast<int>((*pixel)[1]) << "," << static_cast<int>((*pixel)[2]);
+            log::write(log::Level::error, error.str());
+        }
+        return matches;
+    };
+    view_mode_ = ViewMode::board;
+    current_tool_ = Tool::pencil;
+    current_style_.stroke_width = 30.0;
+    current_style_.stroke = red;
+    sync_toolbar();
+    for (const double zoom : {1.0, 0.27, 0.1, 1.0, 0.27}) {
+        set_zoom(zoom);
+        const std::size_t before = document_.size();
+        begin_gesture({.position = {-100.0, 180.0}, .timestamp = 1U});
+        update_gesture({.position = {0.0, 190.0}, .timestamp = 10'000'001U}, false);
+        if (!active_draft_ || !renderer_->render(
+                camera_, document_, &*active_draft_, toolbar_, selection_)) {
+            return 1;
+        }
+        finish_gesture({.position = {100.0, 180.0}, .timestamp = 20'000'001U});
+        if (active_draft_ || document_.size() != before + 1U) return 1;
+        std::vector<const Object*> visible;
+        std::vector<ObjectId> visible_ids;
+        document_.query(camera_.visible_world_bounds(), visible, visible_ids);
+        const auto expected = static_cast<std::size_t>(std::ranges::count_if(
+            visible, [zoom](const Object* object) {
+                return (object->bounds.max_x - object->bounds.min_x) * zoom >= 0.35
+                    || (object->bounds.max_y - object->bounds.min_y) * zoom >= 0.35;
+            }));
+        for (int frame = 0; frame < 2; ++frame) {
+            if (!renderer_->render(camera_, document_, nullptr, toolbar_, selection_)) {
+                return 1;
+            }
+            const auto stats = renderer_->stats();
+            std::ostringstream summary;
+            summary << "stroke-visibility zoom=" << zoom
+                << ", visible=" << stats.visible_objects
+                << ", expected=" << expected
+                << ", rendered=" << stats.rendered_objects
+                << ", vertices=" << stats.emitted_vertices
+                << ", batches=" << stats.scene_batches
+                << ", peak-batch=" << stats.peak_scene_batch_vertices
+                << ", CPU-ms=" << stats.total_cpu_milliseconds;
+            log::write(log::Level::info, summary.str());
+            if (stats.rendered_objects != expected
+                || stats.peak_scene_batch_vertices > 1'048'576U
+                || stats.cache_bytes > 288U * 1024U * 1024U
+                || (board_path.empty() && zoom == 1.0
+                    && (stats.emitted_vertices < 1U * 1024U * 1024U || stats.scene_batches < 2U))
+                || (frame == 1 && (stats.scene_rebuilt
+                    || stats.scene_upload_bytes != 0U))) {
+                log::write(log::Level::error, "Completed strokes disappeared on a busy board");
+                return 1;
+            }
+            if (board_path.empty()
+                && (!pixel_matches({-260.0, -220.0}, {220U, 40U, 160U, 255U})
+                    || !pixel_matches({-60.0, 90.0}, blue)
+                    || !pixel_matches({0.0, 90.0}, green)
+                    || !pixel_matches({200.025, 180.0}, green)
+                    || !pixel_matches({100.0, 180.0}, red))) return 1;
+        }
+        if (history_.undo(document_).empty() || document_.size() != before) return 1;
+        if (!renderer_->render(camera_, document_, nullptr, toolbar_, selection_)) return 1;
+        if (history_.redo(document_).empty() || document_.size() != before + 1U) return 1;
+        if (!renderer_->render(camera_, document_, nullptr, toolbar_, selection_)) return 1;
+        if (board_path.empty() && !pixel_matches({100.0, 180.0}, red)) return 1;
+    }
+    // Exceed even the former temporary 16-million-vertex ceiling. These
+    // extra strokes sit below the existing image/vector pixel probes.
+    if (board_path.empty()) {
+        for (std::size_t index = 32U; index < 128U; ++index) {
+            Stroke stroke;
+            for (std::size_t point = 0U; point < 4'000U; ++point) {
+                stroke.points.push_back({-300.0 + static_cast<double>(point) * 0.15,
+                    -160.0 + static_cast<double>(index) * 2.0
+                        + (point % 2U == 0U ? 0.25 : -0.25)});
+            }
+            if (!document_.insert(Object::make_stroke(ObjectId::random(),
+                    -static_cast<std::int64_t>(index), std::move(stroke)))) return 1;
+        }
+    }
+    // Recreate all GPU resources with a scene that requires many bounded draws.
+    set_zoom(1.0);
+    renderer_.reset();
+    renderer_ = std::make_unique<GpuRenderer>(*window_);
+    if (!renderer_->render(camera_, document_, nullptr, toolbar_, selection_)) {
+        log::write(log::Level::error, "Dense scene recreation did not present a frame");
+        return 1;
+    }
+    if (board_path.empty() && (renderer_->stats().emitted_vertices <= 16U * 1024U * 1024U
+            || renderer_->stats().rendered_objects != document_.size())) {
+        std::ostringstream error;
+        error << "Dense scene recreation: vertices=" << renderer_->stats().emitted_vertices
+            << ", rendered=" << renderer_->stats().rendered_objects << ", expected=" << document_.size()
+            << ", batches=" << renderer_->stats().scene_batches;
+        log::write(log::Level::error, error.str());
+        return 1;
+    }
+    if (board_path.empty() && (!pixel_matches({-60.0, 90.0}, blue)
+            || !pixel_matches({100.0, 180.0}, red))) return 1;
+    const auto bounded_capacity = renderer_->stats().gpu_geometry_capacity_bytes;
+    if (!renderer_->render(camera_, document_, nullptr, toolbar_, selection_)
+        || renderer_->stats().scene_upload_bytes != 0U
+        || renderer_->stats().gpu_geometry_capacity_bytes != bounded_capacity) {
+        std::ostringstream error;
+        error << "Dense scene warm frame: uploads=" << renderer_->stats().scene_upload_bytes
+            << ", capacity=" << renderer_->stats().gpu_geometry_capacity_bytes
+            << ", expected-capacity=" << bounded_capacity;
+        log::write(log::Level::error, error.str());
+        return 1;
+    }
+    if (board_path.empty()) {
+        // Growing and shrinking the drawable must invalidate the raster cache
+        // even while live-resize presentation bypasses the normal vsync wait.
+        for (const auto size : {Vec2d{1440.0, 900.0}, Vec2d{960.0, 640.0}}) {
+            if (!SDL_SetWindowSize(window_.get(), static_cast<int>(size.x), static_cast<int>(size.y))
+                || !SDL_SyncWindow(window_.get())) return 1;
+            static_cast<void>(update_viewport());
+            renderer_->begin_live_resize();
+            if (!renderer_->render(camera_, document_, nullptr, toolbar_, selection_)) return 1;
+            renderer_->end_live_resize();
+            if (!pixel_matches({-60.0, 90.0}, blue)
+                || !pixel_matches({100.0, 180.0}, red)) return 1;
+        }
+        // The same bounded passes also work on hardware without MSAA.
+        renderer_.reset();
+        renderer_ = std::make_unique<GpuRenderer>(*window_, false);
+        if (!renderer_->render(camera_, document_, nullptr, toolbar_, selection_)
+            || !pixel_matches({-60.0, 90.0}, blue)
+            || !pixel_matches({100.0, 180.0}, red)) return 1;
+
+        // Formerly, the stride budget retained only the offscreen endpoints.
+        // The largest case also exceeded the cache budget with one object.
+        history_ = {};
+        selection_.clear();
+        for (const std::size_t crossings : {100U, 20'000U, 150'000U}) {
+            document_ = {};
+            renderer_.reset();
+            renderer_ = std::make_unique<GpuRenderer>(*window_, false);
+            Stroke stroke;
+            stroke.points.reserve(crossings * 5U);
+            for (std::size_t crossing = 0U; crossing < crossings; ++crossing) {
+                for (const Vec2d point : {Vec2d{12'000.0, 12'000.0},
+                         {-20.0, 0.0}, {20.0, 0.0},
+                         {12'000.0, 12'000.0}, {12'000.0, 12'000.0}}) {
+                    stroke.points.push_back(point);
+                }
+            }
+            if (!document_.insert(Object::make_stroke(ObjectId::random(), 0,
+                    std::move(stroke), {blue, std::nullopt, 4.0}))) return 1;
+            sync_toolbar();
+            if (!renderer_->render(camera_, document_, nullptr, toolbar_, selection_)) return 1;
+            const RendererStats cold = renderer_->stats();
+            if (cold.rendered_objects != 1U
+                || cold.cache_bytes > 256U * 1024U * 1024U
+                || cold.cpu_geometry_capacity_bytes > 64U * 1024U * 1024U
+                || cold.peak_stroke_page_vertices > 65'535U
+                || cold.peak_scene_batch_vertices > 1'048'575U
+                || (crossings == 150'000U && cold.scene_batches < 2U)
+                || (crossings == 150'000U && cold.cache_bytes != 0U)
+                || !pixel_matches({10.0, 0.0}, blue)) return 1;
+            std::ostringstream summary;
+            summary << "fragmented-stroke crossings=" << crossings
+                << ", points=" << crossings * 5U
+                << ", cached-bytes=" << cold.cache_bytes
+                << ", stroke-page=" << cold.peak_stroke_page_vertices
+                << ", batches=" << cold.scene_batches;
+            log::write(log::Level::info, summary.str());
+            // Readback must include the dynamic preview, which is deliberately
+            // absent from the retained scene texture. This detects cache-only
+            // pixel reads in the single-sample presentation path.
+            const ObjectDraft preview{Line{{-30.0, 0.0}, {30.0, 0.0}},
+                {red, std::nullopt, 12.0}, 100U, 1U};
+            if (!pixel_matches({10.0, 0.0}, red, &preview)
+                || !pixel_matches({10.0, 0.0}, blue)) return 1;
+            if (renderer_->stats().scene_rebuilt || renderer_->stats().scene_upload_bytes != 0U
+                || renderer_->stats().cache_bytes > 256U * 1024U * 1024U) return 1;
+        }
+        // Loading another board can preserve both revision and object IDs.
+        // Neither a stale raster nor a cached paged-stroke descriptor may survive.
+        const ObjectId reused_id = document_.all_objects().front()->id;
+        Document replacement;
+        if (!replacement.insert(Object::make_line(reused_id, 0,
+                {{-20.0, 0.0}, {20.0, 0.0}}, {green, std::nullopt, 4.0}))) return 1;
+        document_ = std::move(replacement);
+        renderer_->invalidate_document_cache();
+        if (!pixel_matches({10.0, 0.0}, green)) return 1;
+        home_view_.relayout(camera_.viewport().x, camera_.viewport().y,
+            display_scale_, toolbar_.theme());
+        if (!renderer_->render(camera_, document_, nullptr, toolbar_, selection_, &home_view_)
+            || renderer_->stats().cache_bytes != 0U
+            || renderer_->stats().cache_entries != 0U
+            || renderer_->stats().query_scratch_capacity_bytes != 0U
+            || renderer_->stats().cpu_geometry_capacity_bytes > 24U * 1024U * 1024U) return 1;
+    }
+    return 0;
+}
+
 int Application::run_buffer_growth_test()
 {
     constexpr std::size_t growth_points = 90'000U;
@@ -2558,6 +3380,7 @@ void Application::new_board()
     set_zoom(1.0);
     ++lifecycle_generation_;
     status_error_.clear();
+    status_notice_.clear();
     update_window_title();
 }
 
@@ -2573,12 +3396,15 @@ void Application::open_board(const std::filesystem::path& path)
     selection_.clear();
 
     Document loaded;
+    ImageDecodeCache decoded_images;
     bool recovered_final_line = false;
     auto session =
-        BoardFileSession::open(path, loaded, recovered_final_line);
+        BoardFileSession::open(path, loaded, recovered_final_line, &decoded_images);
 
     remember_current_board_zoom();
     document_ = std::move(loaded);
+    renderer_->invalidate_document_cache();
+    renderer_->adopt_decoded_images(std::move(decoded_images));
     history_ = {};
     history_.mark_saved(document_);
     board_file_ = std::move(session);
@@ -2588,6 +3414,9 @@ void Application::open_board(const std::filesystem::path& path)
     }
     restore_board_zoom(path);
     status_error_.clear();
+    status_notice_ = recovered_final_line
+        ? "Recovered an interrupted final write. Your board is safe."
+        : std::string{};
     update_window_title();
 
     if (recovered_final_line) {
@@ -2608,6 +3437,7 @@ void Application::save_as(const std::filesystem::path& path)
         recent_files_->set_zoom(path, camera_.zoom());
     }
     status_error_.clear();
+    status_notice_ = "Saved";
     history_.mark_saved(document_);
     update_window_title();
     synchronize_navigation_target();
@@ -2615,34 +3445,11 @@ void Application::save_as(const std::filesystem::path& path)
 
 void Application::start_session()
 {
-    // A board opened from the command line wins. Otherwise restore the most
-    // recently used file when it is still available, then fall back to Home.
-    if (board_file_.has_value()) {
-        view_mode_ = ViewMode::board;
-        reset_navigation_history();
-        return;
+    // Keep a board opened from the command line; otherwise start fresh.
+    if (!board_file_.has_value()) {
+        new_board();
     }
-    if (recent_files_ && !recent_files_->entries().empty()) {
-        const auto& last = recent_files_->entries().front();
-        std::error_code error;
-        if (std::filesystem::is_regular_file(last, error)) {
-            try {
-                open_board(last);
-                view_mode_ = ViewMode::board;
-                reset_navigation_history();
-                return;
-            } catch (const std::exception& exception) {
-                status_error_ =
-                    "Could not restore the last board: "
-                    + std::string{exception.what()};
-                log::write(
-                    log::Level::warning,
-                    status_error_);
-            }
-        }
-    }
-    view_mode_ = ViewMode::home;
-    refresh_home();
+    view_mode_ = ViewMode::board;
     reset_navigation_history();
 }
 
@@ -2960,7 +3767,7 @@ void Application::refresh_home()
             // A small disk cache is checked synchronously; full board replay
             // and rasterization happen only on a background cache miss.
             std::shared_ptr<const BoardPreview> preview;
-            const std::string key = path.string();
+            const std::string key = path_to_utf8(path);
             active_preview_keys.push_back(key);
             const auto cached = preview_cache_.find(key);
             if (cached != preview_cache_.end()
@@ -3009,7 +3816,7 @@ void Application::refresh_home()
                 renaming_ && rename_target_ == RenameTarget::home
                 && path == rename_path_;
             boards.push_back(HomeBoard{
-                editing ? rename_text_ : path.stem().string(),
+                editing ? rename_text_ : path_to_utf8(path.stem()),
                 format_modified_time(modified),
                 std::move(preview),
                 path,
@@ -3032,7 +3839,8 @@ void Application::refresh_home()
         display_scale_,
         toolbar_.theme(),
         std::move(boards),
-        status_error_);
+        status_error_,
+        status_error_.empty() ? status_notice_ : std::string{});
 }
 
 BoardPreview Application::build_board_preview(
@@ -3053,15 +3861,8 @@ void Application::open_board_from_home(const std::size_t index)
     if (index >= boards.size() || boards[index].path.empty()) {
         return;
     }
-    // Open synchronously so the board is fully loaded before the view switches.
-    // A background open would leave a window where the first stroke is either
-    // eaten by the still-showing home screen or drawn into a document that the
-    // pending load then discards.
     try {
-        open_board(boards[index].path);
-        view_mode_ = ViewMode::board;
-        sync_toolbar();
-        record_navigation_target();
+        begin_background_open(boards[index].path);
     } catch (const std::exception& error) {
         status_error_ = error.what();
         log::write(log::Level::error, status_error_);
@@ -3078,8 +3879,9 @@ void Application::start_rename_current()
     cancel_gesture();
     cancel_selection_gesture();
     rename_target_ = RenameTarget::board;
+    toolbar_.close_settings_panel();
     rename_text_ = board_file_.has_value()
-        ? board_file_->path().stem().string()
+        ? path_to_utf8(board_file_->path().stem())
         : untitled_name_;
     rename_anchor_ = 0U;
     rename_cursor_ = rename_text_.size();
@@ -3123,7 +3925,7 @@ void Application::commit_rename()
     try {
         if (target == RenameTarget::board) {
             if (board_file_.has_value()) {
-                if (name != board_file_->path().stem().string()) {
+                if (name != path_to_utf8(board_file_->path().stem())) {
                     flush_board();
                     const auto old_path = board_file_->path();
                     const auto new_path =
@@ -3148,7 +3950,7 @@ void Application::commit_rename()
         } else if (target == RenameTarget::home) {
             status_error_.clear();
             if (std::filesystem::exists(rename_path_)
-                && name != rename_path_.stem().string()) {
+                && name != path_to_utf8(rename_path_.stem())) {
                 const auto new_path =
                     unique_board_path(rename_path_.parent_path(), name);
                 std::error_code error;
@@ -3576,6 +4378,89 @@ bool Application::handle_width_edit_event(const SDL_Event& event)
     }
 }
 
+void Application::cancel_custom_color()
+{
+    if (!toolbar_.settings_open() || toolbar_.settings_page() != SettingsPage::color_editor) return;
+    toolbar_.cancel_hex_edit();
+    static_cast<void>(SDL_StopTextInput(window_.get()));
+    if (toolbar_.custom_color_target() == CustomColorTarget::background) {
+        background_color_ = toolbar_.initial_custom_color();
+        toolbar_.set_settings_page(SettingsPage::canvas);
+    } else if (toolbar_.custom_color_target() == CustomColorTarget::grid) {
+        grid_color_ = color_editor_original_grid_;
+        toolbar_.set_settings_page(SettingsPage::canvas);
+    } else toolbar_.close_settings_panel();
+}
+
+bool Application::handle_color_edit_event(const SDL_Event& event)
+{
+    const auto commit = [&]() {
+        if (!toolbar_.finish_hex_edit()) { sync_toolbar(); return false; }
+        static_cast<void>(SDL_StopTextInput(window_.get()));
+        if (toolbar_.custom_color_target() == CustomColorTarget::background) background_color_ = toolbar_.custom_color();
+        else if (toolbar_.custom_color_target() == CustomColorTarget::grid) grid_color_ = toolbar_.custom_color();
+        sync_toolbar();
+        return true;
+    };
+    switch (event.type) {
+    case SDL_EVENT_TEXT_INPUT:
+        if (event.text.text != nullptr) toolbar_.insert_hex_text(event.text.text);
+        sync_toolbar();
+        return true;
+    case SDL_EVENT_KEY_DOWN:
+        if ((event.key.mod & SDL_KMOD_CTRL) != 0U) {
+            if (event.key.scancode == SDL_SCANCODE_A) toolbar_.select_hex_text();
+            else if (event.key.scancode == SDL_SCANCODE_V) {
+                if (char* text = SDL_GetClipboardText()) {
+                    toolbar_.insert_hex_text(text);
+                    SDL_free(text);
+                }
+            } else if (event.key.scancode == SDL_SCANCODE_C) {
+                static_cast<void>(SDL_SetClipboardText(std::string{toolbar_.hex_text()}.c_str()));
+            }
+        } else if (event.key.scancode == SDL_SCANCODE_RETURN || event.key.scancode == SDL_SCANCODE_KP_ENTER
+            || event.key.scancode == SDL_SCANCODE_TAB) {
+            if (commit() && event.key.scancode == SDL_SCANCODE_TAB) toolbar_.focus_next();
+        } else if (event.key.scancode == SDL_SCANCODE_ESCAPE) {
+            toolbar_.cancel_hex_edit();
+            static_cast<void>(SDL_StopTextInput(window_.get()));
+        } else if (event.key.scancode == SDL_SCANCODE_BACKSPACE || event.key.scancode == SDL_SCANCODE_DELETE) {
+            toolbar_.erase_hex_text(event.key.scancode == SDL_SCANCODE_DELETE);
+        }
+        sync_toolbar();
+        return true;
+    case SDL_EVENT_KEY_UP:
+        return true;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP: {
+        const Vec2d point{static_cast<double>(event.button.x), static_cast<double>(event.button.y)};
+        const auto action = toolbar_.action_at(point);
+        if (action == UiAction::custom_hex_field) {
+            toolbar_.select_hex_text();
+            sync_toolbar();
+            return true;
+        }
+        if (action == UiAction::custom_color_cancel || action == UiAction::settings_close
+            || (action.has_value() && !toolbar_.is_settings_control(*action))
+            || !toolbar_.contains(point)) {
+            toolbar_.cancel_hex_edit();
+            static_cast<void>(SDL_StopTextInput(window_.get()));
+            return false;
+        }
+        return event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && !commit();
+    }
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+        if (!commit()) {
+            toolbar_.cancel_hex_edit();
+            static_cast<void>(SDL_StopTextInput(window_.get()));
+            sync_toolbar();
+        }
+        return false;
+    default:
+        return false;
+    }
+}
+
 void Application::handle_home_event(const SDL_Event& event, bool& running)
 {
     switch (event.type) {
@@ -3831,10 +4716,33 @@ void Application::handle_event(const SDL_Event& event, bool& running)
         return;
     }
 
+    // Loading is a visible, read-only state. Consume whole interactions here
+    // so a press before completion cannot turn into an edit after the swap.
+    if (background_open_.valid()) {
+        switch (event.type) {
+        case SDL_EVENT_MOUSE_MOTION:
+            pointer_screen_ = Vec2d{
+                static_cast<double>(event.motion.x),
+                static_cast<double>(event.motion.y),
+            };
+            update_cursor();
+            return;
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_BUTTON_UP:
+        case SDL_EVENT_MOUSE_WHEEL:
+        case SDL_EVENT_KEY_DOWN:
+        case SDL_EVENT_KEY_UP:
+            return;
+        default:
+            break;
+        }
+    }
+
     if (event.type == SDL_EVENT_DROP_FILE) {
         if (event.drop.data == nullptr) {
             return;
         }
+        cancel_custom_color();
         if (renaming_) {
             commit_rename();
         }
@@ -3844,7 +4752,7 @@ void Application::handle_event(const SDL_Event& event, bool& running)
         if (dialog_active_ || background_open_.valid()) {
             status_error_ = "Finish the current file operation first.";
         } else {
-            const std::filesystem::path path{event.drop.data};
+            const auto path = path_from_utf8(event.drop.data);
             std::error_code error;
             if (!std::filesystem::is_regular_file(path, error) || error) {
                 status_error_ =
@@ -3871,6 +4779,7 @@ void Application::handle_event(const SDL_Event& event, bool& running)
             event.key.scancode == SDL_SCANCODE_AC_FORWARD
             || (alt && event.key.scancode == SDL_SCANCODE_RIGHT);
         if (back || forward) {
+            cancel_custom_color();
             if (renaming_) {
                 cancel_rename();
             }
@@ -3886,6 +4795,7 @@ void Application::handle_event(const SDL_Event& event, bool& running)
         && (event.button.button == SDL_BUTTON_X1
             || event.button.button == SDL_BUTTON_X2)) {
         if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+            cancel_custom_color();
             if (renaming_) {
                 cancel_rename();
             }
@@ -3899,6 +4809,9 @@ void Application::handle_event(const SDL_Event& event, bool& running)
     }
 
     if (renaming_ && handle_rename_event(event)) {
+        return;
+    }
+    if (toolbar_.hex_editing() && handle_color_edit_event(event)) {
         return;
     }
     if (width_editing_ && handle_width_edit_event(event)) {
@@ -3979,6 +4892,7 @@ void Application::handle_event(const SDL_Event& event, bool& running)
             if (down && toolbar_.settings_open()) {
                 hand_dragging_ = false;
                 toolbar_.clear_focus();
+                cancel_custom_color();
                 toolbar_.close_settings_panel();
                 sync_toolbar();
                 update_cursor();
@@ -4061,6 +4975,12 @@ void Application::handle_event(const SDL_Event& event, bool& running)
             sync_toolbar();
             break;
         }
+        if (!toolbar_.settings_open()
+            && toolbar_.properties_bounds().contains(screen_point)) {
+            toolbar_.scroll_properties(-wheel_amount * 48.0 * toolbar_.scale());
+            sync_toolbar();
+            break;
+        }
         if (toolbar_.contains(screen_point)
             || left_button_down_
             || middle_button_down_
@@ -4128,8 +5048,21 @@ void Application::handle_event(const SDL_Event& event, bool& running)
                        && event.key.scancode == SDL_SCANCODE_DOWN) {
                 toolbar_.scroll_about(0.025);
                 sync_toolbar();
+            } else if (plain && !shift && event.key.scancode == SDL_SCANCODE_F2
+                       && (!toolbar_.settings_open()
+                           || toolbar_.settings_page() == SettingsPage::file)) {
+                start_rename_current();
             } else if (plain && event.key.scancode == SDL_SCANCODE_TAB) {
                 toolbar_.focus_next(shift);
+                sync_toolbar();
+            } else if (plain && !toolbar_.settings_open()
+                       && toolbar_.focused_control() != nullptr
+                       && toolbar_.is_property_control(toolbar_.focused_control()->action)
+                       && (event.key.scancode == SDL_SCANCODE_PAGEUP
+                           || event.key.scancode == SDL_SCANCODE_PAGEDOWN)) {
+                toolbar_.scroll_properties(
+                    (event.key.scancode == SDL_SCANCODE_PAGEUP ? -1.0 : 1.0)
+                    * toolbar_.properties_clip().height * 0.75);
                 sync_toolbar();
             } else if (plain
                        && (event.key.scancode == SDL_SCANCODE_RETURN
@@ -4141,7 +5074,10 @@ void Application::handle_event(const SDL_Event& event, bool& running)
                     || selection_interaction_ != SelectionInteraction::none;
                 toolbar_.clear_focus();
                 if (toolbar_.settings_open()) {
-                    toolbar_.close_settings_panel();
+                    if (toolbar_.settings_page() == SettingsPage::color_editor) cancel_custom_color();
+                    else toolbar_.close_settings_panel();
+                } else if (toolbar_.compact_properties() && toolbar_.properties_open()) {
+                    toolbar_.close_properties();
                 } else if (!had_gesture && current_tool_ == Tool::select
                            && !selection_.empty()) {
                     selection_.clear();
@@ -4151,6 +5087,27 @@ void Application::handle_event(const SDL_Event& event, bool& running)
                 cancel_gesture();
                 cancel_selection_gesture();
                 sync_toolbar();
+            } else if (command && event.key.scancode == SDL_SCANCODE_A
+                       && !toolbar_.settings_open()) {
+                std::vector<ObjectId> ids;
+                for (const Object* const object : document_.all_objects()) {
+                    ids.push_back(object->id);
+                }
+                selection_.select(std::move(ids));
+                current_tool_ = Tool::select;
+                sync_toolbar();
+            } else if (plain && !selection_.empty()
+                       && (event.key.scancode == SDL_SCANCODE_LEFT
+                           || event.key.scancode == SDL_SCANCODE_RIGHT
+                           || event.key.scancode == SDL_SCANCODE_UP
+                           || event.key.scancode == SDL_SCANCODE_DOWN)) {
+                const double amount = shift ? 10.0 : 1.0;
+                Vec2d delta;
+                if (event.key.scancode == SDL_SCANCODE_LEFT) delta.x = -amount;
+                if (event.key.scancode == SDL_SCANCODE_RIGHT) delta.x = amount;
+                if (event.key.scancode == SDL_SCANCODE_UP) delta.y = -amount;
+                if (event.key.scancode == SDL_SCANCODE_DOWN) delta.y = amount;
+                nudge_selection(delta);
             } else if (event.key.scancode == SDL_SCANCODE_DELETE
                        || event.key.scancode == SDL_SCANCODE_BACKSPACE) {
                 delete_selection();
@@ -4261,25 +5218,20 @@ void Application::begin_gesture(const PointerSample sample)
     if (background_open_.valid()) {
         return;
     }
-    active_raw_stroke_points_.clear();
     switch (current_tool_) {
     case Tool::select:
     case Tool::hand:
         return;
     case Tool::pencil: {
         pointer_resampler_.reset(sample);
-        active_raw_stroke_points_.push_back(sample.position);
-        if (drawing_settings_.stabilization_enabled()) {
-            velocity_gaussian_stabilizer_.reset(
-                drawing_settings_.gaussian_sigma(),
-                sample,
-                camera_.zoom());
-        }
+        adaptive_stroke_filter_.reset(
+            drawing_settings_.adaptive_stroke_settings(), sample, camera_.zoom());
         active_draft_ = ObjectDraft{
             .geometry = Stroke{{sample.position}},
             .style = current_style_,
             .generation = ++next_draft_generation_,
         };
+        incremental_stroke_curve_.reset(sample.position, 0.05 / camera_.zoom());
         break;
     }
     case Tool::line:
@@ -4324,38 +5276,13 @@ void Application::update_gesture(
             pointer_resampler_.push(sample, camera_.zoom(), complete);
         bool changed = false;
         for (const PointerSample resampled : samples) {
-            const PointerSample stabilized =
-                drawing_settings_.stabilization_enabled()
-                ? velocity_gaussian_stabilizer_.push(resampled)
-                : resampled;
-            if (active_raw_stroke_points_.size()
-                >= maximum_stroke_samples) {
-                break;
-            }
-            if (!append_filtered_point(
-                active_raw_stroke_points_,
-                stabilized.position,
-                drawing_settings_.sampling_distance() / camera_.zoom())) {
-                continue;
-            }
-            const Vec2d live_endpoint = trailing_smoothed_stroke_point(
-                active_raw_stroke_points_,
-                drawing_settings_.completion_smoothing_radius());
-            const std::size_t previous_size = stroke->points.size();
-            const Vec2d previous_endpoint =
-                stroke->points.empty() ? Vec2d{} : stroke->points.back();
-            if (stroke->points.size() < 2U) {
-                stroke->points.push_back(live_endpoint);
-            } else {
-                append_smooth_tail(
-                    stroke->points,
-                    live_endpoint,
-                    0.05 / camera_.zoom());
-            }
-            changed = changed
-                || stroke->points.size() != previous_size
-                || (!stroke->points.empty()
-                    && stroke->points.back() != previous_endpoint);
+            const PointerSample filtered = adaptive_stroke_filter_.push(resampled);
+            changed = incremental_stroke_curve_.push(
+                filtered.position, stroke->points) || changed;
+        }
+        if (complete) {
+            changed = incremental_stroke_curve_.finish(sample.position, stroke->points)
+                || changed;
         }
         if (changed) {
             ++active_draft_->revision;
@@ -4399,20 +5326,11 @@ void Application::finish_gesture(const PointerSample sample)
 
     if (auto* const stroke =
             std::get_if<Stroke>(&active_draft_->geometry)) {
-        if (!active_raw_stroke_points_.empty()) {
-            stroke->points = std::move(active_raw_stroke_points_);
-        }
-        auto curved = complete_stroke_points(
-            std::move(stroke->points),
-            sample.position,
-            camera_.zoom(),
-            drawing_settings_.completion_smoothing_radius(),
-            drawing_settings_.stabilization_enabled());
-        if (!curved.empty()) {
+        if (!stroke->points.empty()) {
             completed = Object::make_stroke(
                 id,
                 document_.next_z_order(),
-                Stroke{std::move(curved)},
+                std::move(*stroke),
                 active_draft_->style);
         }
     } else if (const auto* const line =
@@ -4455,14 +5373,12 @@ void Application::finish_gesture(const PointerSample sample)
         record_object_state(id);
     }
     active_draft_.reset();
-    active_raw_stroke_points_.clear();
     update_window_title();
 }
 
 void Application::cancel_gesture() noexcept
 {
     active_draft_.reset();
-    active_raw_stroke_points_.clear();
 }
 
 void Application::begin_selection_gesture(const PointerSample sample)
@@ -4479,12 +5395,19 @@ void Application::begin_selection_gesture(const PointerSample sample)
         selection_interaction_ = SelectionInteraction::resize;
     } else if (const auto hit = hit_test(
                    document_, sample.position, 5.0 / camera_.zoom())) {
-        if (!selection_.contains(*hit)) {
+        if (shift_down_) {
+            selection_.toggle(*hit);
+        } else if (!selection_.contains(*hit)) {
             selection_.select(*hit);
         }
-        selection_interaction_ = SelectionInteraction::move;
+        selection_interaction_ = selection_.empty()
+            ? SelectionInteraction::none
+            : SelectionInteraction::move;
     } else {
-        selection_.clear();
+        selection_additive_ = shift_down_;
+        if (!selection_additive_) {
+            selection_.clear();
+        }
         selection_interaction_ = SelectionInteraction::marquee;
         selection_.set_marquee(Aabb::from_points(sample.position, sample.position));
     }
@@ -4569,8 +5492,16 @@ void Application::finish_selection_gesture(const PointerSample sample)
     update_selection_gesture(sample);
     if (selection_interaction_ == SelectionInteraction::marquee) {
         if (selection_.marquee().has_value()) {
-            selection_.select(
-                marquee_hit_test(document_, *selection_.marquee()));
+            const auto hits = marquee_hit_test(document_, *selection_.marquee());
+            if (selection_additive_) {
+                auto ids = selection_.ids();
+                for (const auto id : hits) {
+                    if (std::ranges::find(ids, id) == ids.end()) ids.push_back(id);
+                }
+                selection_.select(std::move(ids));
+            } else {
+                selection_.select(hits);
+            }
         }
     } else if (selection_preview_.has_value()
                && selection_original_bounds_.has_value()) {
@@ -4631,6 +5562,7 @@ void Application::finish_selection_gesture(const PointerSample sample)
     selection_edit_ids_.clear();
     selection_original_bounds_.reset();
     selection_preview_.reset();
+    selection_additive_ = false;
     selection_.set_marquee(std::nullopt);
     update_window_title();
 }
@@ -4642,6 +5574,7 @@ void Application::cancel_selection_gesture() noexcept
     selection_edit_ids_.clear();
     selection_original_bounds_.reset();
     selection_preview_.reset();
+    selection_additive_ = false;
     selection_.set_marquee(std::nullopt);
 }
 
@@ -4704,6 +5637,42 @@ void Application::duplicate_selection()
         std::make_unique<CompositeCommand>(std::move(commands)), document_);
     selection_.select(duplicated_ids);
     record_object_states(duplicated_ids);
+}
+
+void Application::nudge_selection(const Vec2d delta)
+{
+    if (selection_.empty() || !std::isfinite(delta.x) || !std::isfinite(delta.y)) {
+        return;
+    }
+    double lower_x = -board_half_extent;
+    double upper_x = board_half_extent;
+    double lower_y = -board_half_extent;
+    double upper_y = board_half_extent;
+    for (const auto id : selection_.ids()) {
+        const Object* const object = document_.find(id);
+        if (object == nullptr) continue;
+        lower_x = std::max(lower_x, -board_half_extent - object->bounds.min_x);
+        upper_x = std::min(upper_x, board_half_extent - object->bounds.max_x);
+        lower_y = std::max(lower_y, -board_half_extent - object->bounds.min_y);
+        upper_y = std::min(upper_y, board_half_extent - object->bounds.max_y);
+    }
+    const Vec2d bounded{
+        std::clamp(delta.x, lower_x, upper_x),
+        std::clamp(delta.y, lower_y, upper_y),
+    };
+    if (bounded.x == 0.0 && bounded.y == 0.0) return;
+    std::vector<std::unique_ptr<Command>> commands;
+    commands.reserve(selection_.ids().size());
+    for (const auto id : selection_.ids()) {
+        if (document_.find(id) != nullptr) {
+            commands.push_back(std::make_unique<MoveObjectCommand>(id, bounded));
+        }
+    }
+    if (commands.empty()) return;
+    history_.execute(std::make_unique<CompositeCommand>(std::move(commands)), document_);
+    record_move_states(selection_.ids(), bounded);
+    update_window_title();
+    sync_toolbar();
 }
 
 bool Application::copy_selection()
@@ -4807,7 +5776,7 @@ bool Application::poll_clipboard_paste()
         try {
             ClipboardFragment fragment = clipboard_fragment_paste_.get();
             if (clipboard_paste_generation_ != lifecycle_generation_
-                || view_mode_ != ViewMode::board) {
+                || view_mode_ != ViewMode::board || background_open_.valid()) {
                 return true;
             }
             if (clipboard_paste_digest_ != last_clipboard_paste_digest_) {
@@ -4883,7 +5852,7 @@ bool Application::poll_clipboard_paste()
     try {
         CanonicalImage pasted = clipboard_paste_.get();
         if (clipboard_paste_generation_ != lifecycle_generation_
-            || view_mode_ != ViewMode::board) {
+            || view_mode_ != ViewMode::board || background_open_.valid()) {
             return true;
         }
         const double viewport_width = camera_.viewport().x / camera_.zoom();
@@ -5236,7 +6205,7 @@ void Application::flush_board()
         log::write(
             log::Level::warning,
             "The board changed externally; continuing in conflict copy "
-                + board_file_->path().string());
+                + path_to_utf8(board_file_->path()));
         if (recent_files_) {
             recent_files_->touch(board_file_->path());
         }
@@ -5276,7 +6245,7 @@ void Application::autosave_if_due()
             log::write(
                 log::Level::warning,
                 "Autosave detected an external change; switched to "
-                    + board_file_->path().string());
+                    + path_to_utf8(board_file_->path()));
             if (recent_files_) {
                 recent_files_->touch(board_file_->path());
             }
@@ -5332,10 +6301,12 @@ StyleColorTarget Application::effective_style_color_target() const noexcept
 void Application::sync_toolbar()
 {
     std::string filename;
-    if (renaming_ && rename_target_ == RenameTarget::board) {
+    if (background_open_home_path_.has_value()) {
+        filename = path_to_utf8(background_open_home_path_->stem());
+    } else if (renaming_ && rename_target_ == RenameTarget::board) {
         filename = rename_text_;
     } else if (board_file_.has_value()) {
-        filename = board_file_->path().stem().string();
+        filename = path_to_utf8(board_file_->path().stem());
     } else {
         filename = untitled_name_;
     }
@@ -5462,16 +6433,21 @@ void Application::sync_toolbar()
         selection_style,
         effective_style_color_target(),
         width_editing_,
-        width_edit_text_);
+        width_edit_text_,
+        status_error_.empty() && !document_.dirty()
+            ? status_notice_
+            : std::string{},
+        background_open_.valid());
     update_cursor();
 }
 
 std::optional<DrawingCursor> Application::drawing_cursor_preview() const noexcept
 {
     if (view_mode_ == ViewMode::home
+        || background_open_.valid()
         || unsaved_dialog_.visible()
         || !pointer_screen_.has_value()
-        || toolbar_.hovered_control() != nullptr
+        || toolbar_.contains(*pointer_screen_)
         || middle_button_down_
         || hand_dragging_
         || space_down_) {
@@ -5494,6 +6470,11 @@ void Application::update_cursor() noexcept
 {
     const bool show_drawing_cursor = drawing_cursor_preview().has_value();
     SDL_Cursor* cursor = SDL_GetDefaultCursor();
+    if (background_open_.valid()) {
+        static_cast<void>(SDL_SetCursor(cursor));
+        static_cast<void>(SDL_ShowCursor());
+        return;
+    }
     if (unsaved_dialog_.visible()) {
         if (unsaved_dialog_.hovered_choice().has_value() && hand_cursor_) {
             cursor = hand_cursor_.get();
@@ -5540,7 +6521,8 @@ void Application::update_cursor() noexcept
         cursor = nesw_resize_cursor_.get();
     } else if (actively_moving && move_cursor_) {
         cursor = move_cursor_.get();
-    } else if ((toolbar_.hovered_control() != nullptr
+    } else if (((toolbar_.hovered_control() != nullptr
+                    && toolbar_.hovered_control()->enabled)
                 || current_tool_ == Tool::hand
                 || space_down_)
                && hand_cursor_) {
@@ -5556,6 +6538,8 @@ void Application::update_cursor() noexcept
 
 void Application::tick_ui() noexcept
 {
+    const bool navigation_changed = navigation_transition_.update_view(
+        view_mode_ == ViewMode::home);
     // Restart the entrance animation whenever the visible view changes so
     // both the first frame and every home/board switch animate in.
     if (!animated_view_mode_.has_value()
@@ -5575,9 +6559,17 @@ void Application::tick_ui() noexcept
     const double elapsed = static_cast<double>(now - last_ui_tick_)
         / 1'000'000'000.0;
     last_ui_tick_ = now;
+    // Do not consume time spent idle or opening a file on the first frame of
+    // the new view. Later ticks use real elapsed time and settle exactly.
+    if (!navigation_changed) navigation_transition_.tick(elapsed);
     // Keep the shared theme transition current even while Home is visible,
     // so opening a board does not replay a stale palette crossfade.
+    const double previous_properties_reveal = toolbar_.properties_reveal();
     toolbar_.tick(elapsed);
+    if (view_mode_ == ViewMode::board
+        && previous_properties_reveal != toolbar_.properties_reveal()) {
+        update_cursor();
+    }
     unsaved_dialog_.tick(elapsed);
     if (view_mode_ == ViewMode::home) {
         home_view_.tick(elapsed);
@@ -5648,8 +6640,20 @@ void Application::request_quit(bool& running) noexcept
 void Application::activate_ui_action(const UiAction action)
 {
     cancel_gesture();
+    if (toolbar_.settings_open() && toolbar_.settings_page() == SettingsPage::color_editor
+        && !toolbar_.is_settings_control(action)) cancel_custom_color();
     switch (action) {
+    case UiAction::file_menu:
+        toolbar_.toggle_settings_panel(SettingsPage::file);
+        break;
+    case UiAction::preferences_menu:
+        toolbar_.toggle_settings_panel(SettingsPage::preferences);
+        break;
+    case UiAction::properties_menu:
+        toolbar_.toggle_properties();
+        break;
     case UiAction::new_board:
+        toolbar_.close_settings_panel();
         new_board();
         if (status_error_.empty()) {
             record_navigation_target();
@@ -5659,6 +6663,8 @@ void Application::activate_ui_action(const UiAction action)
         enter_home();
         return;
     case UiAction::rename_board:
+    case UiAction::rename_button:
+    case UiAction::rename_file:
         start_rename_current();
         return;
     case UiAction::home_new_board:
@@ -5666,12 +6672,15 @@ void Application::activate_ui_action(const UiAction action)
         // These actions originate only from the home view, never the toolbar.
         return;
     case UiAction::open_board:
+        toolbar_.close_settings_panel();
         show_board_dialog(false);
         return;
     case UiAction::save:
         static_cast<void>(flush_board_safely());
         return;
     case UiAction::save_as:
+    case UiAction::save_copy:
+        toolbar_.close_settings_panel();
         show_board_dialog(true);
         return;
     case UiAction::select:
@@ -5839,19 +6848,8 @@ void Application::activate_ui_action(const UiAction action)
         return;
     case UiAction::toggle_theme: {
         toolbar_.toggle_theme();
-        // Flip the neutral drawing color with the theme so freshly drawn
-        // strokes stay visible against the new background. Explicit accent
-        // colors (red, blue, ...) and existing objects are left untouched.
-        const bool now_light = toolbar_.theme() == Theme::light;
-        Color& stroke = current_style_.stroke;
-        const bool neutral_light = stroke.red > 200U
-            && stroke.green > 200U && stroke.blue > 200U;
-        const bool neutral_dark = stroke.red < 60U
-            && stroke.green < 60U && stroke.blue < 60U;
-        if (now_light && neutral_light) {
-            stroke = Toolbar::color_for(UiAction::color_black);
-        } else if (!now_light && neutral_dark) {
-            stroke = Toolbar::color_for(UiAction::color_white);
+        if (recent_files_) {
+            recent_files_->set_light_theme(toolbar_.theme() == Theme::light);
         }
         if (view_mode_ == ViewMode::home) {
             home_view_.relayout(
@@ -5870,35 +6868,17 @@ void Application::activate_ui_action(const UiAction action)
         break;
     case UiAction::settings_close:
         if (toolbar_.settings_page() == SettingsPage::color_editor) {
-            if (toolbar_.custom_color_target()
-                    == CustomColorTarget::stroke
-                || toolbar_.custom_color_target()
-                    == CustomColorTarget::fill) {
-                toolbar_.close_settings_panel();
-            } else {
-                toolbar_.set_settings_page(SettingsPage::canvas);
-            }
+            cancel_custom_color();
         } else {
             toolbar_.close_settings_panel();
         }
-        break;
-    case UiAction::stabilization_off:
-        drawing_settings_.stabilization = StrokeStabilization::off;
-        break;
-    case UiAction::stabilization_light:
-        drawing_settings_.stabilization = StrokeStabilization::light;
-        break;
-    case UiAction::stabilization_default:
-        drawing_settings_.stabilization = StrokeStabilization::standard;
-        break;
-    case UiAction::stabilization_strong:
-        drawing_settings_.stabilization = StrokeStabilization::strong;
         break;
     case UiAction::edit_background_custom:
         toolbar_.begin_custom_color(
             CustomColorTarget::background, background_color_);
         break;
     case UiAction::edit_grid_custom:
+        color_editor_original_grid_ = grid_color_;
         toolbar_.begin_custom_color(
             CustomColorTarget::grid,
             grid_color_.value_or(Color{110U, 120U, 140U, 255U}));
@@ -5919,6 +6899,9 @@ void Application::activate_ui_action(const UiAction action)
         grid_color_ = Toolbar::grid_color_for(action);
         break;
     case UiAction::custom_color_done:
+        if (!toolbar_.finish_hex_edit()) { sync_toolbar(); return; }
+        static_cast<void>(SDL_StopTextInput(window_.get()));
+        toolbar_.remember_custom_color();
         if (toolbar_.custom_color_target() == CustomColorTarget::stroke
             || toolbar_.custom_color_target() == CustomColorTarget::fill) {
             const Color color = toolbar_.custom_color();
@@ -5933,7 +6916,28 @@ void Application::activate_ui_action(const UiAction action)
                 current_style_.stroke = color;
             }
         } else {
+            if (toolbar_.custom_color_target() == CustomColorTarget::background) background_color_ = toolbar_.custom_color();
+            else grid_color_ = toolbar_.custom_color();
             toolbar_.set_settings_page(SettingsPage::canvas);
+        }
+        break;
+    case UiAction::custom_color_cancel:
+        cancel_custom_color();
+        break;
+    case UiAction::custom_hex_field:
+        toolbar_.begin_hex_edit();
+        static_cast<void>(SDL_StartTextInput(window_.get()));
+        break;
+    case UiAction::recent_color_0:
+    case UiAction::recent_color_1:
+    case UiAction::recent_color_2:
+    case UiAction::recent_color_3:
+    case UiAction::recent_color_4:
+    case UiAction::recent_color_5:
+        if (const UiControl* control = toolbar_.find(action); control != nullptr && control->accent.has_value()) {
+            toolbar_.set_custom_color(*control->accent);
+            if (toolbar_.custom_color_target() == CustomColorTarget::background) background_color_ = toolbar_.custom_color();
+            else if (toolbar_.custom_color_target() == CustomColorTarget::grid) grid_color_ = toolbar_.custom_color();
         }
         break;
     case UiAction::custom_hue_field:
@@ -6117,7 +7121,7 @@ void Application::show_board_dialog(const bool save)
     });
     if (save) {
         const std::string default_location = board_file_.has_value()
-            ? board_file_->path().string()
+            ? path_to_utf8(board_file_->path())
             : untitled_name_ + ".sawer";
         SDL_ShowSaveFileDialog(
             board_dialog_callback,
@@ -6209,6 +7213,22 @@ void Application::begin_background_open(const std::filesystem::path& path)
     cancel_selection_gesture();
     selection_.clear();
     background_open_origin_generation_ = lifecycle_generation_;
+    status_error_.clear();
+    status_notice_ = "Opening " + path_to_utf8(path.filename()) + "...";
+
+    toolbar_.close_settings_panel();
+    toolbar_.clear_pointer();
+    toolbar_.clear_focus();
+    ui_pointer_down_ = false;
+    title_pointer_down_ = false;
+    left_button_down_ = false;
+    middle_button_down_ = false;
+    hand_dragging_ = false;
+    space_down_ = false;
+    shift_down_ = false;
+    left_shift_down_ = false;
+    right_shift_down_ = false;
+    color_drag_action_.reset();
 
     background_open_ = std::async(
         std::launch::async,
@@ -6216,9 +7236,19 @@ void Application::begin_background_open(const std::filesystem::path& path)
             BackgroundOpenResult result;
             result.path = path;
             result.session = BoardFileSession::open(
-                path, result.document, result.recovered_final_line);
+                path, result.document, result.recovered_final_line, &result.decoded_images);
             return result;
         });
+    if (view_mode_ == ViewMode::home) {
+        // Home has no live document. Show the empty canvas shell immediately;
+        // the worker owns the incoming document until replay has succeeded.
+        background_open_home_path_ = path;
+        view_mode_ = ViewMode::board;
+        home_view_.clear_pointer();
+        update_window_title();
+    } else {
+        sync_toolbar();
+    }
 }
 
 void Application::poll_background_open() noexcept
@@ -6234,6 +7264,12 @@ void Application::poll_background_open() noexcept
         auto result = background_open_.get();
         background_open_origin_generation_ = 0U;
         if (origin_generation != lifecycle_generation_) {
+            if (background_open_home_path_.has_value()) {
+                background_open_home_path_.reset();
+                view_mode_ = ViewMode::home;
+                update_window_title();
+            }
+            status_notice_.clear();
             status_error_ =
                 "Open was canceled because the current board changed.";
             if (view_mode_ == ViewMode::home) {
@@ -6244,7 +7280,10 @@ void Application::poll_background_open() noexcept
             return;
         }
         remember_current_board_zoom();
+        background_open_home_path_.reset();
         document_ = std::move(result.document);
+        renderer_->invalidate_document_cache();
+        renderer_->adopt_decoded_images(std::move(result.decoded_images));
         board_file_ = std::move(result.session);
         history_ = {};
         history_.mark_saved(document_);
@@ -6255,6 +7294,9 @@ void Application::poll_background_open() noexcept
         }
         restore_board_zoom(result.path);
         status_error_.clear();
+        status_notice_ = result.recovered_final_line
+            ? "Recovered an interrupted final write. Your board is safe."
+            : std::string{};
         update_window_title();
         sync_toolbar();
         record_navigation_target();
@@ -6265,6 +7307,12 @@ void Application::poll_background_open() noexcept
         }
     } catch (const std::exception& error) {
         background_open_origin_generation_ = 0U;
+        if (background_open_home_path_.has_value()) {
+            background_open_home_path_.reset();
+            view_mode_ = ViewMode::home;
+            update_window_title();
+        }
+        status_notice_.clear();
         status_error_ = error.what();
         log::write(log::Level::error, status_error_);
         if (view_mode_ == ViewMode::home) {
@@ -6313,8 +7361,10 @@ bool Application::poll_background_previews() noexcept
 void Application::update_window_title()
 {
     std::string title{"Sawer"};
-    if (board_file_.has_value()) {
-        title += " — " + board_file_->path().stem().string();
+    if (background_open_home_path_.has_value()) {
+        title += " — " + path_to_utf8(background_open_home_path_->stem());
+    } else if (board_file_.has_value()) {
+        title += " — " + path_to_utf8(board_file_->path().stem());
     } else {
         title += " — " + untitled_name_;
     }

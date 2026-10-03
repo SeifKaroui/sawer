@@ -11,6 +11,37 @@ inline constexpr std::size_t maximum_stroke_samples = 1'000'000U;
 inline constexpr std::size_t maximum_processed_stroke_points =
     maximum_stroke_point_count;
 
+// Builds the visible and stored pencil path together. Completed curve
+// segments are never revisited; only the short uncommitted tail is replaced
+// when a new point arrives. finish() therefore has bounded work and leaves the
+// exact geometry that was last shown by the live preview.
+class IncrementalStrokeCurve final {
+public:
+    void reset(Vec2d initial_point, double flatness_tolerance);
+
+    [[nodiscard]] bool push(
+        Vec2d point,
+        std::vector<Vec2d>& output);
+
+    [[nodiscard]] bool finish(
+        Vec2d endpoint,
+        std::vector<Vec2d>& output);
+
+    [[nodiscard]] std::size_t stable_point_count() const noexcept;
+    [[nodiscard]] bool finished() const noexcept;
+
+private:
+    void append_preview(std::vector<Vec2d>& output) const;
+
+    Vec2d before_{};
+    Vec2d start_{};
+    Vec2d end_{};
+    double flatness_tolerance_{0.05};
+    std::size_t stable_point_count_{1U};
+    std::size_t knot_count_{};
+    bool finished_{};
+};
+
 [[nodiscard]] bool append_filtered_point(
     std::vector<Vec2d>& points,
     Vec2d point,

@@ -181,15 +181,15 @@ SOFTWARE.
 
 Source: https://github.com/nlohmann/json/releases/tag/v3.12.0
 
-## Source Sans 3 version 3.052
+## Inter version 4.1
 
-Sawer embeds the Regular, Medium, and Semibold weights of Source Sans 3.
+Sawer embeds the Regular, Medium, and Semibold weights of Inter.
 
-Copyright 2010-2023 Adobe (http://www.adobe.com/), with Reserved Font Name
-`Source'. Source is a trademark of Adobe in the United States and/or other
-countries.
+Copyright 2016 The Inter Project Authors.
 
-Source: https://github.com/adobe-fonts/source-sans/tree/3.052R
+Inter was designed by Rasmus Andersson.
+
+Source: https://github.com/rsms/inter/releases/tag/v4.1
 
 ### SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
 

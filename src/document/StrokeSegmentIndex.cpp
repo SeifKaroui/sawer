@@ -11,6 +11,8 @@ namespace {
 
 constexpr std::size_t maximum_segment_chunks = 64U;
 constexpr std::size_t maximum_direct_query_chunks = 4'096U;
+constexpr std::size_t maximum_index_references = 1'000'000U;
+constexpr std::size_t segments_per_block = 256U;
 
 std::int32_t chunk_coordinate(const double value) noexcept
 {
@@ -50,12 +52,17 @@ void StrokeSegmentIndex::rebuild(const Stroke& stroke)
 {
     chunks_.clear();
     oversized_segments_.clear();
+    segment_blocks_.clear();
+    block_segment_count_ = 0U;
+    std::size_t references = 0U;
+    bool use_blocks = false;
     double total_length = 0.0;
     for (std::size_t index = 1U; index < stroke.points.size(); ++index) {
         const Vec2d first = stroke.points[index - 1U];
         const Vec2d second = stroke.points[index];
         total_length += std::hypot(
             second.x - first.x, second.y - first.y);
+        if (use_blocks) continue;
         const auto min_x = static_cast<std::int64_t>(
             chunk_coordinate(std::min(first.x, second.x)));
         const auto min_y = static_cast<std::int64_t>(
@@ -64,8 +71,15 @@ void StrokeSegmentIndex::rebuild(const Stroke& stroke)
             chunk_coordinate(std::max(first.x, second.x)));
         const auto max_y = static_cast<std::int64_t>(
             chunk_coordinate(std::max(first.y, second.y)));
-        if (covered_chunks(min_x, min_y, max_x, max_y)
-            > maximum_segment_chunks) {
+        const auto covered = covered_chunks(min_x, min_y, max_x, max_y);
+        references += covered > maximum_segment_chunks ? 1U : static_cast<std::size_t>(covered);
+        if (references > maximum_index_references) {
+            decltype(chunks_){}.swap(chunks_);
+            std::vector<std::uint32_t>{}.swap(oversized_segments_);
+            use_blocks = true;
+            continue;
+        }
+        if (covered > maximum_segment_chunks) {
             oversized_segments_.push_back(
                 static_cast<std::uint32_t>(index));
             continue;
@@ -77,6 +91,21 @@ void StrokeSegmentIndex::rebuild(const Stroke& stroke)
                     static_cast<std::int32_t>(y)}].push_back(
                         static_cast<std::uint32_t>(index));
             }
+        }
+    }
+    if (use_blocks) {
+        block_segment_count_ = stroke.points.size() - 1U;
+        segment_blocks_.reserve((block_segment_count_ + segments_per_block - 1U) / segments_per_block);
+        for (std::size_t first = 1U; first < stroke.points.size(); first += segments_per_block) {
+            Aabb bounds = Aabb::from_points(stroke.points[first - 1U], stroke.points[first]);
+            const auto end = std::min(stroke.points.size(), first + segments_per_block);
+            for (std::size_t point = first + 1U; point < end; ++point) {
+                bounds.min_x = std::min(bounds.min_x, stroke.points[point].x);
+                bounds.min_y = std::min(bounds.min_y, stroke.points[point].y);
+                bounds.max_x = std::max(bounds.max_x, stroke.points[point].x);
+                bounds.max_y = std::max(bounds.max_y, stroke.points[point].y);
+            }
+            segment_blocks_.push_back(bounds);
         }
     }
     average_segment_length_ = stroke.points.size() > 1U
@@ -91,6 +120,17 @@ void StrokeSegmentIndex::query(
     const Aabb& bounds,
     std::vector<std::uint32_t>& result) const
 {
+    if (!segment_blocks_.empty()) {
+        result.clear();
+        for (std::size_t block = 0U; block < segment_blocks_.size(); ++block) {
+            if (!segment_blocks_[block].intersects(bounds)) continue;
+            const std::size_t first = block * segments_per_block + 1U;
+            const auto end = std::min(block_segment_count_ + 1U, first + segments_per_block);
+            for (std::size_t segment = first; segment < end; ++segment)
+                result.push_back(static_cast<std::uint32_t>(segment));
+        }
+        return;
+    }
     result = oversized_segments_;
     const auto min_x = static_cast<std::int64_t>(
         chunk_coordinate(bounds.min_x));
@@ -136,7 +176,8 @@ std::size_t StrokeSegmentIndex::estimated_memory_bytes() const noexcept
         + chunks_.bucket_count() * sizeof(void*)
         + chunks_.size()
             * (sizeof(decltype(chunks_)::value_type) + node_links)
-        + oversized_segments_.capacity() * sizeof(std::uint32_t);
+        + oversized_segments_.capacity() * sizeof(std::uint32_t)
+        + segment_blocks_.capacity() * sizeof(Aabb);
     for (const auto& [key, segments] : chunks_) {
         static_cast<void>(key);
         bytes += segments.capacity() * sizeof(std::uint32_t);

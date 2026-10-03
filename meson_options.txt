@@ -16,5 +16,5 @@ option(
   'font_cache_dir',
   type: 'string',
   value: '',
-  description: 'Optional directory containing the three hash-verified Source Sans 3 font files',
+  description: 'Optional directory containing the three hash-verified Inter font files',
 )

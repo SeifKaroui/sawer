@@ -1,4 +1,8 @@
 #include "renderer/GpuRenderer.hpp"
+#include "renderer/BackgroundGrid.hpp"
+#include "renderer/StrokeDetail.hpp"
+#include "renderer/BackgroundParameters.hpp"
+#include "renderer/BoardTheme.hpp"
 
 #include "canvas/Camera.hpp"
 #include "canvas/Selection.hpp"
@@ -22,6 +26,14 @@
 #include "shaders/generated/colored_triangle.vert.spv.h"
 #include "shaders/generated/image.frag.dxil.h"
 #include "shaders/generated/image.frag.spv.h"
+#include "shaders/generated/background.vert.dxil.h"
+#include "shaders/generated/background.vert.spv.h"
+#include "shaders/generated/background.frag.dxil.h"
+#include "shaders/generated/background.frag.spv.h"
+#include "shaders/generated/retained.vert.dxil.h"
+#include "shaders/generated/retained.vert.spv.h"
+#include "shaders/generated/retained.frag.dxil.h"
+#include "shaders/generated/retained.frag.spv.h"
 #include "shaders/generated/image.vert.dxil.h"
 #include "shaders/generated/image.vert.spv.h"
 #include <algorithm>
@@ -42,6 +54,18 @@
 
 namespace sawer {
 namespace {
+
+constexpr char text_style_key(const TextStyle style) noexcept
+{
+    switch (style) {
+    case TextStyle::secondary: return 'S';
+    case TextStyle::bold: return 'B';
+    case TextStyle::title: return 'T';
+    case TextStyle::document: return 'D';
+    case TextStyle::caption: return 'C';
+    default: return 'R';
+    }
+}
 
 struct RenderColor final {
     float red;
@@ -122,6 +146,10 @@ constexpr std::array<float, 4> text_color(
 static_assert(sizeof(GeometryVertex) == 12U);
 static_assert(sizeof(CachedWorldVertex) == 24U);
 constexpr Uint32 maximum_vertex_count = 1'048'576U;
+constexpr std::size_t scene_batch_vertex_count =
+    maximum_vertex_count - maximum_vertex_count % 3U;
+constexpr std::size_t stroke_page_vertex_count = 65'535U;
+constexpr std::size_t maximum_cached_stroke_vertices = scene_batch_vertex_count;
 constexpr std::size_t initial_scene_vertex_capacity = 524'288U;
 constexpr std::size_t initial_draft_vertex_capacity = 524'288U;
 constexpr std::size_t initial_overlay_vertex_capacity = 65'536U;
@@ -164,6 +192,13 @@ public:
         swapchain_acquired_ = true;
     }
 
+    // Only used after release(), when a submission consumed the old buffer.
+    void reset(SDL_GPUCommandBuffer* command_buffer) noexcept
+    {
+        command_buffer_ = command_buffer;
+        swapchain_acquired_ = false;
+    }
+
     [[nodiscard]] SDL_GPUCommandBuffer* release() noexcept
     {
         SDL_GPUCommandBuffer* const result = command_buffer_;
@@ -175,6 +210,17 @@ private:
     SDL_GPUCommandBuffer* command_buffer_ = nullptr;
     bool swapchain_acquired_ = false;
 };
+
+[[noreturn]] void throw_sdl(std::string_view operation);
+
+void submit_and_wait(SDL_GPUDevice* device, SDL_GPUCommandBuffer* command_buffer)
+{
+    SDL_GPUFence* const fence = SDL_SubmitGPUCommandBufferAndAcquireFence(command_buffer);
+    if (fence == nullptr) throw_sdl("GPU batch submission");
+    const bool complete = SDL_WaitForGPUFences(device, true, &fence, 1U);
+    SDL_ReleaseGPUFence(device, fence);
+    if (!complete) throw_sdl("GPU batch completion");
+}
 
 constexpr std::size_t initial_transfer_capacity_bytes =
     8U * 1024U * 1024U;
@@ -206,19 +252,20 @@ constexpr bool is_tool_action(const UiAction action) noexcept
 constexpr bool uses_soft_property_selection(const UiAction action) noexcept
 {
     return action == UiAction::edit_stroke_custom
+        || action == UiAction::properties_menu
         || action == UiAction::color_target_stroke
         || action == UiAction::color_target_fill
         || action == UiAction::fill_none
         || (action >= UiAction::width_thin
             && action <= UiAction::width_increase)
         || (action >= UiAction::roundness_square
-            && action <= UiAction::roundness_full)
-        || (action >= UiAction::stabilization_off
-            && action <= UiAction::stabilization_strong);
+            && action <= UiAction::roundness_full);
 }
 
 std::optional<UiRect> tooltip_bounds(
-    const Toolbar& toolbar, const UiControl* const control) noexcept
+    const Toolbar& toolbar, const UiControl* const control,
+    const double text_width,
+    const double text_height = 0.0) noexcept
 {
     if (control == nullptr || control->tooltip.empty()) {
         return std::nullopt;
@@ -228,27 +275,27 @@ std::optional<UiRect> tooltip_bounds(
     const double spacing = 12.0 * scale;
     const double width = std::min(
         toolbar.viewport_width() - margin * 2.0,
-        static_cast<double>(control->tooltip.size()) * 7.4 * scale
-            + 24.0 * scale);
-    const double height = 30.0 * scale;
+        text_width + 24.0 * scale);
+    const double height = std::max(30.0 * scale, text_height + 12.0 * scale);
 
-    const bool left_rail =
-        control->bounds.x < 80.0 * scale
-        && control->bounds.y >= toolbar.height();
-    if (left_rail) {
-        // The open contextual sidecar already identifies the active tool.
-        // Suppressing that tool's tooltip avoids covering both surfaces.
-        if (control->selected && is_tool_action(control->action)
-            && toolbar.find(UiAction::width_cycle) != nullptr) {
-            return std::nullopt;
-        }
-        const double x = control->bounds.x + control->bounds.width
-            + 10.0 * scale;
+    if (toolbar.is_property_control(control->action)) {
+        // Keep help beside the entire options panel so adjacent controls stay
+        // visible. Compact windows fall back to the roomier vertical side.
+        const UiRect panel = toolbar.properties_bounds();
+        const double x = panel.x + panel.width + spacing;
         const double y = std::clamp(
             control->bounds.y + (control->bounds.height - height) * 0.5,
             margin,
             std::max(margin, toolbar.viewport_height() - height - margin));
-        return UiRect{x, y, width, height};
+        if (x + width <= toolbar.viewport_width() - margin) {
+            return UiRect{x, y, width, height};
+        }
+        const double fallback_x = std::clamp(control->bounds.x,
+            margin, std::max(margin, toolbar.viewport_width() - width - margin));
+        const double below = control->bounds.y + control->bounds.height + spacing;
+        const double fallback_y = below + height <= toolbar.viewport_height() - margin
+            ? below : std::max(margin, control->bounds.y - height - spacing);
+        return UiRect{fallback_x, fallback_y, width, height};
     }
 
     if (is_settings_control(toolbar, control)) {
@@ -397,6 +444,56 @@ SDL_GPUShader* create_text_shader(
             : "Text fragment shader creation");
     }
     return shader;
+}
+
+SDL_GPUShader* create_embedded_shader(SDL_GPUDevice* device, const bool vertex,
+    const std::span<const unsigned char> dxil, const std::span<const unsigned char> spirv,
+    const Uint32 uniforms)
+{
+    SDL_GPUShaderCreateInfo info{};
+    info.entrypoint = "main";
+    info.stage = vertex ? SDL_GPU_SHADERSTAGE_VERTEX : SDL_GPU_SHADERSTAGE_FRAGMENT;
+    info.num_uniform_buffers = uniforms;
+    const bool use_dxil = (SDL_GetGPUShaderFormats(device) & SDL_GPU_SHADERFORMAT_DXIL) != 0U;
+    const auto bytes = use_dxil ? dxil : spirv;
+    info.format = use_dxil ? SDL_GPU_SHADERFORMAT_DXIL : SDL_GPU_SHADERFORMAT_SPIRV;
+    info.code = bytes.data();
+    info.code_size = bytes.size();
+    auto* shader = SDL_CreateGPUShader(device, &info);
+    if (shader == nullptr) throw_sdl("Embedded shader creation");
+    return shader;
+}
+
+SDL_GPUGraphicsPipeline* create_auxiliary_pipeline(SDL_GPUDevice* device,
+    SDL_Window* window, SDL_GPUShader* vertex, SDL_GPUShader* fragment,
+    const int samples, const bool mesh)
+{
+    const SDL_GPUVertexBufferDescription buffer{0U, sizeof(GeometryVertex), SDL_GPU_VERTEXINPUTRATE_VERTEX, 0U};
+    const std::array<SDL_GPUVertexAttribute, 2> attributes{{
+        {0U, 0U, SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, 0U},
+        {1U, 0U, SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM, 8U}}};
+    SDL_GPUColorTargetDescription target{};
+    target.format = SDL_GetGPUSwapchainTextureFormat(device, window);
+    SDL_GPUGraphicsPipelineCreateInfo info{};
+    info.vertex_shader = vertex;
+    info.fragment_shader = fragment;
+    if (mesh) {
+        info.vertex_input_state.vertex_buffer_descriptions = &buffer;
+        info.vertex_input_state.num_vertex_buffers = 1U;
+        info.vertex_input_state.vertex_attributes = attributes.data();
+        info.vertex_input_state.num_vertex_attributes = 2U;
+    }
+    info.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    info.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+    info.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+    info.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+    info.rasterizer_state.enable_depth_clip = true;
+    info.multisample_state.sample_count = gpu_sample_count(samples);
+    info.target_info.color_target_descriptions = &target;
+    info.target_info.num_color_targets = 1U;
+    auto* pipeline = SDL_CreateGPUGraphicsPipeline(device, &info);
+    if (pipeline == nullptr) throw_sdl("Auxiliary pipeline creation");
+    return pipeline;
 }
 
 SDL_GPUShader* create_image_shader(
@@ -574,9 +671,16 @@ double smooth_theme_transition(const HomeView& home) noexcept
 
 InterfacePalette home_palette(const HomeView& home)
 {
+    const auto gallery_palette = [](const bool light) {
+        InterfacePalette palette = interface_palette(light);
+        palette.background = light ? rgb(0xEEF0F3U) : rgb(0x0F1114U);
+        palette.surface = light ? rgb(0xFFFFFFU) : rgb(0x202429U);
+        palette.preview_surface = light ? rgb(0xFAFBFCU) : rgb(0x1B1F24U);
+        return palette;
+    };
     return mix_palette(
-        interface_palette(home.previous_theme() == Theme::light),
-        interface_palette(home.theme() == Theme::light),
+        gallery_palette(home.previous_theme() == Theme::light),
+        gallery_palette(home.theme() == Theme::light),
         smooth_theme_transition(home));
 }
 
@@ -775,7 +879,22 @@ void set_geometry_alpha(
     if (!spans.empty() && spans.back().alpha == value) {
         return;
     }
-    spans.push_back(GeometrySpan{vertex, value});
+    spans.push_back(GeometrySpan{vertex, value,
+        spans.empty() ? std::nullopt : spans.back().clip});
+}
+
+void set_geometry_clip(
+    std::vector<GeometrySpan>& spans,
+    const std::vector<GeometryVertex>& output,
+    const std::optional<std::array<double, 4>>& clip)
+{
+    const auto vertex = static_cast<std::uint32_t>(output.size());
+    if (!spans.empty() && spans.back().first_vertex == vertex) {
+        spans.back().clip = clip;
+    } else if (spans.empty() || spans.back().clip != clip) {
+        spans.push_back(GeometrySpan{vertex,
+            spans.empty() ? 1.0F : spans.back().alpha, clip});
+    }
 }
 
 constexpr bool can_append_vertices(
@@ -1209,24 +1328,21 @@ void append_icon(
         svg_line(12.0, 18.0, 12.0, 12.0);
         break;
     case UiIcon::folder_open:
-        // Lucide "folder-open".
-        svg_line(6.0, 14.0, 7.5, 11.1);
-        svg_arc(7.5, 11.1, 9.24, 10.0, 2.0, 2.0, false, true);
-        svg_line(9.24, 10.0, 20.0, 10.0);
-        svg_arc(20.0, 10.0, 21.94, 12.5, 2.0, 2.0, false, true);
-        svg_line(21.94, 12.5, 20.4, 18.5);
-        svg_arc(20.4, 18.5, 18.45, 20.0, 2.0, 2.0, false, true);
-        svg_line(18.45, 20.0, 4.0, 20.0);
-        svg_arc(4.0, 20.0, 2.0, 18.0, 2.0, 2.0, false, true);
-        svg_line(2.0, 18.0, 2.0, 5.0);
-        svg_arc(2.0, 5.0, 4.0, 3.0, 2.0, 2.0, false, true);
-        svg_line(4.0, 3.0, 7.9, 3.0);
-        svg_arc(7.9, 3.0, 9.59, 3.9, 2.0, 2.0, false, true);
-        svg_line(9.59, 3.9, 10.4, 5.1);
-        svg_arc(10.4, 5.1, 12.07, 6.0, 2.0, 2.0, false, false);
-        svg_line(12.07, 6.0, 18.0, 6.0);
-        svg_arc(18.0, 6.0, 20.0, 8.0, 2.0, 2.0, false, true);
-        svg_line(20.0, 8.0, 20.0, 10.0);
+        // Lucide "folder". The single continuous silhouette stays legible at
+        // Home's compact icon size and avoids the visually busy overlapping
+        // flap used by the previous open-folder drawing.
+        svg_arc(20.0, 20.0, 22.0, 18.0, 2.0, 2.0, false, false);
+        svg_line(22.0, 18.0, 22.0, 8.0);
+        svg_arc(22.0, 8.0, 20.0, 6.0, 2.0, 2.0, false, false);
+        svg_line(20.0, 6.0, 12.1, 6.0);
+        svg_arc(12.1, 6.0, 10.41, 5.1, 2.0, 2.0, false, true);
+        svg_line(10.41, 5.1, 9.6, 3.9);
+        svg_arc(9.6, 3.9, 7.93, 3.0, 2.0, 2.0, false, false);
+        svg_line(7.93, 3.0, 4.0, 3.0);
+        svg_arc(4.0, 3.0, 2.0, 5.0, 2.0, 2.0, false, false);
+        svg_line(2.0, 5.0, 2.0, 18.0);
+        svg_arc(2.0, 18.0, 4.0, 20.0, 2.0, 2.0, false, false);
+        svg_line(4.0, 20.0, 20.0, 20.0);
         break;
     case UiIcon::home:
         // Lucide "house".
@@ -1452,6 +1568,54 @@ void append_icon(
     }
     case UiIcon::zoom_reset:
         break;
+    case UiIcon::settings:
+        // Lucide "sliders-horizontal".
+        svg_line(3.0, 6.0, 7.0, 6.0);
+        svg_line(13.0, 6.0, 21.0, 6.0);
+        svg_line(3.0, 18.0, 11.0, 18.0);
+        svg_line(17.0, 18.0, 21.0, 18.0);
+        svg_line(10.0, 3.0, 10.0, 9.0);
+        svg_line(14.0, 15.0, 14.0, 21.0);
+        break;
+    case UiIcon::close:
+        // Lucide "x".
+        svg_line(6.0, 6.0, 18.0, 18.0);
+        svg_line(6.0, 18.0, 18.0, 6.0);
+        break;
+    case UiIcon::check:
+        // Lucide "check".
+        svg_line(20.0, 6.0, 9.0, 17.0);
+        svg_line(9.0, 17.0, 4.0, 12.0);
+        break;
+    case UiIcon::chevron_left:
+        // Lucide "chevron-left".
+        svg_line(15.0, 18.0, 9.0, 12.0);
+        svg_line(9.0, 12.0, 15.0, 6.0);
+        break;
+    case UiIcon::chevron_right:
+        // Lucide "chevron-right".
+        svg_line(9.0, 18.0, 15.0, 12.0);
+        svg_line(15.0, 12.0, 9.0, 6.0);
+        break;
+    case UiIcon::chevron_down:
+        // Lucide "chevron-down".
+        svg_line(6.0, 9.0, 12.0, 15.0);
+        svg_line(12.0, 15.0, 18.0, 9.0);
+        break;
+    case UiIcon::rename:
+        // Text cursor inside an input field, on the Lucide optical grid.
+        svg_line(10.0, 3.0, 12.0, 5.0);
+        svg_line(12.0, 5.0, 14.0, 3.0);
+        svg_line(12.0, 5.0, 12.0, 19.0);
+        svg_line(10.0, 21.0, 12.0, 19.0);
+        svg_line(12.0, 19.0, 14.0, 21.0);
+        svg_line(8.0, 6.0, 4.0, 6.0);
+        svg_line(4.0, 6.0, 4.0, 18.0);
+        svg_line(4.0, 18.0, 8.0, 18.0);
+        svg_line(16.0, 6.0, 20.0, 6.0);
+        svg_line(20.0, 6.0, 20.0, 18.0);
+        svg_line(20.0, 18.0, 16.0, 18.0);
+        break;
     case UiIcon::theme:
         // Lucide "sun".
         ring(4.0, 4.0);
@@ -1464,6 +1628,14 @@ void append_icon(
         svg_line(6.34, 17.66, 4.93, 19.07);
         svg_line(19.07, 4.93, 17.66, 6.34);
         break;
+    case UiIcon::moon:
+        // Crescent on the same 24-unit optical grid as the outline icons.
+        svg_cubic(20.8, 13.0, 20.3, 17.5, 16.5, 21.0, 12.0, 21.0);
+        svg_cubic(12.0, 21.0, 7.0, 21.0, 3.0, 17.0, 3.0, 12.0);
+        svg_cubic(3.0, 12.0, 3.0, 7.5, 6.4, 3.8, 11.0, 3.1);
+        svg_cubic(11.0, 3.1, 9.1, 5.3, 9.0, 8.7, 11.1, 11.0);
+        svg_cubic(11.1, 11.0, 13.4, 13.6, 17.3, 14.4, 20.8, 13.0);
+        break;
     case UiIcon::background:
         // Lucide "grid-2x2".
         svg_line(12.0, 3.0, 12.0, 21.0);
@@ -1471,28 +1643,23 @@ void append_icon(
         rounded_box(-9.0, -9.0, 18.0, 18.0, 2.0);
         break;
     case UiIcon::custom_color: {
-        // Lucide "pipette" converted from its 24-unit SVG path to Sawer's
-        // native rounded line geometry. SVG endpoint arcs are flattened here
-        // so the source silhouette is preserved without runtime SVG loading.
-        svg_line(12.0, 9.0, 3.586, 17.414);
-        svg_arc(3.586, 17.414, 3.0, 18.828, 2.0, 2.0, false, false);
-        svg_line(3.0, 18.828, 3.0, 20.172);
-        svg_arc(3.0, 20.172, 2.414, 21.586, 2.0, 2.0, false, true);
-        svg_arc(2.414, 21.586, 3.828, 21.0, 2.0, 2.0, false, true);
-        svg_line(3.828, 21.0, 5.172, 21.0);
-        svg_arc(5.172, 21.0, 6.586, 20.414, 2.0, 2.0, false, true);
-        svg_line(6.586, 20.414, 15.0, 12.0);
-
-        svg_line(18.0, 9.0, 18.4, 9.4);
-        svg_arc(18.4, 9.4, 15.4, 12.4, 1.0, 1.0, true, true);
-        svg_line(15.4, 12.4, 11.6, 8.6);
-        svg_arc(11.6, 8.6, 14.6, 5.6, 1.0, 1.0, true, true);
-        svg_line(14.6, 5.6, 15.0, 6.0);
-        svg_line(15.0, 6.0, 18.4, 2.6);
-        svg_arc(18.4, 2.6, 21.4, 5.6, 1.0, 1.0, true, true);
-        svg_line(21.4, 5.6, 18.0, 9.0);
-
-        svg_line(2.0, 22.0, 2.414, 21.586);
+        // Palette silhouette on the same optical grid as the outline icons.
+        // This opens color editing; it does not sample pixels from the board.
+        svg_cubic(12.0, 22.0, 6.48, 22.0, 2.0, 17.52, 2.0, 12.0);
+        svg_cubic(2.0, 12.0, 2.0, 6.48, 6.48, 2.0, 12.0, 2.0);
+        svg_cubic(12.0, 2.0, 17.52, 2.0, 22.0, 6.48, 22.0, 12.0);
+        svg_cubic(22.0, 12.0, 22.0, 14.21, 20.21, 16.0, 18.0, 16.0);
+        svg_line(18.0, 16.0, 16.0, 16.0);
+        svg_cubic(16.0, 16.0, 14.90, 16.0, 14.0, 16.90, 14.0, 18.0);
+        svg_cubic(14.0, 18.0, 14.0, 18.45, 14.3, 18.9, 14.3, 19.5);
+        svg_cubic(14.3, 19.5, 14.3, 20.88, 13.38, 22.0, 12.0, 22.0);
+        for (const Vec2d dot : std::array<Vec2d, 4>{{
+                 {8.0, 8.0}, {13.0, 6.0}, {18.0, 10.0}, {6.0, 13.0}}}) {
+            append_screen_circle(output,
+                {center.x + (dot.x - 12.0) * unit,
+                    center.y + (dot.y - 12.0) * unit},
+                1.25 * unit, camera, color, 12U);
+        }
         break;
     }
     case UiIcon::back:
@@ -1655,6 +1822,38 @@ void append_world_vertex(
         },
         packed_color(color),
     });
+}
+
+// Completed long strokes emit triangle-aligned pages instead of dropping
+// samples to fit one mesh. Stopping the cache collector does not change data.
+struct StrokePageStopped final {};
+struct PagedStrokeGeometry final {
+    std::vector<CachedWorldVertex>& page;
+    const std::function<bool(std::span<const CachedWorldVertex>)>& consume;
+    Aabb clip;
+
+    void flush()
+    {
+        if (page.empty()) return;
+        if (!consume(page)) throw StrokePageStopped{};
+        page.clear();
+    }
+};
+
+void append_world_triangle(
+    PagedStrokeGeometry& output, const Vec2d first, const Vec2d second,
+    const Vec2d third, const RenderColor color)
+{
+    const Aabb bounds{std::min({first.x, second.x, third.x}),
+        std::min({first.y, second.y, third.y}),
+        std::max({first.x, second.x, third.x}),
+        std::max({first.y, second.y, third.y})};
+    if (!bounds.intersects(output.clip)) return;
+    if (output.page.size() == stroke_page_vertex_count) output.flush();
+    const auto packed = packed_color(color);
+    output.page.push_back({first, packed});
+    output.page.push_back({second, packed});
+    output.page.push_back({third, packed});
 }
 
 template <typename Output>
@@ -2547,15 +2746,10 @@ void append_cached_geometry(
     }
 }
 
-// The grid is anchored to fixed canvas coordinates with a constant world-space
-// spacing, so its cells/dots keep their position and scale with zoom: larger
-// when zooming in, smaller when zooming out.
-constexpr double grid_world_spacing = 50.0;
-
 // Draws the board's background pattern (dots, squares, rules, diamonds, ...)
 // into the world-space geometry buffer. Line colors are derived from the
 // chosen background color's luminance so any swatch stays legible.
-void append_background_pattern(
+[[maybe_unused]] void append_background_pattern(
     std::vector<GeometryVertex>& output,
     const Vec2d camera_position,
     const BackgroundStyle style,
@@ -2565,12 +2759,21 @@ void append_background_pattern(
     const double min_y,
     const double max_x,
     const double max_y,
+    const Vec2d viewport,
     const double step,
     const double zoom)
 {
     if (style == BackgroundStyle::solid) {
         return;
     }
+
+    const auto grid_plan = plan_background_grid(
+        static_cast<BackgroundGridPattern>(style),
+        viewport.x,
+        viewport.y,
+        zoom,
+        step);
+    const double actual_step = grid_plan.world_spacing;
 
     const float luminance = 0.299F * background.red
         + 0.587F * background.green + 0.114F * background.blue;
@@ -2579,17 +2782,21 @@ void append_background_pattern(
         : (luminance > 0.5F
             ? RenderColor{0.0F, 0.0F, 0.0F}
             : RenderColor{1.0F, 1.0F, 1.0F});
+    const float grid_density = static_cast<float>(grid_plan.density);
     const RenderColor minor = mix_color(
-        background, ink, custom_grid_color.has_value() ? 0.65 : 0.15);
+        background, ink,
+        (custom_grid_color.has_value() ? 0.65F : 0.15F) * grid_density);
     const RenderColor major = mix_color(
-        background, ink, custom_grid_color.has_value() ? 0.84 : 0.32);
+        background, ink,
+        (custom_grid_color.has_value() ? 0.84F : 0.32F) * grid_density);
     const RenderColor axis = mix_color(
-        background, ink, custom_grid_color.has_value() ? 1.0 : 0.48);
+        background, ink,
+        (custom_grid_color.has_value() ? 1.0F : 0.48F) * grid_density);
     const RenderColor dots = mix_color(
-        background, ink, custom_grid_color.has_value() ? 0.78 : 0.26);
+        background, ink,
+        (custom_grid_color.has_value() ? 0.78F : 0.26F) * grid_density);
 
-    // Widths and dot sizes are in world units so the pattern scales with zoom
-    // instead of staying a fixed number of screen pixels.
+    // Keep mark sizes in world units even if distant detail is skipped.
     const double w_minor = step * 0.018;
     const double w_major = step * 0.032;
     const double w_axis = step * 0.05;
@@ -2626,10 +2833,8 @@ void append_background_pattern(
     const auto dot_lattice = [&](const double gstep) {
         const double first_x = std::ceil(min_x / gstep) * gstep;
         const double first_y = std::ceil(min_y / gstep) * gstep;
-        const double r = gstep * 0.045;
-        // Dots are round; when they shrink below a couple of screen pixels a
-        // filled quad is indistinguishable from a circle and far cheaper, which
-        // also keeps the vertex count bounded when zoomed far out.
+        const double r = step * 0.045;
+        // Use less geometry for dots that shrink to a few screen pixels.
         const double screen_r = r * zoom;
         const std::uint32_t segments = screen_r < 2.0
             ? 0U
@@ -2720,35 +2925,35 @@ void append_background_pattern(
 
     switch (style) {
     case BackgroundStyle::dot:
-        dot_lattice(step);
+        dot_lattice(actual_step);
         break;
     case BackgroundStyle::square:
-        vertical_lines(step, true);
-        horizontal_lines(step, true, true);
+        vertical_lines(actual_step, true);
+        horizontal_lines(actual_step, true, true);
         break;
     case BackgroundStyle::graph:
-        vertical_lines(step / 5.0, true);
-        horizontal_lines(step / 5.0, true, true);
+        vertical_lines(actual_step / 5.0, true);
+        horizontal_lines(actual_step / 5.0, true, true);
         break;
     case BackgroundStyle::hybrid:
-        vertical_lines(step, false);
-        horizontal_lines(step, false, true);
-        dot_lattice(step);
+        vertical_lines(actual_step, false);
+        horizontal_lines(actual_step, false, true);
+        dot_lattice(actual_step);
         break;
     case BackgroundStyle::diamond:
-        diagonal_family(1.0, step);
-        diagonal_family(-1.0, step);
+        diagonal_family(1.0, actual_step);
+        diagonal_family(-1.0, actual_step);
         break;
     case BackgroundStyle::wide_rule:
-        horizontal_lines(step, false, false);
+        horizontal_lines(actual_step, false, false);
         break;
     case BackgroundStyle::narrow_rule:
-        horizontal_lines(step * 0.5, false, false);
+        horizontal_lines(actual_step * 0.5, false, false);
         break;
     case BackgroundStyle::triangle:
-        horizontal_lines(step, false, true);
-        diagonal_family(1.7320508, step * 2.0);
-        diagonal_family(-1.7320508, step * 2.0);
+        horizontal_lines(actual_step, false, true);
+        diagonal_family(1.7320508, actual_step * 2.0);
+        diagonal_family(-1.7320508, actual_step * 2.0);
         break;
     case BackgroundStyle::solid:
     case BackgroundStyle::count:
@@ -2788,6 +2993,9 @@ void append_home_geometry(
     const RenderColor accent = palette.primary;
     const RenderColor accent_hover = palette.primary_hover;
     const RenderColor text = palette.text;
+    const RenderColor card_shadow = mix_color(
+        previous_light ? rgb(0x273244U) : rgb(0x000000U),
+        light ? rgb(0x273244U) : rgb(0x000000U), theme_amount);
     const RenderColor danger = mix_color(
         previous_light
             ? RenderColor{0.72F, 0.18F, 0.24F}
@@ -2821,17 +3029,20 @@ void append_home_geometry(
     }
 
     if (home.status_bounds().width > 1.0) {
+        const bool is_error = !home.error_message().empty();
         UiRect bounds = home.status_bounds();
         bounds.y += panel_shift;
         append_screen_rounded_rect(
             output, bounds, 7.0 * scale, camera,
-            mix_color(
-                card_border,
-                danger,
-                (previous_light ? 0.48 : 0.62)
-                    + ((light ? 0.48 : 0.62)
-                        - (previous_light ? 0.48 : 0.62))
-                        * theme_amount));
+            is_error
+                ? mix_color(
+                    card_border,
+                    danger,
+                    (previous_light ? 0.48 : 0.62)
+                        + ((light ? 0.48 : 0.62)
+                            - (previous_light ? 0.48 : 0.62))
+                            * theme_amount)
+                : mix_color(card_border, accent, 0.42));
         UiRect inside = bounds;
         inside.x += 1.0 * scale;
         inside.y += 1.0 * scale;
@@ -2839,21 +3050,24 @@ void append_home_geometry(
         inside.height -= 2.0 * scale;
         append_screen_rounded_rect(
             output, inside, 6.0 * scale, camera,
-            mix_color(
-                previous_light
-                    ? RenderColor{1.0F, 0.955F, 0.958F}
-                    : RenderColor{0.17F, 0.075F, 0.085F},
-                light
-                    ? RenderColor{1.0F, 0.955F, 0.958F}
-                    : RenderColor{0.17F, 0.075F, 0.085F},
-                theme_amount));
+            is_error
+                ? mix_color(
+                    previous_light
+                        ? RenderColor{1.0F, 0.955F, 0.958F}
+                        : RenderColor{0.17F, 0.075F, 0.085F},
+                    light
+                        ? RenderColor{1.0F, 0.955F, 0.958F}
+                        : RenderColor{0.17F, 0.075F, 0.085F},
+                    theme_amount)
+                : palette.accent_soft);
 
         const Vec2d center{
             bounds.x + 21.0 * scale,
             bounds.y + bounds.height * 0.5,
         };
         append_screen_circle(
-            output, center, 11.0 * scale, camera, danger, 24U);
+            output, center, 11.0 * scale, camera,
+            is_error ? danger : accent, 24U);
         UiControl info{};
         info.icon = UiIcon::info;
         append_icon(
@@ -2914,7 +3128,16 @@ void append_home_geometry(
             continue;
         }
         const bool board_card = index < boards.size();
+        const bool board_focused = board_card
+            && focused_control == &control;
         const double hover = animation.hover;
+        const double raw_board_emphasis = board_card
+            ? std::max(
+                hover,
+                (board_focused || boards[index].editing) ? 1.0 : 0.0)
+            : 0.0;
+        const double board_emphasis = raw_board_emphasis
+            * raw_board_emphasis * (3.0 - 2.0 * raw_board_emphasis);
         UiRect bounds = control.bounds;
         bounds.y += home.control_offset(index);
         if (board_card
@@ -2922,12 +3145,9 @@ void append_home_geometry(
                 || bounds.y > home.viewport_height() + vertical_margin)) {
             continue;
         }
-        const double corner = 8.0 * scale;
-        UiRect surface_bounds = bounds;
-        if (board_card) {
-            surface_bounds.height -= HomeView::card_text_area * scale;
-        }
-        if (focused_control == &control) {
+        const double corner = board_card ? 10.0 * scale : 8.0 * scale;
+        const UiRect surface_bounds = bounds;
+        if (focused_control == &control && !board_card) {
             const UiRect focus_bounds{
                 bounds.x - 2.0 * scale,
                 bounds.y - 2.0 * scale,
@@ -2939,47 +3159,121 @@ void append_home_geometry(
                 camera, accent);
         }
 
-        // Surfaces fade into the neutral canvas without elevation.
+        // Only the shadow changes elevation; card content and hit regions stay
+        // fixed throughout hover and press feedback.
+        if (board_card) {
+            const double idle_strength = previous_light ? 0.48 : 0.9;
+            const double strength = idle_strength
+                + ((light ? 0.48 : 0.9) - idle_strength) * theme_amount;
+            append_soft_shadow(
+                output, spans, surface_bounds, corner, camera, card_shadow,
+                scale,
+                (strength + 0.62 * board_emphasis)
+                    * (1.0 - 0.42 * animation.press) * entrance,
+                0.85 + 0.45 * board_emphasis - 0.35 * animation.press);
+        }
+
         const auto entering = [&](const RenderColor color) {
             return mix_color(
                 backdrop, color, 0.3 + 0.7 * entrance);
         };
 
-        const RenderColor border = control.selected
-            ? entering(accent)
-            : entering(mix_color(card_border, accent, hover * 0.32));
+        const RenderColor card_accent =
+            (board_focused || (board_card && boards[index].editing))
+            ? palette.focus : mix_color(accent, accent_hover, animation.press);
+        const RenderColor border = board_card
+            ? entering((board_focused || boards[index].editing) ? card_accent
+                : mix_color(card_border, card_accent, board_emphasis * 0.88))
+            : control.selected
+                ? entering(accent)
+                : entering(mix_color(card_border, accent, hover * 0.38));
         append_screen_rounded_rect(
             output, surface_bounds, corner, camera, border);
 
+        // Card content always starts at the same position. A half-strength
+        // second neutral pixel gives the resting edge an optical 1.5-pixel
+        // weight. Hover builds a cobalt outline; focus and editing give it
+        // full strength so keyboard navigation remains distinct.
+        if (board_card) {
+            for (int inset = 1; inset <= 2; ++inset) {
+                const double amount = static_cast<double>(inset) * scale;
+                UiRect quiet_edge = surface_bounds;
+                quiet_edge.x += amount;
+                quiet_edge.y += amount;
+                quiet_edge.width -= amount * 2.0;
+                quiet_edge.height -= amount * 2.0;
+                append_screen_rounded_rect(
+                    output, quiet_edge,
+                    std::max(corner - amount, 0.0),
+                    camera,
+                    entering(mix_color(
+                        inset == 1
+                            ? mix_color(card_border, card_surface, 0.5)
+                            : card_surface,
+                        (board_focused || boards[index].editing) ? card_accent
+                            : mix_color(card_border, card_accent, 0.88),
+                        board_emphasis)));
+            }
+        }
+        const double content_inset = (board_card ? 3.0 : 1.0) * scale;
         UiRect inner = surface_bounds;
-        inner.x += 1.0 * scale;
-        inner.y += 1.0 * scale;
-        inner.width -= 2.0 * scale;
-        inner.height -= 2.0 * scale;
-        if (control.selected) {
+        inner.x += content_inset;
+        inner.y += content_inset;
+        inner.width -= content_inset * 2.0;
+        inner.height -= content_inset * 2.0;
+        const double inner_corner = std::max(corner - content_inset, 0.0);
+        if (control.selected && !board_card) {
             const double active_state = std::clamp(
                 hover * 0.72 + animation.press * 0.62, 0.0, 1.0);
             const RenderColor fill =
                 mix_color(accent, accent_hover, active_state);
             append_screen_rounded_rect(
-                output, inner, corner - 1.0 * scale, camera,
+                output, inner, inner_corner, camera,
                 entering(fill));
         } else {
-            const RenderColor idle_surface =
-                board_card ? preview_surface : card_surface;
+            const RenderColor idle_surface = card_surface;
             RenderColor fill =
-                mix_color(idle_surface, hovered, hover * 0.72);
+                mix_color(
+                    idle_surface,
+                    hovered,
+                    board_card
+                        ? 0.22 * board_emphasis
+                        : hover * 0.72);
             fill = mix_color(
-                fill, palette.accent_soft, animation.press * 0.22);
+                fill, hovered, animation.press * 0.42);
             append_screen_rounded_rect(
-                output, inner, corner - 1.0 * scale, camera,
+                output, inner, inner_corner, camera,
                 entering(fill));
         }
 
         if (board_card) {
-            const UiRect preview = inner;
+            UiRect preview = inner;
+            preview.height = std::max(
+                preview.height - HomeView::card_text_area * scale,
+                1.0);
+            append_screen_rounded_rect(
+                output, preview, inner_corner, camera,
+                entering(mix_color(
+                    preview_surface,
+                    hovered,
+                    0.18 * board_emphasis)));
 
-            const RenderColor dot_color = entering(palette.preview_dots);
+            append_screen_quad(
+                output,
+                {
+                    inner.x,
+                    preview.y + preview.height - std::max(scale, 1.0),
+                    inner.width,
+                    std::max(scale, 1.0),
+                },
+                camera,
+                entering(mix_color(
+                    card_surface,
+                    card_border,
+                    0.66 + 0.10 * board_emphasis)));
+
+            const RenderColor dot_color = entering(mix_color(
+                preview_surface, palette.preview_dots, 0.46));
             const double dot_step = 18.0 * scale;
             const std::size_t dot_columns = std::max<std::size_t>(
                 1U, static_cast<std::size_t>(
@@ -3002,9 +3296,27 @@ void append_home_geometry(
                                 + static_cast<double>(column) * dot_step,
                             dot_top + static_cast<double>(row) * dot_step,
                         },
-                        std::max(0.95 * scale, 0.95),
+                        std::max(0.72 * scale, 0.72),
                         camera, dot_color, 10U);
                 }
+            }
+
+            if (boards[index].editing) {
+                UiRect field = home.board_name_bounds(index);
+                field.x -= 6.0 * scale;
+                field.y -= 4.0 * scale;
+                field.width += 12.0 * scale;
+                field.height = 32.0 * scale;
+                append_screen_rounded_rect(
+                    output, field, 6.0 * scale, camera,
+                    entering(accent));
+                field.x += 1.0 * scale;
+                field.y += 1.0 * scale;
+                field.width -= 2.0 * scale;
+                field.height -= 2.0 * scale;
+                append_screen_rounded_rect(
+                    output, field, 5.0 * scale, camera,
+                    entering(card_surface));
             }
         }
 
@@ -3037,7 +3349,7 @@ void append_home_geometry(
         }
 
         if (control.icon != UiIcon::none) {
-            const RenderColor icon_color = control.selected
+            const RenderColor icon_color = control.selected && !board_card
                 ? palette.on_primary
                 : entering(text);
             const double size = home_button_icon_size(scale);
@@ -3071,28 +3383,40 @@ void append_home_geometry(
             continue;
         }
         const double hover = home.rename_hover(index);
-        const double card_hover = home.animation(index).hover;
         const bool card_focused =
             index < controls.size() && focused_control == &controls[index];
-        const double visibility = std::clamp(
-            card_hover * 0.78 + hover + (card_focused ? 1.0 : 0.0),
-            0.0,
-            1.0);
+        const double raw_visibility = std::max(
+            home.animation(index).hover,
+            card_focused ? 1.0 : 0.0);
+        const double visibility = raw_visibility * raw_visibility
+            * (3.0 - 2.0 * raw_visibility);
+        if (visibility <= 0.004 || boards[index].editing) {
+            continue;
+        }
         set_geometry_alpha(spans, output, visibility);
+        // Use one surface layer for the fading control. Stacking an outer
+        // rounded rectangle under an inner one made their opacity accumulate,
+        // so the center appeared sooner than the border and glyph.
+        const RenderColor chip_surface = mix_color(
+            mix_color(
+                card_surface,
+                card_border,
+                light ? 0.20 : 0.30),
+            hovered,
+            hover * 0.72);
         append_screen_rounded_rect(
             output, chip, 6.0 * scale, camera,
-            mix_color(card_border, accent, hover * 0.5));
-        UiRect chip_inner = chip;
-        chip_inner.x += 1.0 * scale;
-        chip_inner.y += 1.0 * scale;
-        chip_inner.width -= 2.0 * scale;
-        chip_inner.height -= 2.0 * scale;
-        append_screen_rounded_rect(
-            output, chip_inner, 5.0 * scale, camera,
-            mix_color(card_surface, hovered, hover * 0.8));
+            chip_surface);
+        const double icon_size = 18.0 * scale;
+        const UiRect icon_bounds{
+            chip.x + (chip.width - icon_size) * 0.5,
+            chip.y + (chip.height - icon_size) * 0.5,
+            icon_size,
+            icon_size,
+        };
         append_icon(
-            output, pencil, chip_inner, camera,
-            mix_color(text, accent, hover * 0.8), scale);
+            output, pencil, icon_bounds, camera,
+            mix_color(palette.muted, text, hover), scale);
         set_geometry_alpha(spans, output, 1.0);
     }
 
@@ -3118,16 +3442,25 @@ void append_home_geometry(
                     * theme_amount);
         append_screen_rounded_rect(
             output, scroll_thumb, scroll_thumb.width * 0.5,
-            camera, mix_color(card_border, accent, 0.34));
+            camera, mix_color(card_border, text, 0.32));
         set_geometry_alpha(spans, output, 1.0);
     }
+}
+
+[[nodiscard]] bool is_canvas_pattern(const UiAction action) noexcept
+{
+    return action >= UiAction::grid_solid && action <= UiAction::grid_narrow_rule;
 }
 
 void append_toolbar_geometry(
     std::vector<GeometryVertex>& output,
     std::vector<GeometrySpan>& spans,
     const Camera& camera,
-    const Toolbar& toolbar)
+    const Toolbar& toolbar,
+    const double tooltip_text_width,
+    const double tooltip_text_height,
+    const bool tooltip_allowed,
+    std::optional<std::uint32_t>& tooltip_first_vertex)
 {
     const bool light = toolbar.theme() == Theme::light;
     const bool previous_light =
@@ -3136,10 +3469,9 @@ void append_toolbar_geometry(
     const double scale = toolbar.scale();
     const double reveal = toolbar.reveal();
     const double settings_reveal = toolbar.settings_reveal();
-    const bool style_color_modal = toolbar.style_color_editor_open();
-    constexpr double modal_background_alpha = 0.38;
-    const double background_chrome_alpha =
-        style_color_modal ? modal_background_alpha : 1.0;
+    // Keep chrome opaque behind the picker; translucent panels let board
+    // strokes show through controls and make their state hard to read.
+    constexpr double background_chrome_alpha = 1.0;
     const InterfacePalette palette = toolbar_palette(toolbar);
     const auto theme_value =
         [light, previous_light, theme_amount](
@@ -3184,12 +3516,8 @@ void append_toolbar_geometry(
     const RenderColor error_surface = mix_color(
         panel, danger, theme_value(0.06, 0.13));
 
-    // Entrance: chrome nearest the top slides down while lower controls rise;
-    // both settle as reveal approaches one.
-    const auto slide = [&](const double y) {
-        const double offset = (1.0 - reveal) * 18.0 * scale;
-        return y < toolbar.viewport_height() * 0.5 ? -offset : offset;
-    };
+    // Fade chrome in place so animated surfaces and their hit regions agree.
+    const auto slide = [](double) { return 0.0; };
     const auto shifted = [&](UiRect bounds) {
         bounds.y += slide(bounds.y);
         return bounds;
@@ -3215,12 +3543,10 @@ void append_toolbar_geometry(
             ? toolbar.panels().size() - 2U
             : toolbar.panels().size();
     std::optional<UiRect> modal_bounds;
-    if (style_color_modal
+    if (toolbar.settings_open()
         && settings_panel_index < toolbar.panels().size()) {
         modal_bounds = shifted(
             toolbar.panels()[settings_panel_index].bounds);
-        modal_bounds->y +=
-            (1.0 - settings_reveal) * 10.0 * scale;
     }
     const auto occluded_by_modal = [&](const UiRect bounds) {
         return modal_bounds.has_value()
@@ -3229,63 +3555,6 @@ void append_toolbar_geometry(
             && bounds.y < modal_bounds->y + modal_bounds->height
             && bounds.y + bounds.height > modal_bounds->y;
     };
-
-    // A short bridge makes the vertical context rail read as a sidecar
-    // belonging to the selected tool without merging the control groups.
-    if (toolbar.find(UiAction::width_cycle) != nullptr
-        && toolbar.panels().size() >= 3U) {
-        set_geometry_alpha(spans, output, background_chrome_alpha);
-        constexpr std::array tool_actions{
-            UiAction::select,
-            UiAction::hand,
-            UiAction::pencil,
-            UiAction::line,
-            UiAction::rectangle,
-            UiAction::ellipse,
-        };
-        const UiControl* active_tool = nullptr;
-        for (const UiAction action : tool_actions) {
-            const UiControl* const control = toolbar.find(action);
-            if (control != nullptr && control->selected) {
-                active_tool = control;
-                break;
-            }
-        }
-        if (active_tool != nullptr) {
-            const UiRect tool_panel = shifted(toolbar.panels()[1U].bounds);
-            const UiRect style_panel = shifted(toolbar.panels()[2U].bounds);
-            const UiRect active_bounds = shifted(active_tool->bounds);
-            const double bridge_left =
-                tool_panel.x + tool_panel.width - 1.0 * scale;
-            const double bridge_right = style_panel.x + 1.0 * scale;
-            const double bridge_width = bridge_right - bridge_left;
-            const double center_y =
-                active_bounds.y + active_bounds.height * 0.5;
-            if (bridge_width > 0.0) {
-                append_screen_quad(
-                    output,
-                    {
-                        bridge_left,
-                        center_y - 5.0 * scale,
-                        bridge_width,
-                        10.0 * scale,
-                    },
-                    camera,
-                    panel_border);
-                append_screen_quad(
-                    output,
-                    {
-                        bridge_left,
-                        center_y - 4.0 * scale,
-                        bridge_width,
-                        8.0 * scale,
-                    },
-                    camera,
-                    panel);
-            }
-        }
-        set_geometry_alpha(spans, output, 1.0);
-    }
 
     for (std::size_t index = 0U; index < toolbar.panels().size(); ++index) {
         const bool application_bar = index == 0U;
@@ -3300,22 +3569,32 @@ void append_toolbar_geometry(
             continue;
         }
         UiRect bounds = shifted(toolbar.panels()[index].bounds);
-        if (settings_panel) {
-            bounds.y += (1.0 - settings_reveal) * 10.0 * scale;
-        }
         if (application_bar) {
             set_geometry_alpha(spans, output, panel_alpha);
-            append_screen_quad(
-                output, bounds, camera, palette.background);
-            append_screen_quad(
-                output,
-                {
-                    bounds.x,
-                    bounds.y + bounds.height - std::max(scale, 1.0),
-                    bounds.width,
-                    std::max(scale, 1.0),
-                },
-                camera, panel_border);
+            const UiRect title = toolbar.filename_bounds();
+            const UiControl* rename_button = toolbar.find(UiAction::rename_button);
+            const double document_right = rename_button != nullptr
+                ? rename_button->bounds.x + rename_button->bounds.width
+                : title.x + title.width;
+            const UiControl* utility = toolbar.find(UiAction::toggle_theme);
+            const double island_y = std::max(0.0, (toolbar.height() - 56.0 * scale) * 0.5);
+            const UiRect document_island{8.0 * scale, island_y,
+                document_right, 56.0 * scale};
+            const UiRect utility_island{utility->bounds.x - 8.0 * scale, island_y,
+                toolbar.viewport_width() - utility->bounds.x, 56.0 * scale};
+            for (const UiRect island : {document_island, utility_island}) {
+                append_screen_rounded_rect(output, island, 12.0 * scale, camera, panel_border);
+                append_screen_rounded_rect(output,
+                    {island.x + scale, island.y + scale, island.width - 2.0 * scale, island.height - 2.0 * scale},
+                    11.0 * scale, camera, panel);
+            }
+            if (const UiControl* file = toolbar.find(UiAction::file_menu)) {
+                const double divider_x = file->bounds.x + file->bounds.width + 8.0 * scale;
+                append_screen_line(output,
+                    {divider_x, file->bounds.y + 8.0 * scale},
+                    {divider_x, file->bounds.y + file->bounds.height - 8.0 * scale},
+                    std::max(1.0, scale), camera, panel_border);
+            }
             set_geometry_alpha(spans, output, 1.0);
             continue;
         }
@@ -3373,8 +3652,7 @@ void append_toolbar_geometry(
                 1.15);
         }
         set_geometry_alpha(spans, output, panel_alpha);
-        const double panel_corner =
-            (settings_panel ? 10.0 : 8.0) * scale;
+        const double panel_corner = 12.0 * scale;
         append_screen_rounded_rect(
             output, bounds, panel_corner, camera, panel_border);
         UiRect inner = bounds;
@@ -3388,7 +3666,16 @@ void append_toolbar_geometry(
         set_geometry_alpha(spans, output, 1.0);
     }
 
-    set_geometry_alpha(spans, output, background_chrome_alpha);
+    set_geometry_alpha(spans, output, background_chrome_alpha * toolbar.properties_reveal());
+    const UiRect property_clip = toolbar.properties_clip();
+    // Preserve focus outlines at every edge without expanding the input area.
+    const UiRect property_render_clip = toolbar.properties_render_clip();
+    const std::optional<std::array<double, 4>> property_scissor =
+        property_clip.width > 0.0
+            ? std::optional<std::array<double, 4>>{{property_render_clip.x,
+                property_render_clip.y, property_render_clip.width, property_render_clip.height}}
+            : std::nullopt;
+    set_geometry_clip(spans, output, property_scissor);
     for (const auto& divider_line : toolbar.dividers()) {
         const Vec2d first{
             divider_line.first.x,
@@ -3415,6 +3702,7 @@ void append_toolbar_geometry(
             camera,
             divider);
     }
+    set_geometry_clip(spans, output, std::nullopt);
     set_geometry_alpha(spans, output, 1.0);
 
     // Gaps larger than the normal control spacing mark semantic groups.
@@ -3452,35 +3740,39 @@ void append_toolbar_geometry(
     }
     set_geometry_alpha(spans, output, 1.0);
 
-    const UiControl* const hovered_control = toolbar.hovered_control();
     const UiControl* const focused_control = toolbar.focused_control();
     for (const auto& control : toolbar.controls()) {
         const bool in_settings = is_settings_control(toolbar, &control);
+        set_geometry_clip(spans, output,
+            toolbar.is_property_control(control.action) ? property_scissor : std::nullopt);
         if (!in_settings
             && occluded_by_modal(shifted(control.bounds))) {
             continue;
         }
         const double control_alpha = in_settings
             ? settings_reveal
-            : background_chrome_alpha;
+            : background_chrome_alpha
+                * (toolbar.is_property_control(control.action) ? toolbar.properties_reveal() : 1.0);
         if (control_alpha <= 0.01) {
             continue;
         }
-        const double settings_rise = in_settings
-            ? (1.0 - settings_reveal) * 10.0 * scale
-            : 0.0;
+        const double settings_rise = 0.0;
         if (control.action == UiAction::custom_hue_field) {
             UiRect field = shifted(control.bounds);
             field.y += settings_rise;
             set_geometry_alpha(spans, output, control_alpha);
             append_screen_rounded_rect(
-                output, field, 8.0 * scale, camera, panel_border);
+                output, field, 7.0 * scale, camera, palette.control_surface);
+            const UiRect track = toolbar.color_field_bounds(control.action);
+            append_screen_rounded_rect(output,
+                {track.x - scale, track.y - scale,
+                    track.width + scale * 2.0, track.height + scale * 2.0},
+                3.0 * scale, camera, panel_border);
             // HSV hue is exactly piecewise linear across its six sectors.
             // Interpolating the sector endpoints removes the visible 36-band
             // approximation without increasing the geometry budget.
             constexpr std::uint32_t hue_sectors = 6U;
-            const double inset = 2.0 * scale;
-            const double width = field.width - inset * 2.0;
+            const double width = track.width;
             for (std::uint32_t sector = 0U;
                  sector < hue_sectors;
                  ++sector) {
@@ -3490,27 +3782,26 @@ void append_toolbar_geometry(
                     / static_cast<double>(hue_sectors);
                 append_screen_quad_gradient_horizontal(
                     output,
-                    {field.x + inset + width * first,
-                     field.y + inset,
+                    {track.x + width * first,
+                     track.y,
                      width * (second - first),
-                     field.height - inset * 2.0},
+                     track.height},
                     camera,
                     hsv_render_color(first, 1.0, 1.0),
                     hsv_render_color(second, 1.0, 1.0));
             }
             const Vec2d marker{
-                field.x + inset + width * toolbar.custom_hue(),
+                track.x + width * toolbar.custom_hue(),
                 field.y + field.height * 0.5,
             };
-            append_screen_circle(
-                output, marker, 6.2 * scale, camera,
-                {0.07F, 0.08F, 0.11F}, 24U);
-            append_screen_circle(
-                output, marker, 5.0 * scale, camera,
-                {1.0F, 1.0F, 1.0F}, 20U);
-            append_screen_circle(
-                output, marker, 2.8 * scale, camera,
-                hsv_render_color(toolbar.custom_hue(), 1.0, 1.0), 20U);
+            append_screen_rounded_rect(output,
+                {marker.x - 5.0 * scale, marker.y - 13.0 * scale,
+                    10.0 * scale, 26.0 * scale},
+                3.0 * scale, camera, {0.12F, 0.14F, 0.18F});
+            append_screen_rounded_rect(output,
+                {marker.x - 4.0 * scale, marker.y - 12.0 * scale,
+                    8.0 * scale, 24.0 * scale},
+                2.0 * scale, camera, {1.0F, 1.0F, 1.0F});
             set_geometry_alpha(spans, output, 1.0);
             continue;
         }
@@ -3525,9 +3816,9 @@ void append_toolbar_geometry(
             // modest grid only approximates HSV's saturation/value cross-term.
             constexpr std::uint32_t columns = 16U;
             constexpr std::uint32_t rows = 12U;
-            const double inset = 2.0 * scale;
-            const double width = field.width - inset * 2.0;
-            const double height = field.height - inset * 2.0;
+            const UiRect track = toolbar.color_field_bounds(control.action);
+            const double width = track.width;
+            const double height = track.height;
             for (std::uint32_t row = 0U; row < rows; ++row) {
                 for (std::uint32_t column = 0U; column < columns; ++column) {
                     const double saturation_left =
@@ -3544,10 +3835,10 @@ void append_toolbar_geometry(
                             / static_cast<double>(rows);
                     append_screen_gradient_cell(
                         output,
-                        {field.x + inset
+                        {track.x
                                 + width * static_cast<double>(column)
                                     / static_cast<double>(columns),
-                         field.y + inset
+                         track.y
                                 + height * static_cast<double>(row)
                                     / static_cast<double>(rows),
                          width / static_cast<double>(columns),
@@ -3572,8 +3863,8 @@ void append_toolbar_geometry(
                 }
             }
             const Vec2d marker{
-                field.x + inset + width * toolbar.custom_saturation(),
-                field.y + inset + height * (1.0 - toolbar.custom_value()),
+                track.x + width * toolbar.custom_saturation(),
+                track.y + height * (1.0 - toolbar.custom_value()),
             };
             append_screen_circle(
                 output, marker, 7.0 * scale, camera,
@@ -3581,10 +3872,19 @@ void append_toolbar_geometry(
             append_screen_circle(
                 output, marker, 5.7 * scale, camera,
                 {1.0F, 1.0F, 1.0F}, 20U);
-            append_screen_circle(
-                output, marker, 3.6 * scale, camera,
+            append_screen_circle(output, marker, 4.0 * scale, camera,
                 to_render_color(toolbar.custom_color()), 20U);
             set_geometry_alpha(spans, output, 1.0);
+            continue;
+        }
+        if (control.action == UiAction::custom_hex_field) {
+            const UiRect field = control.bounds;
+            const RenderColor border = !toolbar.hex_valid() ? danger
+                : (toolbar.hex_editing() || focused_control == &control ? palette.focus : panel_border);
+            append_screen_rounded_rect(output, field, 8.0 * scale, camera, border);
+            append_screen_rounded_rect(output,
+                {field.x + scale, field.y + scale, field.width - 2.0 * scale, field.height - 2.0 * scale},
+                7.0 * scale, camera, toolbar.hex_selected() ? palette.accent_soft : panel);
             continue;
         }
         const UiAnimation& animation = toolbar.animation(control.action);
@@ -3595,30 +3895,55 @@ void append_toolbar_geometry(
         const bool color_well =
             control.action == UiAction::color_target_stroke
             || control.action == UiAction::color_target_fill;
+        const Color displayed_swatch = control.accent.has_value()
+            ? board_display_color(*control.accent, board_theme_amount(toolbar)) : Color{};
         const bool no_fill_control =
             control.action == UiAction::fill_none;
-        const bool custom_color_control =
-            control.action == UiAction::edit_stroke_custom
-            && control.accent.has_value();
-        const bool soft_property =
-            uses_soft_property_selection(control.action);
+        const bool canvas_choice = in_settings && toolbar.settings_page() == SettingsPage::canvas
+            && (is_canvas_pattern(control.action) || control.action == UiAction::grid_color_auto
+                || control.action == UiAction::edit_background_custom || control.action == UiAction::edit_grid_custom);
+        const bool custom_color_control = control.accent.has_value()
+            && (control.action == UiAction::edit_stroke_custom
+                || control.action == UiAction::edit_background_custom || control.action == UiAction::edit_grid_custom);
+        const bool soft_property = canvas_choice || uses_soft_property_selection(control.action);
         const bool history_control =
             control.action == UiAction::undo
             || control.action == UiAction::redo;
+        const bool width_stepper = control.action == UiAction::width_decrease
+            || control.action == UiAction::width_increase;
         const bool top_bar_control =
             control.bounds.y < toolbar.height();
         const bool quiet_chrome = control.label.empty()
             && !in_settings;
+        const bool menu_row = in_settings
+            && (toolbar.settings_page() == SettingsPage::file || toolbar.settings_page() == SettingsPage::preferences)
+            && control.action != UiAction::settings_close;
         RenderColor background = information
             ? panel
             : (control.enabled
                 ? (top_bar_control
-                    ? top_bar_button
+                    ? (control.label.empty() && !history_control ? palette.background : top_bar_button)
                     : (quiet_chrome && !history_control ? panel : button))
                 : (history_control
                     ? (top_bar_control ? top_bar_button : button)
                     : disabled));
         background = mix_color(background, hovered, animation.hover);
+        if (menu_row || (toolbar.is_property_control(control.action) && control.action != UiAction::width_cycle)
+            || top_bar_control) {
+            background = mix_color(panel, palette.hover_surface, animation.hover);
+        }
+        if (canvas_choice) {
+            background = mix_color(panel, palette.hover_surface, animation.hover * 0.8);
+        }
+        if (width_stepper) {
+            background = control.enabled
+                ? mix_color(button, hovered, animation.hover)
+                : disabled;
+        }
+        if (swatch_control || custom_color_control) {
+            background = mix_color(panel, hovered, animation.hover);
+            background = mix_color(background, palette.accent_soft, animation.selected);
+        }
         if (control.action == UiAction::delete_selection
             && animation.hover > 0.0) {
             background = mix_color(
@@ -3638,7 +3963,7 @@ void append_toolbar_geometry(
         bounds.width -= inset * 2.0;
         bounds.height -= inset * 2.0;
 
-        const double corner = 7.0 * scale;
+        const double corner = 8.0 * scale;
         set_geometry_alpha(spans, output, control_alpha);
         if (focused_control == &control) {
             append_screen_rounded_rect(
@@ -3662,19 +3987,30 @@ void append_toolbar_geometry(
                 soft_property ? palette.accent_soft : accent,
                 animation.selected);
         }
-        if (custom_color_control) {
-            background = mix_color(
-                panel_border, accent, animation.selected);
-        }
         const bool outlined_property_control =
-            color_well || no_fill_control;
-        if (outlined_property_control && animation.selected > 0.02) {
+            color_well || no_fill_control || custom_color_control;
+        if (canvas_choice) {
+            append_screen_rounded_rect(output, bounds, corner, camera,
+                mix_color(panel_border, palette.focus, animation.selected));
+            const double edge = (1.0 + animation.selected) * scale;
+            append_screen_rounded_rect(output,
+                {bounds.x + edge, bounds.y + edge, bounds.width - edge * 2.0, bounds.height - edge * 2.0},
+                corner - edge, camera, background);
+        } else if (width_stepper) {
+            append_screen_rounded_rect(output, bounds, corner, camera,
+                mix_color(panel_border, palette.focus,
+                    control.enabled ? animation.hover * 0.3 : 0.0));
+            const UiRect inner{bounds.x + scale, bounds.y + scale,
+                bounds.width - 2.0 * scale, bounds.height - 2.0 * scale};
+            append_screen_rounded_rect(output, inner, corner - scale,
+                camera, background);
+        } else if (outlined_property_control && animation.selected > 0.02) {
             append_screen_rounded_rect(
                 output,
                 bounds,
                 corner,
                 camera,
-                mix_color(panel_border, accent, animation.selected));
+                mix_color(panel_border, palette.focus, animation.selected));
             UiRect selected_inner = bounds;
             selected_inner.x += 2.0 * scale;
             selected_inner.y += 2.0 * scale;
@@ -3691,19 +4027,7 @@ void append_toolbar_geometry(
                 output, bounds, corner, camera, background);
         }
 
-        if (custom_color_control) {
-            UiRect inner = bounds;
-            inner.x += 2.0 * scale;
-            inner.y += 2.0 * scale;
-            inner.width -= 4.0 * scale;
-            inner.height -= 4.0 * scale;
-            append_screen_rounded_rect(
-                output,
-                inner,
-                std::max(2.0 * scale, corner - 2.0 * scale),
-                camera,
-                to_render_color(*control.accent));
-        } else if (swatch_control) {
+        if (swatch_control) {
             const Vec2d center{
                 bounds.x + bounds.width * 0.5,
                 bounds.y + bounds.height * 0.5,
@@ -3711,15 +4035,15 @@ void append_toolbar_geometry(
             // Selected colors use the same cobalt outline language as board
             // focus without turning the whole swatch tile into a blue button.
             const double swatch_radius =
-                std::min(bounds.width, bounds.height) * 0.30;
+                std::min(bounds.width, bounds.height) * 0.28;
             if (animation.selected > 0.02) {
                 append_screen_circle(
                     output, center,
-                    swatch_radius + 4.0 * scale,
-                    camera, accent, 28U);
+                    swatch_radius + 3.0 * scale,
+                    camera, palette.focus, 28U);
                 append_screen_circle(
                     output, center,
-                    swatch_radius + 2.0 * scale,
+                    swatch_radius + 1.5 * scale,
                     camera, background, 28U);
             } else {
                 append_screen_circle(
@@ -3729,60 +4053,66 @@ void append_toolbar_geometry(
             }
             append_screen_circle(
                 output, center, swatch_radius, camera,
-                to_render_color(*control.accent), 28U);
-        }
-        if (color_well) {
-            const Vec2d center{
-                bounds.x + 9.0 * scale,
-                bounds.y + bounds.height * 0.5,
-            };
-            append_screen_circle(
-                output, center, 4.5 * scale, camera, panel_border, 20U);
-            if (control.accent.has_value()) {
-                append_screen_circle(
-                    output, center, 3.25 * scale, camera,
-                    to_render_color(*control.accent), 20U);
-            } else {
-                append_screen_circle(
-                    output, center, 3.25 * scale, camera, panel, 20U);
-                append_screen_line(
-                    output,
-                    {
-                        center.x - 2.25 * scale,
-                        center.y + 2.25 * scale,
-                    },
-                    {
-                        center.x + 2.25 * scale,
-                        center.y - 2.25 * scale,
-                    },
-                    1.25 * scale,
-                    camera,
-                    muted);
+                to_render_color(displayed_swatch), 28U);
+            if (animation.selected > 0.45) {
+                const Color swatch = displayed_swatch;
+                const double brightness = (0.2126 * swatch.red
+                    + 0.7152 * swatch.green + 0.0722 * swatch.blue) / 255.0;
+                const RenderColor mark = brightness > 0.58
+                    ? RenderColor{0.10F, 0.12F, 0.16F}
+                    : RenderColor{1.0F, 1.0F, 1.0F};
+                append_screen_line(output,
+                    {center.x - 4.0 * scale, center.y},
+                    {center.x - scale, center.y + 3.0 * scale},
+                    1.8 * scale, camera, mark);
+                append_screen_line(output,
+                    {center.x - scale, center.y + 3.0 * scale},
+                    {center.x + 5.0 * scale, center.y - 4.0 * scale},
+                    1.8 * scale, camera, mark);
             }
         }
-
         if (control.icon != UiIcon::none) {
             RenderColor icon_color = information
                 ? muted
                 : (control.enabled ? text : muted);
             if (animation.selected > 0.45) {
                 icon_color = soft_property
-                    ? accent
+                    ? palette.focus
                     : RenderColor{0.98F, 0.99F, 1.0F};
             }
-            if (custom_color_control) {
-                const Color color = *control.accent;
-                const double luminance =
-                    (0.2126 * static_cast<double>(color.red)
-                     + 0.7152 * static_cast<double>(color.green)
-                     + 0.0722 * static_cast<double>(color.blue))
-                    / 255.0;
-                icon_color = luminance > 0.58
-                    ? RenderColor{0.07F, 0.09F, 0.12F}
-                    : RenderColor{0.98F, 0.99F, 1.0F};
+            UiRect icon_bounds = bounds;
+            if (menu_row) icon_bounds.width = 28.0 * scale;
+            if (control.action == UiAction::properties_menu) {
+                // Keep the chevron centered in a square at the trailing edge,
+                // including when the tab morphs into the collapse button.
+                const double icon_width = std::min(bounds.width, bounds.height);
+                icon_bounds.x += bounds.width - icon_width;
+                icon_bounds.width = icon_width;
             }
-            append_icon(
-                output, control, bounds, camera, icon_color, scale);
+            double icon_scale = scale;
+            if (control.action == UiAction::file_menu) {
+                icon_bounds.x += bounds.width - 20.0 * scale;
+                icon_bounds.width = 16.0 * scale;
+                icon_scale = scale * 0.65;
+            } else if (canvas_choice && is_canvas_pattern(control.action)) {
+                icon_bounds.y += 2.0 * scale;
+                icon_bounds.height = bounds.height - 20.0 * scale;
+                icon_scale = std::min(scale * 0.85, icon_bounds.height / 34.0);
+            } else if (control.action == UiAction::edit_background_custom) {
+                icon_bounds.width = 32.0 * scale;
+                icon_scale = scale * 0.78;
+            } else if (control.action == UiAction::edit_grid_custom) {
+                icon_scale = scale * 0.78;
+            }
+            append_icon(output, control, icon_bounds, camera, icon_color, icon_scale);
+            if (custom_color_control && animation.selected > 0.02) {
+                const Vec2d badge{bounds.x + bounds.width - 9.0 * scale,
+                    bounds.y + bounds.height - 8.0 * scale};
+                append_screen_circle(output, badge, 5.0 * scale,
+                    camera, panel, 20U);
+                append_screen_circle(output, badge, 3.75 * scale,
+                    camera, to_render_color(displayed_swatch), 20U);
+            }
         }
         if (control.partial) {
             append_screen_circle(
@@ -3798,52 +4128,52 @@ void append_toolbar_geometry(
         }
         set_geometry_alpha(spans, output, 1.0);
     }
-
-    if (toolbar.dirty() && !toolbar.panels().empty()
-        && toolbar.panels().back().bounds.width > 1.0
-        && toolbar.panels().back().bounds.height > 1.0) {
-        const UiRect status = shifted(toolbar.panels().back().bounds);
-        if (!occluded_by_modal(status)) {
-            const Vec2d center{
-                status.x + 15.0 * scale,
-                status.y + status.height * 0.5,
-            };
-            // Keep the unsaved marker quiet and static once the surrounding UI
-            // settles so an idle document does not require continuous frames.
-            constexpr double pulse = 0.5;
-            set_geometry_alpha(
-                spans, output,
-                (0.10 + 0.14 * pulse) * background_chrome_alpha);
-            append_screen_circle(
-                output, center, 7.0 * scale, camera,
-                {0.97F, 0.45F, 0.35F}, 22U);
-            set_geometry_alpha(
-                spans, output, background_chrome_alpha);
-            append_screen_circle(
-                output, center, (3.1 + 0.5 * pulse) * scale, camera,
-                {0.97F, 0.42F, 0.32F}, 18U);
-            set_geometry_alpha(spans, output, 1.0);
-        }
+    set_geometry_clip(spans, output, std::nullopt);
+    const UiRect color_preview = toolbar.custom_color_preview_bounds();
+    if (toolbar.settings_open() && color_preview.width > 0.0) {
+        set_geometry_alpha(spans, output, settings_reveal);
+        append_screen_rounded_rect(output,
+            {color_preview.x, color_preview.y, color_preview.height, color_preview.height},
+            7.0 * scale, camera, palette.control_surface);
+        const double swatch_size = color_preview.height - 8.0 * scale;
+        const UiRect swatch{color_preview.x + 4.0 * scale,
+            color_preview.y + 4.0 * scale, swatch_size, swatch_size};
+        append_screen_rounded_rect(output, swatch,
+            5.0 * scale, camera, panel_border);
+        append_screen_rounded_rect(output,
+            {swatch.x + scale, swatch.y + scale,
+                swatch.width - 2.0 * scale, swatch.height - 2.0 * scale},
+            4.0 * scale, camera, to_render_color(board_display_color(toolbar.custom_color(), board_theme_amount(toolbar))));
+        set_geometry_alpha(spans, output, 1.0);
+    }
+    if (toolbar.properties_scroll_limit() > 0.0
+        && toolbar.properties_reveal() == 1.0
+        && !occluded_by_modal(toolbar.properties_bounds())) {
+        const UiRect bounds = toolbar.properties_bounds();
+        const double track_height = property_clip.height;
+        const double thumb_height = std::max(24.0 * scale,
+            track_height * track_height
+                / (track_height + toolbar.properties_scroll_limit()));
+        const double thumb_y = property_clip.y
+            + (track_height - thumb_height) * toolbar.properties_scroll()
+                / toolbar.properties_scroll_limit();
+        append_screen_rounded_rect(output,
+            {bounds.x + bounds.width - 6.0 * scale, thumb_y,
+                3.0 * scale, thumb_height}, 1.5 * scale, camera, muted);
     }
 
-    const UiControl* const tooltip_focused_control =
-        toolbar.focused_tooltip_control();
-    const UiControl* const described_control =
-        hovered_control != nullptr
-        ? hovered_control
-        : tooltip_focused_control;
-    const double described_visibility = hovered_control != nullptr
-        ? toolbar.animation(hovered_control->action).hover
-        : (tooltip_focused_control != nullptr ? 1.0 : 0.0);
-    if (described_control != nullptr && described_visibility > 0.08) {
+    const UiControl* const described_control = toolbar.tooltip_control();
+    const double described_visibility = described_control == nullptr ? 0.0 : 1.0;
+    if (tooltip_allowed && described_control != nullptr && described_visibility > 0.08) {
         const double visibility = described_visibility;
-        if (const auto bounds = tooltip_bounds(toolbar, described_control)) {
+        if (const auto bounds = tooltip_bounds(toolbar, described_control, tooltip_text_width, tooltip_text_height)) {
+            tooltip_first_vertex = static_cast<std::uint32_t>(output.size());
             UiRect animated = shifted(*bounds);
             animated.y += (1.0 - visibility) * 4.0 * scale;
             append_soft_shadow(
                 output, spans, animated, 8.0 * scale, camera, shadow,
                 scale, 0.7 * visibility);
-            set_geometry_alpha(spans, output, 0.96 * visibility);
+            set_geometry_alpha(spans, output, visibility);
             append_screen_rounded_rect(
                 output,
                 animated,
@@ -4203,8 +4533,8 @@ void append_unsaved_dialog_geometry(
 
 } // namespace
 
-GpuRenderer::GpuRenderer(SDL_Window& window)
-    : window_{&window}
+GpuRenderer::GpuRenderer(SDL_Window& window, const bool enable_antialiasing)
+    : window_{&window}, antialiasing_enabled_{enable_antialiasing}
 {
     try {
         scene_geometry_.reserve(initial_scene_vertex_capacity);
@@ -4236,6 +4566,8 @@ GpuRenderer::GpuRenderer(SDL_Window& window)
 
         create_geometry_buffers();
         create_pipeline();
+        create_background_pipeline();
+        create_retained_pipeline();
         create_text_resources();
         create_image_resources();
         collect_diagnostics();
@@ -4260,7 +4592,8 @@ bool GpuRenderer::render(
     const HomeView* const home,
     const SelectionPreview* const selection_preview,
     const UnsavedDialog* const unsaved_dialog,
-    const DrawingCursor* const drawing_cursor)
+    const DrawingCursor* const drawing_cursor,
+    const double navigation_opacity)
 {
     const auto frame_start = std::chrono::steady_clock::now();
     if (rendering_) {
@@ -4279,7 +4612,20 @@ bool GpuRenderer::render(
     } render_scope{rendering_};
 
     ++stats_.frame;
+    reap_mesh_submissions();
+    sync_document_changes(document);
+    resident_scene_invalidated_ = false;
+    stats_.background_draw_calls = 0U;
+    stats_.resident_upload_bytes = 0U;
+    stats_.resident_draws = 0U;
     stats_.visible_objects = 0U;
+    stats_.visibility_query_reuses = 0U;
+    stats_.rendered_objects = 0U;
+    stats_.scene_batches = 0U;
+    stats_.batch_reuse_waits = 0U;
+    stats_.batch_wait_milliseconds = 0.0;
+    stats_.peak_scene_batch_vertices = 0U;
+    stats_.peak_stroke_page_vertices = 0U;
     stats_.tessellated_objects = 0U;
     stats_.cache_hits = 0U;
     stats_.segment_index_builds = 0U;
@@ -4289,8 +4635,13 @@ bool GpuRenderer::render(
     stats_.text_upload_bytes = 0U;
     stats_.thumbnail_upload_bytes = 0U;
     stats_.image_upload_bytes = 0U;
+    stats_.image_decodes = 0U;
     stats_.draw_calls = 0U;
     stats_.text_draw_calls = 0U;
+    stats_.tooltip_draw_calls = 0U;
+    tooltip_first_vertex_.reset();
+    tooltip_first_text_batch_ = 0U;
+    tooltip_allowed_this_frame_ = unsaved_dialog == nullptr || !unsaved_dialog->visible();
     stats_.draft_full_rebuilds = 0U;
     stats_.draft_appended_points = 0U;
     stats_.background_milliseconds = 0.0;
@@ -4354,13 +4705,34 @@ bool GpuRenderer::render(
         }
     }
     trim_geometry_to_vertex_budget(geometry_, geometry_spans_);
+    if (tooltip_first_vertex_.has_value() && *tooltip_first_vertex_ >= geometry_.size()) {
+        // An exhausted geometry budget must not leave floating tooltip text.
+        text_batches_.resize(std::min(tooltip_first_text_batch_, text_batches_.size()));
+        tooltip_first_vertex_.reset();
+    }
+    const auto interface_vertex_count = static_cast<Uint32>(geometry_.size());
+    // Composite over geometry, thumbnails, labels, and tooltips together. The
+    // transition needs only one screen-sized quad and no retained board copy.
+    const bool navigation_overlay = std::isfinite(navigation_opacity)
+        && navigation_opacity > 0.0
+        && geometry_.size() + 6U <= maximum_vertex_count;
+    if (navigation_overlay) {
+        const RenderColor backdrop = home != nullptr
+            ? home_palette(*home).background : toolbar_palette(toolbar).background;
+        geometry_spans_.push_back(GeometrySpan{
+            interface_vertex_count,
+            static_cast<float>(std::clamp(navigation_opacity, 0.0, 1.0)),
+            std::nullopt});
+        append_screen_quad(geometry_,
+            {0.0, 0.0, camera.viewport().x, camera.viewport().y}, camera, backdrop);
+    }
     const auto build_end = std::chrono::steady_clock::now();
     stats_.build_milliseconds = std::chrono::duration<double, std::milli>(
         build_end - build_start).count();
     stats_.emitted_vertices =
         geometry_.size()
         + (scene_active_this_frame_
-            ? scene_geometry_.size()
+            ? scene_total_vertices_
             : 0U)
         + (draft_active_this_frame_
             ? draft_gpu_geometry_.size()
@@ -4368,12 +4740,13 @@ bool GpuRenderer::render(
         + (scene_active_this_frame_ ? image_vertices_.size() : 0U);
     stats_.cache_entries = object_cache_.size();
     stats_.cache_bytes = geometry_cache_bytes_;
+    stats_.cache_metadata_bytes = geometry_metadata_bytes();
     stats_.evictions = total_evictions_;
 
     const auto staging_start = std::chrono::steady_clock::now();
     const std::size_t scene_vertex_count =
         scene_geometry_.size();
-    if (scene_active_this_frame_
+    if (scene_active_this_frame_ && !scene_streamed_
         && ensure_vertex_buffer_capacity(
             scene_vertex_buffer_,
             scene_vertex_capacity_,
@@ -4405,7 +4778,7 @@ bool GpuRenderer::render(
         "GPU overlay vertex-buffer growth"));
 
     Uint32 scene_geometry_bytes = 0U;
-    if (scene_active_this_frame_ && scene_upload_pending_) {
+    if (scene_active_this_frame_ && scene_upload_pending_ && !scene_streamed_) {
         scene_geometry_bytes = static_cast<Uint32>(
             scene_geometry_.size() * sizeof(GeometryVertex));
         stats_.scene_upload_bytes = scene_geometry_bytes;
@@ -4441,9 +4814,12 @@ bool GpuRenderer::render(
         draft_transfer_offset + draft_geometry_bytes;
     const Uint32 image_geometry_transfer_offset =
         geometry_transfer_offset + geometry_bytes;
+    const Uint32 resident_transfer_offset = image_geometry_transfer_offset + image_geometry_bytes;
+    const auto resident_bytes = static_cast<Uint32>(mesh_upload_vertices_.size() * sizeof(GeometryVertex));
+    stats_.resident_upload_bytes = resident_bytes;
+    stats_.scene_upload_bytes += resident_bytes;
     const std::size_t total_geometry_upload_bytes =
-        static_cast<std::size_t>(image_geometry_transfer_offset)
-        + image_geometry_bytes;
+        static_cast<std::size_t>(resident_transfer_offset) + resident_bytes;
     constexpr std::size_t texture_upload_alignment = 512U;
     const std::size_t thumbnail_transfer_offset =
         thumbnail_uploads_.empty()
@@ -4489,6 +4865,8 @@ bool GpuRenderer::render(
                 image_vertices_.data(),
                 image_geometry_bytes);
         }
+        if (resident_bytes != 0U) std::memcpy(bytes + resident_transfer_offset,
+            mesh_upload_vertices_.data(), resident_bytes);
         if (!thumbnail_upload_pixels_.empty()) {
             std::memcpy(
                 bytes + thumbnail_transfer_offset,
@@ -4562,6 +4940,7 @@ bool GpuRenderer::render(
     }
     stats_.image_texture_cache_bytes = image_texture_bytes_;
     stats_.image_texture_evictions = image_texture_evictions_;
+    stats_.image_decode_cache_bytes = image_decode_cache_.bytes();
 
     const auto text_vertex_bytes = static_cast<Uint32>(
         text_vertices_.size() * sizeof(TextVertex));
@@ -4590,7 +4969,7 @@ bool GpuRenderer::render(
             staging_end - staging_start).count();
 
     const auto command_acquire_start = std::chrono::steady_clock::now();
-    SDL_GPUCommandBuffer* const command_buffer =
+    SDL_GPUCommandBuffer* command_buffer =
         SDL_AcquireGPUCommandBuffer(device_);
     if (command_buffer == nullptr) {
         throw_sdl("GPU command-buffer acquisition");
@@ -4600,37 +4979,6 @@ bool GpuRenderer::render(
     stats_.command_acquire_milliseconds =
         std::chrono::duration<double, std::milli>(
             command_acquire_end - command_acquire_start).count();
-
-    SDL_GPUTexture* swapchain_texture = nullptr;
-    Uint32 drawable_width = 0U;
-    Uint32 drawable_height = 0U;
-    const auto swapchain_wait_start = std::chrono::steady_clock::now();
-    if (!SDL_WaitAndAcquireGPUSwapchainTexture(
-            command_buffer,
-            window_,
-            &swapchain_texture,
-            &drawable_width,
-            &drawable_height)) {
-        throw_sdl("GPU swapchain acquisition");
-    }
-    command_buffer_guard.mark_swapchain_acquired();
-    const auto swapchain_wait_end = std::chrono::steady_clock::now();
-    stats_.swapchain_wait_milliseconds =
-        std::chrono::duration<double, std::milli>(
-            swapchain_wait_end - swapchain_wait_start).count();
-
-    // D3D12 can briefly return a swapchain image with a zero drawable extent
-    // while a window is hidden, minimized, or transitioning between display
-    // states. Recording a render pass for that image only fails later when
-    // SDL closes the command list, obscuring the real cause behind E_INVALIDARG.
-    if (swapchain_texture == nullptr
-        || drawable_width == 0U
-        || drawable_height == 0U) {
-        stats_.total_cpu_milliseconds =
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - frame_start).count();
-        return false;
-    }
 
     const auto command_record_start = std::chrono::steady_clock::now();
     SDL_GPUCopyPass* const copy_pass = SDL_BeginGPUCopyPass(command_buffer);
@@ -4744,10 +5092,110 @@ bool GpuRenderer::render(
         SDL_UploadToGPUTexture(copy_pass, &source, &destination, true);
     }
     SDL_EndGPUCopyPass(copy_pass);
+    if (!mesh_uploads_.empty()) {
+        auto* resident_copy = SDL_BeginGPUCopyPass(command_buffer);
+        if (resident_copy == nullptr) throw_sdl("GPU resident copy pass");
+        for (const auto& upload : mesh_uploads_) {
+            const SDL_GPUTransferBufferLocation source{transfer_buffer_, resident_transfer_offset
+                + upload.first * static_cast<Uint32>(sizeof(GeometryVertex))};
+            const SDL_GPUBufferRegion destination{mesh_pages_[upload.range.page],
+                upload.range.first * static_cast<Uint32>(sizeof(GeometryVertex)),
+                upload.range.count * static_cast<Uint32>(sizeof(GeometryVertex))};
+            SDL_UploadToGPUBuffer(resident_copy, &source, &destination, false);
+        }
+        SDL_EndGPUCopyPass(resident_copy);
+    }
     for (const auto& upload : image_uploads_) {
         if (upload.mip_levels > 1U) {
             SDL_GenerateMipmapsForGPUTexture(command_buffer, upload.texture);
         }
+    }
+
+    if (scene_active_this_frame_ && scene_streamed_) {
+        int window_width = 0;
+        int window_height = 0;
+        if (!SDL_GetWindowSizeInPixels(window_, &window_width, &window_height)
+            || window_width <= 0 || window_height <= 0) return false;
+        if (scene_upload_pending_ || scene_stream_texture_ == nullptr
+            || scene_stream_width_ != static_cast<std::uint32_t>(window_width)
+            || scene_stream_height_ != static_cast<std::uint32_t>(window_height)) {
+            // Complete resource uploads before reusing bounded batch staging.
+            // A warm scene is sampled from its viewport-sized raster cache.
+            submit_and_wait(device_, command_buffer_guard.release());
+            render_scene_batches(camera, document, toolbar,
+                static_cast<std::uint32_t>(window_width),
+                static_cast<std::uint32_t>(window_height));
+            command_buffer = SDL_AcquireGPUCommandBuffer(device_);
+            if (command_buffer == nullptr) throw_sdl("GPU final batch acquisition");
+            command_buffer_guard.reset(command_buffer);
+        } else {
+            stats_.scene_batches = scene_stream_batches_;
+            stats_.peak_scene_batch_vertices = scene_stream_peak_vertices_;
+        }
+    }
+
+    SDL_GPUTexture* swapchain_texture = nullptr;
+    Uint32 drawable_width = 0U;
+    Uint32 drawable_height = 0U;
+    const auto swapchain_wait_start = std::chrono::steady_clock::now();
+    if (!SDL_WaitAndAcquireGPUSwapchainTexture(
+            command_buffer,
+            window_,
+            &swapchain_texture,
+            &drawable_width,
+            &drawable_height)) {
+        throw_sdl("GPU swapchain acquisition");
+    }
+    command_buffer_guard.mark_swapchain_acquired();
+    const auto swapchain_wait_end = std::chrono::steady_clock::now();
+    stats_.swapchain_wait_milliseconds =
+        std::chrono::duration<double, std::milli>(
+            swapchain_wait_end - swapchain_wait_start).count();
+
+    // D3D12 can briefly return a swapchain image with a zero drawable extent
+    // while a window is hidden, minimized, or transitioning between display
+    // states. Recording a render pass for that image only fails later when
+    // SDL closes the command list, obscuring the real cause behind E_INVALIDARG.
+    if (swapchain_texture == nullptr
+        || drawable_width == 0U
+        || drawable_height == 0U) {
+        stats_.total_cpu_milliseconds =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - frame_start).count();
+        return false;
+    }
+
+    const bool capture_pixel = pixel_readback_request_.has_value()
+        && (*pixel_readback_request_)[0] < drawable_width
+        && (*pixel_readback_request_)[1] < drawable_height;
+    SDL_GPUTexture* final_surface = swapchain_texture;
+    if (capture_pixel) {
+        // Vulkan swapchain images are not transfer sources. Render the final
+        // frame to a normal single-sample texture, then present that same image.
+        if (pixel_readback_surface_ == nullptr || pixel_readback_width_ != drawable_width
+            || pixel_readback_height_ != drawable_height) {
+            SDL_GPUTextureCreateInfo info{};
+            info.type = SDL_GPU_TEXTURETYPE_2D;
+            info.format = SDL_GetGPUSwapchainTextureFormat(device_, window_);
+            info.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+            info.width = drawable_width;
+            info.height = drawable_height;
+            info.layer_count_or_depth = 1U;
+            info.num_levels = 1U;
+            info.sample_count = SDL_GPU_SAMPLECOUNT_1;
+            SDL_GPUTexture* replacement = SDL_CreateGPUTexture(device_, &info);
+            if (replacement == nullptr) throw_sdl("GPU final-frame diagnostic surface");
+            if (pixel_readback_surface_ != nullptr) SDL_ReleaseGPUTexture(device_, pixel_readback_surface_);
+            pixel_readback_surface_ = replacement;
+            pixel_readback_width_ = drawable_width;
+            pixel_readback_height_ = drawable_height;
+        }
+        if (pixel_readback_transfer_ == nullptr) {
+            const SDL_GPUTransferBufferCreateInfo info{SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD, 256U, 0U};
+            pixel_readback_transfer_ = SDL_CreateGPUTransferBuffer(device_, &info);
+            if (pixel_readback_transfer_ == nullptr) throw_sdl("GPU final-frame diagnostic transfer");
+        }
+        final_surface = pixel_readback_surface_;
     }
 
     // Keep MSAA active while resizing. The targets grow geometrically, then
@@ -4787,8 +5235,12 @@ bool GpuRenderer::render(
         color_target.cycle = true;
         color_target.cycle_resolve_texture = true;
     } else {
-        color_target.texture = swapchain_texture;
+        color_target.texture = final_surface;
         color_target.store_op = SDL_GPU_STOREOP_STORE;
+    }
+    if (scene_active_this_frame_ && !scene_streamed_) {
+        stats_.scene_batches = 1U;
+        stats_.peak_scene_batch_vertices = scene_geometry_.size();
     }
     SDL_GPUGraphicsPipeline* const opaque_pipeline =
         !msaa_active && pipeline_direct_ != nullptr
@@ -4834,6 +5286,10 @@ bool GpuRenderer::render(
         board_matrices.data(),
         static_cast<Uint32>(sizeof(board_matrices)));
 
+    const auto theme_parameters = board_theme_parameters(toolbar);
+    SDL_PushGPUVertexUniformData(command_buffer, 1U, &theme_parameters, sizeof(theme_parameters));
+    SDL_GPUGraphicsPipeline* const board_vector_pipeline =
+        !msaa_active && retained_pipeline_direct_ != nullptr ? retained_pipeline_direct_ : retained_pipeline_;
     SDL_GPURenderPass* const render_pass =
         SDL_BeginGPURenderPass(command_buffer, &color_target, 1U, nullptr);
     if (render_pass == nullptr) {
@@ -4853,7 +5309,20 @@ bool GpuRenderer::render(
         SDL_SetGPUViewport(render_pass, &drawable_viewport);
     }
 
-    if (scene_active_this_frame_ && !scene_draws_.empty()) {
+    if (scene_active_this_frame_ && scene_streamed_) {
+        SDL_BindGPUGraphicsPipeline(render_pass, board_image_pipeline);
+        const SDL_GPUBufferBinding binding{scene_stream_quad_, 0U};
+        SDL_BindGPUVertexBuffers(render_pass, 0U, &binding, 1U);
+        const SDL_GPUTextureSamplerBinding sampler{scene_stream_texture_, image_sampler_};
+        SDL_BindGPUFragmentSamplers(render_pass, 0U, &sampler, 1U);
+        SDL_DrawGPUPrimitives(render_pass, 6U, 1U, 0U, 0U);
+        ++stats_.draw_calls;
+    }
+
+    if (scene_active_this_frame_ && !scene_streamed_)
+        draw_background(command_buffer, render_pass, camera, toolbar, drawable_width, drawable_height, msaa_active);
+
+    if (scene_active_this_frame_ && !scene_streamed_ && !scene_draws_.empty()) {
         const SDL_GPUBufferBinding scene_binding{
             scene_vertex_buffer_, 0U};
         const SDL_GPUBufferBinding image_binding{
@@ -4862,9 +5331,15 @@ bool GpuRenderer::render(
         bool has_bound_kind = false;
         for (const SceneDraw& draw : scene_draws_) {
             if (draw.vertex_count == 0U) continue;
+            if (draw.kind == SceneDraw::Kind::resident) {
+                draw_resident(command_buffer, render_pass, draw, camera, msaa_active);
+                SDL_PushGPUVertexUniformData(command_buffer, 0U, board_matrices.data(), sizeof(board_matrices));
+                has_bound_kind = false;
+                continue;
+            }
             if (!has_bound_kind || draw.kind != bound_kind) {
                 if (draw.kind == SceneDraw::Kind::vector) {
-                    SDL_BindGPUGraphicsPipeline(render_pass, opaque_pipeline);
+                    SDL_BindGPUGraphicsPipeline(render_pass, board_vector_pipeline);
                     SDL_BindGPUVertexBuffers(
                         render_pass, 0U, &scene_binding, 1U);
                 } else {
@@ -4892,7 +5367,7 @@ bool GpuRenderer::render(
     if (draft_active_this_frame_ && !draft_gpu_geometry_.empty()) {
         const SDL_GPUBufferBinding draft_binding{
             draft_vertex_buffer_, 0U};
-        SDL_BindGPUGraphicsPipeline(render_pass, opaque_pipeline);
+        SDL_BindGPUGraphicsPipeline(render_pass, board_vector_pipeline);
         SDL_BindGPUVertexBuffers(
             render_pass, 0U, &draft_binding, 1U);
         SDL_DrawGPUPrimitives(
@@ -4904,45 +5379,69 @@ bool GpuRenderer::render(
         ++stats_.draw_calls;
     }
 
-    const SDL_GPUBufferBinding vertex_binding{vertex_buffer_, 0U};
-    SDL_BindGPUVertexBuffers(render_pass, 0U, &vertex_binding, 1U);
-    const auto total_vertices =
-        static_cast<Uint32>(geometry_.size());
-    SDL_GPUGraphicsPipeline* bound_pipeline = nullptr;
-    float bound_constant = -1.0F;
-    for (std::size_t index = 0U; index < geometry_spans_.size(); ++index) {
-        const GeometrySpan& span = geometry_spans_[index];
-        const Uint32 end_vertex = index + 1U < geometry_spans_.size()
-            ? geometry_spans_[index + 1U].first_vertex
-            : total_vertices;
-        if (end_vertex <= span.first_vertex) {
-            continue;
+    const auto total_vertices = static_cast<Uint32>(geometry_.size());
+    const auto set_scissor = [&](SDL_GPURenderPass* pass,
+                                const std::optional<std::array<double, 4>>& clip) {
+        SDL_Rect rect{0, 0, static_cast<int>(drawable_width),
+            static_cast<int>(drawable_height)};
+        if (clip.has_value()) {
+            const double sx = static_cast<double>(drawable_width) / viewport.x;
+            const double sy = static_cast<double>(drawable_height) / viewport.y;
+            const int left = static_cast<int>(std::clamp(std::ceil((*clip)[0] * sx),
+                0.0, static_cast<double>(drawable_width)));
+            const int top = static_cast<int>(std::clamp(std::ceil((*clip)[1] * sy),
+                0.0, static_cast<double>(drawable_height)));
+            const int right = static_cast<int>(std::clamp(
+                std::floor(((*clip)[0] + (*clip)[2]) * sx),
+                static_cast<double>(left), static_cast<double>(drawable_width)));
+            const int bottom = static_cast<int>(std::clamp(
+                std::floor(((*clip)[1] + (*clip)[3]) * sy),
+                static_cast<double>(top), static_cast<double>(drawable_height)));
+            rect = {left, top, right - left, bottom - top};
         }
-        SDL_GPUGraphicsPipeline* const wanted = span.alpha >= 0.999F
-            ? opaque_pipeline
-            : translucent_pipeline;
-        if (wanted != bound_pipeline) {
-            SDL_BindGPUGraphicsPipeline(render_pass, wanted);
-            bound_pipeline = wanted;
-            // Blend constants may be pipeline-local dynamic state on some
-            // backends; force a refresh after every rebind.
-            bound_constant = -1.0F;
+        SDL_SetGPUScissor(pass, &rect);
+    };
+    const auto draw_geometry_spans = [&](SDL_GPURenderPass* pass,
+        SDL_GPUGraphicsPipeline* opaque, SDL_GPUGraphicsPipeline* translucent,
+        const Uint32 first, const Uint32 last, const bool tooltip = false) {
+        // Text uses normalized device coordinates; geometry needs the camera
+        // uniforms and vertex binding restored when drawn over text.
+        SDL_PushGPUVertexUniformData(command_buffer, 0U, board_matrices.data(),
+            static_cast<Uint32>(sizeof(board_matrices)));
+        const SDL_GPUBufferBinding binding{vertex_buffer_, 0U};
+        SDL_BindGPUVertexBuffers(pass, 0U, &binding, 1U);
+        SDL_GPUGraphicsPipeline* bound_pipeline = nullptr;
+        float bound_constant = -1.0F;
+        for (std::size_t index = 0U; index < geometry_spans_.size(); ++index) {
+            const GeometrySpan& span = geometry_spans_[index];
+            const Uint32 start = std::max(span.first_vertex, first);
+            const Uint32 end = std::min(last, index + 1U < geometry_spans_.size()
+                ? geometry_spans_[index + 1U].first_vertex : total_vertices);
+            if (end <= start) continue;
+            set_scissor(pass, span.clip);
+            SDL_GPUGraphicsPipeline* wanted = span.alpha >= 0.999F ? opaque : translucent;
+            if (wanted != bound_pipeline) {
+                SDL_BindGPUGraphicsPipeline(pass, wanted);
+                bound_pipeline = wanted;
+                bound_constant = -1.0F;
+            }
+            if (wanted == translucent && span.alpha != bound_constant) {
+                SDL_SetGPUBlendConstants(pass,
+                    SDL_FColor{span.alpha, span.alpha, span.alpha, span.alpha});
+                bound_constant = span.alpha;
+            }
+            SDL_DrawGPUPrimitives(pass, end - start, 1U, start, 0U);
+            ++stats_.draw_calls;
+            if (tooltip) ++stats_.tooltip_draw_calls;
         }
-        if (wanted == translucent_pipeline && span.alpha != bound_constant) {
-            SDL_SetGPUBlendConstants(
-                render_pass,
-                SDL_FColor{span.alpha, span.alpha, span.alpha, span.alpha});
-            bound_constant = span.alpha;
-        }
-        SDL_DrawGPUPrimitives(
-            render_pass,
-            end_vertex - span.first_vertex,
-            1U,
-            span.first_vertex,
-            0U);
-        ++stats_.draw_calls;
-    }
-    if (!text_vertices_.empty()) {
+    };
+    draw_geometry_spans(render_pass, opaque_pipeline, translucent_pipeline,
+        0U, tooltip_first_vertex_.value_or(interface_vertex_count));
+    const auto draw_text_batches = [&] (
+        SDL_GPURenderPass* const pass,
+        SDL_GPUGraphicsPipeline* const pipeline,
+        const std::size_t first, const std::size_t last, const bool tooltip = false) {
+        if (first >= last) return;
         constexpr std::array<float, 32> identity_matrices{{
             1.0F, 0.0F, 0.0F, 0.0F,
             0.0F, 1.0F, 0.0F, 0.0F,
@@ -4962,27 +5461,50 @@ bool GpuRenderer::render(
             text_vertex_buffer_, 0U};
         const SDL_GPUBufferBinding text_index_binding{
             text_index_buffer_, 0U};
-        SDL_BindGPUGraphicsPipeline(render_pass, glyph_pipeline);
+        SDL_BindGPUGraphicsPipeline(pass, pipeline);
         SDL_BindGPUVertexBuffers(
-            render_pass, 0U, &text_vertex_binding, 1U);
+            pass, 0U, &text_vertex_binding, 1U);
         SDL_BindGPUIndexBuffer(
-            render_pass,
+            pass,
             &text_index_binding,
             SDL_GPU_INDEXELEMENTSIZE_16BIT);
-        for (const auto& batch : text_batches_) {
+        for (std::size_t index = first; index < last; ++index) {
+            const TextBatch& batch = text_batches_[index];
+            set_scissor(pass, batch.clip);
             const SDL_GPUTextureSamplerBinding binding{
                 batch.texture, text_sampler_};
             SDL_BindGPUFragmentSamplers(
-                render_pass, 0U, &binding, 1U);
+                pass, 0U, &binding, 1U);
             SDL_DrawGPUIndexedPrimitives(
-                render_pass,
+                pass,
                 batch.index_count,
                 1U,
                 batch.first_index,
                 batch.vertex_offset,
                 0U);
             ++stats_.text_draw_calls;
+            if (tooltip) ++stats_.tooltip_draw_calls;
         }
+    };
+    const auto draw_interface_text = [&](SDL_GPURenderPass* pass,
+        SDL_GPUGraphicsPipeline* glyphs, SDL_GPUGraphicsPipeline* opaque,
+        SDL_GPUGraphicsPipeline* translucent) {
+        const std::size_t normal_text_end = tooltip_first_vertex_.has_value()
+            ? tooltip_first_text_batch_ : text_batches_.size();
+        draw_text_batches(pass, glyphs, 0U, normal_text_end);
+        if (tooltip_first_vertex_.has_value()) {
+            // Composite the complete tooltip after every ordinary UI label.
+            draw_geometry_spans(pass, opaque, translucent,
+                *tooltip_first_vertex_, interface_vertex_count, true);
+            draw_text_batches(pass, glyphs, tooltip_first_text_batch_, text_batches_.size(), true);
+        }
+        if (navigation_overlay) {
+            draw_geometry_spans(pass, opaque, translucent,
+                interface_vertex_count, total_vertices);
+        }
+    };
+    if (!msaa_active) {
+        draw_interface_text(render_pass, glyph_pipeline, opaque_pipeline, translucent_pipeline);
     }
     SDL_EndGPURenderPass(render_pass);
     if (msaa_active) {
@@ -4990,12 +5512,52 @@ bool GpuRenderer::render(
         blit.source.texture = msaa_resolve_texture_;
         blit.source.w = drawable_width;
         blit.source.h = drawable_height;
-        blit.destination.texture = swapchain_texture;
+        blit.destination.texture = final_surface;
         blit.destination.w = drawable_width;
         blit.destination.h = drawable_height;
         blit.load_op = SDL_GPU_LOADOP_DONT_CARE;
         blit.filter = SDL_GPU_FILTER_NEAREST;
         SDL_BlitGPUTexture(command_buffer, &blit);
+
+        // Glyphs are already rasterized with grayscale antialiasing. Drawing
+        // them into the multisampled scene would filter their coverage a
+        // second time during resolve and make small UI text look soft. Draw
+        // text and the final tooltip overlay over the resolved scene at native
+        // drawable resolution instead.
+        if (!text_vertices_.empty() || tooltip_first_vertex_.has_value() || navigation_overlay) {
+            SDL_GPUColorTargetInfo text_target{};
+            text_target.texture = final_surface;
+            text_target.load_op = SDL_GPU_LOADOP_LOAD;
+            text_target.store_op = SDL_GPU_STOREOP_STORE;
+            SDL_GPURenderPass* const text_pass =
+                SDL_BeginGPURenderPass(
+                    command_buffer, &text_target, 1U, nullptr);
+            if (text_pass == nullptr) {
+                throw_sdl("GPU text render-pass creation");
+            }
+            draw_interface_text(text_pass, text_pipeline_direct_,
+                pipeline_direct_, blend_pipeline_direct_);
+            SDL_EndGPURenderPass(text_pass);
+        }
+    }
+    if (capture_pixel) {
+        SDL_GPUBlitInfo present{};
+        present.source.texture = final_surface;
+        present.source.w = drawable_width;
+        present.source.h = drawable_height;
+        present.destination.texture = swapchain_texture;
+        present.destination.w = drawable_width;
+        present.destination.h = drawable_height;
+        present.load_op = SDL_GPU_LOADOP_DONT_CARE;
+        present.filter = SDL_GPU_FILTER_NEAREST;
+        SDL_BlitGPUTexture(command_buffer, &present);
+        SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(command_buffer);
+        if (copy == nullptr) throw_sdl("GPU final-frame diagnostic copy pass");
+        const SDL_GPUTextureRegion source{final_surface, 0U, 0U,
+            (*pixel_readback_request_)[0], (*pixel_readback_request_)[1], 0U, 1U, 1U, 1U};
+        const SDL_GPUTextureTransferInfo destination{pixel_readback_transfer_, 0U, 64U, 1U};
+        SDL_DownloadFromGPUTexture(copy, &source, &destination);
+        SDL_EndGPUCopyPass(copy);
     }
     const auto command_record_end = std::chrono::steady_clock::now();
     stats_.command_record_milliseconds =
@@ -5003,9 +5565,28 @@ bool GpuRenderer::render(
             command_record_end - command_record_start).count();
 
     const auto submit_start = std::chrono::steady_clock::now();
-    if (!SDL_SubmitGPUCommandBuffer(command_buffer_guard.release())) {
+    if (capture_pixel) {
+        submit_and_wait(device_, command_buffer_guard.release());
+        completed_mesh_serial_ = ++submitted_mesh_serial_;
+        const auto* mapped = static_cast<const std::uint8_t*>(
+            SDL_MapGPUTransferBuffer(device_, pixel_readback_transfer_, false));
+        if (mapped == nullptr) throw_sdl("GPU final-frame diagnostic mapping");
+        std::array<std::uint8_t, 4> rgba{mapped[0], mapped[1], mapped[2], mapped[3]};
+        SDL_UnmapGPUTransferBuffer(device_, pixel_readback_transfer_);
+        const auto format = SDL_GetGPUSwapchainTextureFormat(device_, window_);
+        if (format == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM
+            || format == SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB) std::swap(rgba[0], rgba[2]);
+        pixel_readback_result_ = rgba;
+        pixel_readback_position_ = pixel_readback_request_;
+    } else if (mesh_arena_.pages() != 0U) {
+        SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(command_buffer_guard.release());
+        if (fence == nullptr) throw_sdl("GPU resident frame submission");
+        try { mesh_submissions_.push_back({fence, ++submitted_mesh_serial_}); }
+        catch (...) { SDL_ReleaseGPUFence(device_, fence); throw; }
+    } else if (!SDL_SubmitGPUCommandBuffer(command_buffer_guard.release())) {
         throw_sdl("GPU command-buffer submission");
     }
+    pixel_readback_request_.reset();
     for (const auto& upload : thumbnail_uploads_) {
         if (const auto found = thumbnail_textures_.find(upload.key);
             found != thumbnail_textures_.end()
@@ -5020,10 +5601,344 @@ bool GpuRenderer::render(
     stats_.total_cpu_milliseconds =
         std::chrono::duration<double, std::milli>(
             submit_end - frame_start).count();
+    stats_.cpu_geometry_live_bytes += scene_batch_geometry_.size() * sizeof(GeometryVertex)
+        + scene_stream_draws_.size() * sizeof(SceneDraw)
+        + stroke_render_points_.size() * sizeof(Vec2d)
+        + stroke_page_vertices_.size() * sizeof(CachedWorldVertex);
+    stats_.cpu_geometry_capacity_bytes += scene_batch_geometry_.capacity() * sizeof(GeometryVertex)
+        + scene_batch_draws_.capacity() * sizeof(SceneDraw)
+        + scene_stream_draws_.capacity() * sizeof(SceneDraw)
+        + stroke_render_points_.capacity() * sizeof(Vec2d)
+        + stroke_page_vertices_.capacity() * sizeof(CachedWorldVertex);
+    stats_.query_scratch_capacity_bytes += stroke_segment_scratch_.capacity() * sizeof(std::uint32_t)
+        + visibility_cache_.capacity_bytes() + mesh_changes_.capacity() * sizeof(DocumentChange)
+        + resident_scene_ids_.capacity() * sizeof(ObjectId);
+    stats_.gpu_geometry_capacity_bytes =
+        (scene_vertex_capacity_ + draft_vertex_capacity_ + overlay_vertex_capacity_)
+            * sizeof(GeometryVertex) + image_vertex_capacity_ * sizeof(ImageVertex)
+            + (scene_stream_quad_ != nullptr ? 6U * sizeof(ImageVertex) : 0U);
+    for (const auto& slot : batch_slots_) {
+        if (slot.transfer != nullptr) stats_.transfer_capacity_bytes +=
+            scene_batch_vertex_count * sizeof(GeometryVertex) + 6U * sizeof(ImageVertex);
+        if (slot.vertices != nullptr) stats_.gpu_geometry_capacity_bytes +=
+            scene_batch_vertex_count * sizeof(GeometryVertex);
+    }
+    stats_.cache_bytes = geometry_cache_bytes_;
+    stats_.cache_metadata_bytes = geometry_metadata_bytes();
+    stats_.evictions = total_evictions_;
     scene_upload_pending_ = false;
     draft_upload_pending_ = false;
+    stats_.resident_pages = mesh_arena_.pages();
+    stats_.gpu_geometry_capacity_bytes += mesh_arena_.pages() * MeshArena::page_vertices * sizeof(GeometryVertex);
+    stats_.cpu_geometry_live_bytes += mesh_upload_vertices_.size() * sizeof(GeometryVertex);
+    stats_.cpu_geometry_capacity_bytes += mesh_upload_vertices_.capacity() * sizeof(GeometryVertex)
+        + mesh_uploads_.capacity() * sizeof(MeshUpload) + mesh_arena_.capacity_bytes()
+        + mesh_retirements_.capacity() * sizeof(MeshRetirement)
+        + mesh_submissions_.capacity() * sizeof(MeshSubmission);
+    for (const auto& retirement : mesh_retirements_)
+        stats_.cpu_geometry_capacity_bytes += retirement.ranges.capacity() * sizeof(MeshRange);
+    mesh_uploads_.clear();
+    mesh_upload_vertices_.clear();
+    if (resident_scene_invalidated_ && !scene_streamed_) scene_valid_ = false;
 
     return true;
+}
+
+void GpuRenderer::request_rendered_pixel(const std::uint32_t x, const std::uint32_t y)
+{
+    pixel_readback_request_ = std::array{x, y};
+    pixel_readback_position_.reset();
+    pixel_readback_result_.reset();
+}
+
+std::optional<std::array<std::uint8_t, 4>> GpuRenderer::read_rendered_pixel(
+    const std::uint32_t x, const std::uint32_t y) const noexcept
+{
+    if (pixel_readback_position_ != std::optional{std::array{x, y}}) return std::nullopt;
+    return pixel_readback_result_;
+}
+
+void GpuRenderer::render_scene_batches(
+    const Camera& camera, const Document& document, const Toolbar& toolbar,
+    const std::uint32_t width, const std::uint32_t height)
+{
+    ensure_msaa_target(width, height, true);
+    if (scene_stream_texture_ == nullptr
+        || scene_stream_capacity_width_ != msaa_width_
+        || scene_stream_capacity_height_ != msaa_height_) {
+        SDL_GPUTextureCreateInfo info{};
+        info.type = SDL_GPU_TEXTURETYPE_2D;
+        info.format = SDL_GetGPUSwapchainTextureFormat(device_, window_);
+        info.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        info.width = msaa_width_;
+        info.height = msaa_height_;
+        info.layer_count_or_depth = 1U;
+        info.num_levels = 1U;
+        info.sample_count = SDL_GPU_SAMPLECOUNT_1;
+        SDL_GPUTexture* replacement = SDL_CreateGPUTexture(device_, &info);
+        if (replacement == nullptr) throw_sdl("GPU streamed scene target creation");
+        if (scene_stream_texture_ != nullptr) SDL_ReleaseGPUTexture(device_, scene_stream_texture_);
+        scene_stream_texture_ = replacement;
+        scene_stream_capacity_width_ = msaa_width_;
+        scene_stream_capacity_height_ = msaa_height_;
+    }
+    if (scene_stream_quad_ == nullptr) {
+        const SDL_GPUBufferCreateInfo info{SDL_GPU_BUFFERUSAGE_VERTEX,
+            static_cast<Uint32>(6U * sizeof(ImageVertex)), 0U};
+        scene_stream_quad_ = SDL_CreateGPUBuffer(device_, &info);
+        if (scene_stream_quad_ == nullptr) throw_sdl("GPU streamed scene quad creation");
+    }
+    scene_batch_geometry_.clear();
+    scene_batch_geometry_.reserve(scene_batch_vertex_count);
+    scene_batch_draws_.clear();
+    const bool multisampled = antialiasing_samples_ != 1;
+    const auto viewport = camera.viewport();
+    const float x = static_cast<float>(2.0 * camera.zoom() / viewport.x);
+    const float y = static_cast<float>(-2.0 * camera.zoom() / viewport.y);
+    const std::array<float, 32> matrices{{
+        x, 0, 0, 0, 0, y, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}};
+    const RenderColor clear = mix_color(
+        toolbar.previous_theme() == Theme::light
+            ? RenderColor{0.82F, 0.84F, 0.88F} : RenderColor{0.025F, 0.03F, 0.045F},
+        toolbar.theme() == Theme::light
+            ? RenderColor{0.82F, 0.84F, 0.88F} : RenderColor{0.025F, 0.03F, 0.045F},
+        smooth_theme_transition(toolbar));
+    const float half_width = static_cast<float>(viewport.x / (2.0 * camera.zoom()));
+    const float half_height = static_cast<float>(viewport.y / (2.0 * camera.zoom()));
+    const float u = static_cast<float>(width) / static_cast<float>(msaa_width_);
+    const float v = static_cast<float>(height) / static_cast<float>(msaa_height_);
+    constexpr std::array<std::uint8_t, 4> white{255U, 255U, 255U, 255U};
+    const std::array<ImageVertex, 6> quad{{
+        {{-half_width, -half_height}, white, {0, 0}},
+        {{half_width, -half_height}, white, {u, 0}},
+        {{half_width, half_height}, white, {u, v}},
+        {{-half_width, -half_height}, white, {0, 0}},
+        {{half_width, half_height}, white, {u, v}},
+        {{-half_width, half_height}, white, {0, v}},
+    }};
+    const auto flush = [&](const bool last = false) {
+        if (scene_batch_draws_.empty()) return;
+        BatchSlot& slot = batch_slots_[next_batch_slot_];
+        next_batch_slot_ = (next_batch_slot_ + 1U) % batch_slots_.size();
+        if (slot.fence != nullptr) {
+            if (!SDL_QueryGPUFence(device_, slot.fence)) {
+                const auto start = std::chrono::steady_clock::now();
+                if (!SDL_WaitForGPUFences(device_, true, &slot.fence, 1U))
+                    throw_sdl("GPU batch slot completion");
+                ++stats_.batch_reuse_waits;
+                stats_.batch_wait_milliseconds += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - start).count();
+            }
+            SDL_ReleaseGPUFence(device_, slot.fence);
+            slot.fence = nullptr;
+        }
+        if (slot.vertices == nullptr) {
+            const SDL_GPUBufferCreateInfo info{SDL_GPU_BUFFERUSAGE_VERTEX,
+                static_cast<Uint32>(scene_batch_vertex_count * sizeof(GeometryVertex)), 0U};
+            slot.vertices = SDL_CreateGPUBuffer(device_, &info);
+            if (slot.vertices == nullptr) throw_sdl("GPU batch slot creation");
+        }
+        if (slot.transfer == nullptr) {
+            const SDL_GPUTransferBufferCreateInfo info{SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+                static_cast<Uint32>(scene_batch_vertex_count * sizeof(GeometryVertex)
+                    + 6U * sizeof(ImageVertex)), 0U};
+            slot.transfer = SDL_CreateGPUTransferBuffer(device_, &info);
+            if (slot.transfer == nullptr) throw_sdl("GPU batch slot staging creation");
+        }
+        const Uint32 bytes = static_cast<Uint32>(
+            scene_batch_geometry_.size() * sizeof(GeometryVertex));
+        if (bytes != 0U || last) {
+            void* mapped = SDL_MapGPUTransferBuffer(device_, slot.transfer, false);
+            if (mapped == nullptr) throw_sdl("GPU batch staging mapping");
+            std::memcpy(mapped, scene_batch_geometry_.data(), bytes);
+            if (last) std::memcpy(static_cast<std::byte*>(mapped) + bytes, quad.data(), sizeof(quad));
+            SDL_UnmapGPUTransferBuffer(device_, slot.transfer);
+        }
+        SDL_GPUCommandBuffer* command = SDL_AcquireGPUCommandBuffer(device_);
+        if (command == nullptr) throw_sdl("GPU scene batch acquisition");
+        CommandBufferGuard guard{command};
+        if (bytes != 0U) {
+            SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(command);
+            if (copy == nullptr) throw_sdl("GPU scene batch copy pass");
+            const SDL_GPUTransferBufferLocation source{slot.transfer, 0U};
+            const SDL_GPUBufferRegion destination{slot.vertices, 0U, bytes};
+            // Only reuse a slot after its last consumer completes. Avoid
+            // cycling allocations proportional to the number of batches.
+            SDL_UploadToGPUBuffer(copy, &source, &destination, false);
+            SDL_EndGPUCopyPass(copy);
+        }
+        if (last) {
+            SDL_GPUCopyPass* quad_copy = SDL_BeginGPUCopyPass(command);
+            if (quad_copy == nullptr) throw_sdl("GPU scene quad copy pass");
+            const SDL_GPUTransferBufferLocation source{slot.transfer, bytes};
+            const SDL_GPUBufferRegion destination{scene_stream_quad_, 0U, sizeof(quad)};
+            SDL_UploadToGPUBuffer(quad_copy, &source, &destination, true);
+            SDL_EndGPUCopyPass(quad_copy);
+        }
+        SDL_GPUColorTargetInfo target{};
+        target.texture = multisampled ? msaa_texture_ : scene_stream_texture_;
+        target.clear_color = {clear.red, clear.green, clear.blue, 1.0F};
+        target.load_op = stats_.scene_batches == 0U ? SDL_GPU_LOADOP_CLEAR : SDL_GPU_LOADOP_LOAD;
+        // Keep earlier batches, then resolve only the completed canvas. UI
+        // and live previews are drawn separately and never enter this cache.
+        target.store_op = multisampled && last
+            ? SDL_GPU_STOREOP_RESOLVE : SDL_GPU_STOREOP_STORE;
+        if (multisampled && last) {
+            target.resolve_texture = scene_stream_texture_;
+            target.cycle_resolve_texture = true;
+        }
+        target.cycle = stats_.scene_batches == 0U;
+        SDL_PushGPUVertexUniformData(command, 0U, matrices.data(), sizeof(matrices));
+        const auto theme_parameters = board_theme_parameters(toolbar);
+        SDL_PushGPUVertexUniformData(command, 1U, &theme_parameters, sizeof(theme_parameters));
+        SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(command, &target, 1U, nullptr);
+        if (pass == nullptr) throw_sdl("GPU scene batch render pass");
+        const SDL_GPUViewport drawable{0, 0, static_cast<float>(width),
+            static_cast<float>(height), 0, 1};
+        SDL_SetGPUViewport(pass, &drawable);
+        if (stats_.scene_batches == 0U)
+            draw_background(command, pass, camera, toolbar, width, height, multisampled);
+        SceneDraw::Kind bound = SceneDraw::Kind::vector;
+        bool have_binding = false;
+        for (const SceneDraw& draw : scene_batch_draws_) {
+            if (draw.kind == SceneDraw::Kind::resident) {
+                draw_resident(command, pass, draw, camera, multisampled);
+                SDL_PushGPUVertexUniformData(command, 0U, matrices.data(), sizeof(matrices));
+                have_binding = false;
+                continue;
+            }
+            if (!have_binding || bound != draw.kind) {
+                SDL_BindGPUGraphicsPipeline(pass,
+                    draw.kind == SceneDraw::Kind::vector
+                        ? (!multisampled && retained_pipeline_direct_ != nullptr ? retained_pipeline_direct_ : retained_pipeline_)
+                        : (!multisampled && image_pipeline_direct_ != nullptr ? image_pipeline_direct_ : image_pipeline_));
+                const SDL_GPUBufferBinding binding{
+                    draw.kind == SceneDraw::Kind::vector ? slot.vertices : image_vertex_buffer_, 0U};
+                SDL_BindGPUVertexBuffers(pass, 0U, &binding, 1U);
+                bound = draw.kind;
+                have_binding = true;
+            }
+            if (draw.kind == SceneDraw::Kind::image) {
+                const SDL_GPUTextureSamplerBinding binding{draw.texture, image_sampler_};
+                SDL_BindGPUFragmentSamplers(pass, 0U, &binding, 1U);
+            }
+            SDL_DrawGPUPrimitives(pass, draw.vertex_count, 1U, draw.first_vertex, 0U);
+            ++stats_.draw_calls;
+        }
+        SDL_EndGPURenderPass(pass);
+        slot.fence = SDL_SubmitGPUCommandBufferAndAcquireFence(guard.release());
+        if (slot.fence == nullptr) throw_sdl("GPU batch slot submission");
+        ++stats_.scene_batches;
+        stats_.peak_scene_batch_vertices = std::max(
+            stats_.peak_scene_batch_vertices, scene_batch_geometry_.size());
+        stats_.scene_upload_bytes += bytes;
+        scene_batch_geometry_.clear();
+        scene_batch_draws_.clear();
+    };
+    const auto append_vertices = [&](const auto& vertices) {
+        std::size_t first = 0U;
+        while (first < vertices.size()) {
+            if (scene_batch_geometry_.size() == scene_batch_vertex_count) flush();
+            const std::size_t count = std::min(
+                scene_batch_vertex_count - scene_batch_geometry_.size(), vertices.size() - first);
+            const std::uint32_t offset = static_cast<std::uint32_t>(scene_batch_geometry_.size());
+            for (std::size_t index = first; index < first + count; ++index) {
+                if constexpr (std::is_same_v<std::decay_t<decltype(vertices[index])>, CachedWorldVertex>) {
+                    const auto& vertex = vertices[index];
+                    scene_batch_geometry_.push_back({{
+                        static_cast<float>(vertex.position.x - camera.position().x),
+                        static_cast<float>(vertex.position.y - camera.position().y)}, vertex.color});
+                } else {
+                    scene_batch_geometry_.push_back(vertices[index]);
+                }
+            }
+            if (!scene_batch_draws_.empty()
+                && scene_batch_draws_.back().kind == SceneDraw::Kind::vector) {
+                scene_batch_draws_.back().vertex_count += static_cast<std::uint32_t>(count);
+            } else {
+                scene_batch_draws_.push_back({SceneDraw::Kind::vector, offset,
+                    static_cast<std::uint32_t>(count), nullptr, nullptr});
+            }
+            first += count;
+        }
+    };
+    scene_total_vertices_ = scene_geometry_.size();
+    stats_.rendered_objects = scene_rendered_images_ + scene_rendered_residents_;
+    for (const SceneDraw& draw : scene_stream_draws_) {
+        if (draw.kind == SceneDraw::Kind::resident) {
+            scene_batch_draws_.push_back(draw);
+            scene_total_vertices_ += draw.vertex_count;
+        } else if (draw.kind == SceneDraw::Kind::image) {
+            scene_batch_draws_.push_back(draw);
+        } else if (draw.object == nullptr) {
+            append_vertices(scene_geometry_);
+        } else {
+            // Descriptors store document objects, not pointers into the LRU
+            // cache. An evicted mesh can be rebuilt without losing its draw.
+            auto& cached = cached_geometry_for(*draw.object, document, camera,
+                camera.visible_world_bounds());
+            std::size_t emitted = 0U;
+            if (cached.paged) {
+                const auto* stroke = std::get_if<Stroke>(&draw.object->geometry);
+                const auto* index = document.stroke_segment_index(draw.object->id);
+                if (stroke == nullptr || index == nullptr) throw std::logic_error{"Paged stroke has no geometry index"};
+                static_cast<void>(visit_indexed_stroke(*stroke, draw.object->style,
+                    cached.detail, camera.zoom(), camera.visible_world_bounds(), *index,
+                    [&](const auto page) {
+                        emitted += page.size();
+                        append_vertices(page);
+                        return true;
+                    }));
+            } else {
+                emitted = cached.vertices.size();
+                append_vertices(cached.vertices);
+            }
+            scene_total_vertices_ += emitted;
+            if (emitted != 0U) ++stats_.rendered_objects;
+        }
+    }
+    flush(true);
+    scene_rendered_objects_ = stats_.rendered_objects;
+    stats_.emitted_vertices = scene_total_vertices_ + draft_gpu_geometry_.size()
+        + geometry_.size() + image_vertices_.size();
+    scene_stream_width_ = width;
+    scene_stream_height_ = height;
+    scene_stream_batches_ = stats_.scene_batches;
+    scene_stream_peak_vertices_ = stats_.peak_scene_batch_vertices;
+}
+
+void GpuRenderer::release_batch_slots() noexcept
+{
+    for (auto& slot : batch_slots_) {
+        if (slot.fence != nullptr) SDL_ReleaseGPUFence(device_, slot.fence);
+        if (slot.vertices != nullptr) SDL_ReleaseGPUBuffer(device_, slot.vertices);
+        if (slot.transfer != nullptr) SDL_ReleaseGPUTransferBuffer(device_, slot.transfer);
+        slot = {};
+    }
+    next_batch_slot_ = 0U;
+}
+
+void GpuRenderer::invalidate_document_cache() noexcept
+{
+    release_mesh_storage();
+    object_cache_.clear();
+    geometry_recency_.clear();
+    visibility_cache_.clear();
+    std::vector<ObjectId>{}.swap(resident_scene_ids_);
+    geometry_cache_bytes_ = 0U;
+    scene_stream_draws_.clear();
+    scene_draws_.clear();
+    visible_objects_.clear();
+    visible_object_ids_.clear();
+    scene_valid_ = false;
+    scene_stream_width_ = scene_stream_height_ = 0U;
+    draft_cache_active_ = false;
+}
+
+void GpuRenderer::adopt_decoded_images(ImageDecodeCache images) noexcept
+{
+    image_decode_cache_ = std::move(images);
 }
 
 void GpuRenderer::begin_live_resize() noexcept
@@ -5182,6 +6097,64 @@ void GpuRenderer::ensure_transfer_capacity(
     transfer_capacity_bytes_ = grown;
 }
 
+void GpuRenderer::create_background_pipeline()
+{
+    SDL_GPUShader* vertex = create_embedded_shader(device_, true,
+        background_vert_dxil, background_vert_spv, 0U);
+    SDL_GPUShader* fragment = nullptr;
+    try {
+        fragment = create_embedded_shader(device_, false,
+            background_frag_dxil, background_frag_spv, 1U);
+        background_pipeline_ = create_auxiliary_pipeline(device_, window_, vertex, fragment,
+            antialiasing_samples_, false);
+        if (antialiasing_samples_ != 1) background_pipeline_direct_ =
+            create_auxiliary_pipeline(device_, window_, vertex, fragment, 1, false);
+    } catch (...) {
+        if (fragment != nullptr) SDL_ReleaseGPUShader(device_, fragment);
+        SDL_ReleaseGPUShader(device_, vertex);
+        throw;
+    }
+    SDL_ReleaseGPUShader(device_, fragment);
+    SDL_ReleaseGPUShader(device_, vertex);
+}
+
+void GpuRenderer::create_retained_pipeline()
+{
+    SDL_GPUShader* vertex = create_embedded_shader(device_, true,
+        retained_vert_dxil, retained_vert_spv, 2U);
+    SDL_GPUShader* fragment = nullptr;
+    try {
+        fragment = create_embedded_shader(device_, false, retained_frag_dxil, retained_frag_spv, 0U);
+        retained_pipeline_ = create_auxiliary_pipeline(device_, window_, vertex, fragment, antialiasing_samples_, true);
+        if (antialiasing_samples_ != 1) retained_pipeline_direct_ =
+            create_auxiliary_pipeline(device_, window_, vertex, fragment, 1, true);
+    } catch (...) {
+        if (fragment != nullptr) SDL_ReleaseGPUShader(device_, fragment);
+        SDL_ReleaseGPUShader(device_, vertex);
+        throw;
+    }
+    SDL_ReleaseGPUShader(device_, fragment);
+    SDL_ReleaseGPUShader(device_, vertex);
+}
+
+void GpuRenderer::draw_background(SDL_GPUCommandBuffer* command, SDL_GPURenderPass* pass,
+    const Camera& camera, const Toolbar& toolbar, const std::uint32_t width,
+    const std::uint32_t height, const bool multisampled)
+{
+    const double theme_amount = board_theme_amount(toolbar);
+    const auto grid_color = toolbar.grid_color().has_value()
+        ? std::optional<Color>{board_display_color(*toolbar.grid_color(), theme_amount)} : std::nullopt;
+    const auto parameters = background_parameters(static_cast<BackgroundGridPattern>(toolbar.background_style()),
+        board_display_color(toolbar.background_color(), theme_amount), grid_color, camera.position(), camera.viewport(), camera.zoom(),
+        {static_cast<double>(width), static_cast<double>(height)});
+    SDL_PushGPUFragmentUniformData(command, 0U, &parameters, sizeof(parameters));
+    SDL_BindGPUGraphicsPipeline(pass, !multisampled && background_pipeline_direct_ != nullptr
+        ? background_pipeline_direct_ : background_pipeline_);
+    SDL_DrawGPUPrimitives(pass, 3U, 1U, 0U, 0U);
+    ++stats_.draw_calls;
+    ++stats_.background_draw_calls;
+}
+
 void GpuRenderer::create_pipeline()
 {
     SDL_GPUShader* vertex_shader = create_shader(device_, true);
@@ -5210,17 +6183,17 @@ void GpuRenderer::create_pipeline()
         constexpr auto preferred_sample_count = SDL_GPU_SAMPLECOUNT_4;
         constexpr auto fallback_sample_count = SDL_GPU_SAMPLECOUNT_2;
         antialiasing_samples_ = 1;
-        if (SDL_GPUTextureSupportsSampleCount(
+        if (antialiasing_enabled_ && SDL_GPUTextureSupportsSampleCount(
                 device_, color_target.format, preferred_sample_count)) {
             antialiasing_samples_ = 4;
-        } else if (SDL_GPUTextureSupportsSampleCount(
+        } else if (antialiasing_enabled_ && SDL_GPUTextureSupportsSampleCount(
                        device_, color_target.format, fallback_sample_count)) {
             antialiasing_samples_ = 2;
             log::write(
                 log::Level::warning,
                 "GPU does not support the preferred 4x MSAA drawing target; "
                 "using 2x MSAA");
-        } else {
+        } else if (antialiasing_enabled_) {
             log::write(
                 log::Level::warning,
                 "GPU does not support a multisampled drawing target; "
@@ -5410,6 +6383,7 @@ GpuRenderer::CachedImage& GpuRenderer::ensure_image_texture(
     std::shared_ptr<const DecodedImage> decoded = image_decode_cache_.find(asset->id);
     if (!decoded) {
         decoded = std::make_shared<DecodedImage>(decode_image_rgba(asset->png));
+        ++stats_.image_decodes;
         if (decoded->width != asset->pixel_width
             || decoded->height != asset->pixel_height) {
             throw std::runtime_error{"Image asset dimensions changed during decode"};
@@ -5541,9 +6515,9 @@ void GpuRenderer::prune_image_cache()
 }
 
 void GpuRenderer::ensure_msaa_target(
-    const std::uint32_t width, const std::uint32_t height)
+    const std::uint32_t width, const std::uint32_t height, const bool force)
 {
-    if (antialiasing_samples_ == 1 || width == 0U || height == 0U) {
+    if ((!force && antialiasing_samples_ == 1) || width == 0U || height == 0U) {
         return;
     }
     if (msaa_texture_ != nullptr
@@ -5583,6 +6557,7 @@ void GpuRenderer::ensure_msaa_target(
         create_info.height = target_height;
         create_info.sample_count = gpu_sample_count(antialiasing_samples_);
         create_info.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
+        if (antialiasing_samples_ == 1) create_info.usage |= SDL_GPU_TEXTUREUSAGE_SAMPLER;
         SDL_GPUTexture* const msaa =
             SDL_CreateGPUTexture(device_, &create_info);
         if (msaa == nullptr) {
@@ -5634,40 +6609,67 @@ void GpuRenderer::create_text_resources()
     }
 
     SDL_IOStream* const font_stream = SDL_IOFromConstMem(
-        assets::source_sans_3_regular,
-        assets::source_sans_3_regular_size);
+        assets::inter_regular,
+        assets::inter_regular_size);
     if (font_stream == nullptr) {
         throw_sdl("Embedded font stream creation");
     }
-    font_ = TTF_OpenFontIO(font_stream, true, 15.0F);
+    font_ = TTF_OpenFontIO(font_stream, true, 16.0F);
     if (font_ == nullptr) {
-        throw_sdl("Embedded Source Sans 3 Regular font opening");
+        throw_sdl("Embedded Inter Regular font opening");
     }
-    TTF_SetFontHinting(font_, TTF_HINTING_LIGHT);
+    TTF_SetFontHinting(font_, TTF_HINTING_NORMAL);
+
+    SDL_IOStream* const secondary_font_stream = SDL_IOFromConstMem(
+        assets::inter_regular,
+        assets::inter_regular_size);
+    if (secondary_font_stream == nullptr) {
+        throw_sdl("Embedded secondary font stream creation");
+    }
+    secondary_font_ = TTF_OpenFontIO(
+        secondary_font_stream, true, 14.0F);
+    if (secondary_font_ == nullptr) {
+        throw_sdl("Embedded Inter secondary font opening");
+    }
+    TTF_SetFontHinting(secondary_font_, TTF_HINTING_NORMAL);
 
     SDL_IOStream* const bold_font_stream = SDL_IOFromConstMem(
-        assets::source_sans_3_medium,
-        assets::source_sans_3_medium_size);
+        assets::inter_medium,
+        assets::inter_medium_size);
     if (bold_font_stream == nullptr) {
         throw_sdl("Embedded bold font stream creation");
     }
-    bold_font_ = TTF_OpenFontIO(bold_font_stream, true, 15.0F);
+    bold_font_ = TTF_OpenFontIO(bold_font_stream, true, 16.0F);
     if (bold_font_ == nullptr) {
-        throw_sdl("Embedded Source Sans 3 Medium font opening");
+        throw_sdl("Embedded Inter Medium font opening");
     }
-    TTF_SetFontHinting(bold_font_, TTF_HINTING_LIGHT);
+    TTF_SetFontHinting(bold_font_, TTF_HINTING_NORMAL);
 
     SDL_IOStream* const title_font_stream = SDL_IOFromConstMem(
-        assets::source_sans_3_semibold,
-        assets::source_sans_3_semibold_size);
+        assets::inter_semibold,
+        assets::inter_semibold_size);
     if (title_font_stream == nullptr) {
         throw_sdl("Embedded title font stream creation");
     }
-    title_font_ = TTF_OpenFontIO(title_font_stream, true, 28.0F);
+    title_font_ = TTF_OpenFontIO(title_font_stream, true, 29.0F);
     if (title_font_ == nullptr) {
-        throw_sdl("Embedded Source Sans 3 Semibold font opening");
+        throw_sdl("Embedded Inter Semibold font opening");
     }
-    TTF_SetFontHinting(title_font_, TTF_HINTING_LIGHT);
+    TTF_SetFontHinting(title_font_, TTF_HINTING_NORMAL);
+
+    SDL_IOStream* const document_font_stream = SDL_IOFromConstMem(
+        assets::inter_medium, assets::inter_medium_size);
+    if (document_font_stream == nullptr) throw_sdl("Document font stream creation");
+    document_font_ = TTF_OpenFontIO(document_font_stream, true, 14.0F);
+    if (document_font_ == nullptr) throw_sdl("Document font opening");
+    TTF_SetFontHinting(document_font_, TTF_HINTING_NORMAL);
+
+    SDL_IOStream* const caption_font_stream = SDL_IOFromConstMem(
+        assets::inter_regular, assets::inter_regular_size);
+    if (caption_font_stream == nullptr) throw_sdl("Caption font stream creation");
+    caption_font_ = TTF_OpenFontIO(caption_font_stream, true, 12.0F);
+    if (caption_font_ == nullptr) throw_sdl("Caption font opening");
+    TTF_SetFontHinting(caption_font_, TTF_HINTING_NORMAL);
 
     text_engine_ = TTF_CreateGPUTextEngine(device_);
     if (text_engine_ == nullptr) {
@@ -5912,20 +6914,52 @@ void GpuRenderer::queue_home_thumbnail(
     });
 }
 
+TTF_Font* GpuRenderer::text_font(const TextStyle style) const noexcept
+{
+    switch (style) {
+    case TextStyle::secondary: return secondary_font_;
+    case TextStyle::bold: return bold_font_;
+    case TextStyle::title: return title_font_;
+    case TextStyle::document: return document_font_;
+    case TextStyle::caption: return caption_font_;
+    default: return font_;
+    }
+}
+
+Vec2d GpuRenderer::tooltip_text_extent(const Toolbar& toolbar, const UiControl& control)
+{
+    const double width = measure_text_width(control.tooltip);
+    const double scale = toolbar.scale();
+    const double wrap_width = std::min(480.0 * scale,
+        toolbar.viewport_width() - 32.0 * scale) - 24.0 * scale;
+    if (control.action != UiAction::rename_board || width <= wrap_width) return {width, 0.0};
+    int measured_width = 0;
+    int measured_height = 0;
+    if (!TTF_GetStringSizeWrapped(font_, control.tooltip.data(), control.tooltip.size(),
+            std::max(1, static_cast<int>(std::floor(wrap_width / text_geometry_scale_))),
+            &measured_width, &measured_height)) {
+        throw_sdl("Filename tooltip measurement");
+    }
+    return {wrap_width, static_cast<double>(measured_height) * text_geometry_scale_};
+}
+
 void GpuRenderer::queue_text(
     const std::string_view text,
     const double x,
     const double y,
     const std::array<float, 4> color,
-    const TextStyle style)
+    const TextStyle style,
+    const double wrap_width)
 {
     if (text.empty()) return;
     if (color[3] <= 0.004F) return;
     std::string key;
     key.reserve(text.size() + 1U);
-    key.push_back(
-        style == TextStyle::title ? 'T'
-                                  : (style == TextStyle::bold ? 'B' : 'R'));
+    key.push_back(text_style_key(style));
+    const int wrap_pixels = wrap_width > 0.0
+        ? std::max(1, static_cast<int>(std::floor(wrap_width / text_geometry_scale_))) : 0;
+    key.append(std::to_string(wrap_pixels));
+    key.push_back('|');
     key.append(text);
     auto found = text_cache_.find(key);
     if (found == text_cache_.end()) {
@@ -5941,13 +6975,15 @@ void GpuRenderer::queue_text(
                 text_cache_.erase(oldest);
             }
         }
-        TTF_Font* const selected_font = style == TextStyle::title
-            ? title_font_
-            : (style == TextStyle::bold ? bold_font_ : font_);
+        TTF_Font* const selected_font = text_font(style);
         TTF_Text* const created = TTF_CreateText(
             text_engine_, selected_font, text.data(), text.size());
         if (created == nullptr) {
             throw_sdl("Text shaping");
+        }
+        if (wrap_pixels > 0 && !TTF_SetTextWrapWidth(created, wrap_pixels)) {
+            TTF_DestroyText(created);
+            throw_sdl("Filename tooltip wrapping");
         }
         found = text_cache_.emplace(
             key,
@@ -6016,6 +7052,7 @@ void GpuRenderer::queue_text(
             first_index,
             vertex_offset,
             static_cast<std::uint32_t>(sequence->num_indices),
+            text_clip_,
         });
     }
 }
@@ -6029,18 +7066,14 @@ double GpuRenderer::measure_text_width(
     }
     std::string key;
     key.reserve(text.size() + 1U);
-    key.push_back(
-        style == TextStyle::title ? 'T'
-                                  : (style == TextStyle::bold ? 'B' : 'R'));
+    key.push_back(text_style_key(style));
     key.append(text);
     if (const auto found = text_width_cache_.find(key);
         found != text_width_cache_.end()) {
         return found->second;
     }
 
-    TTF_Font* const selected_font = style == TextStyle::title
-        ? title_font_
-        : (style == TextStyle::bold ? bold_font_ : font_);
+    TTF_Font* const selected_font = text_font(style);
     int width = 0;
     int height = 0;
     if (!TTF_GetStringSize(
@@ -6070,9 +7103,7 @@ std::string GpuRenderer::fit_text_to_width(
         std::floor(maximum_width / text_geometry_scale_)));
     std::string key;
     key.reserve(text.size() + 24U);
-    key.push_back(
-        style == TextStyle::title ? 'T'
-                                  : (style == TextStyle::bold ? 'B' : 'R'));
+    key.push_back(text_style_key(style));
     key.append(std::to_string(pixel_budget));
     key.push_back('|');
     key.append(text);
@@ -6124,6 +7155,7 @@ double GpuRenderer::prepare_text_frame(
     text_vertices_.clear();
     text_indices_.clear();
     text_batches_.clear();
+    text_clip_.reset();
     text_viewport_width_ = viewport_width;
     text_viewport_height_ = viewport_height;
 
@@ -6138,7 +7170,7 @@ double GpuRenderer::prepare_text_frame(
     }
     const double previous_geometry_scale = text_geometry_scale_;
     text_geometry_scale_ = 1.0 / pixel_density;
-    constexpr double base_text_size = 15.0;
+    constexpr double base_text_size = 16.0;
     const double desired_raster_size = std::max(
         text_raster_size_quantum,
         std::round(
@@ -6167,11 +7199,25 @@ double GpuRenderer::prepare_text_frame(
                 font_, static_cast<float>(desired_raster_size))) {
             throw_sdl("DPI-aware font sizing");
         }
+        constexpr double secondary_text_size = 14.0;
+        if (!TTF_SetFontSize(
+                secondary_font_,
+                static_cast<float>(
+                    desired_raster_size
+                    * secondary_text_size / base_text_size))) {
+            throw_sdl("DPI-aware secondary font sizing");
+        }
         if (!TTF_SetFontSize(
                 bold_font_, static_cast<float>(desired_raster_size))) {
             throw_sdl("DPI-aware bold font sizing");
         }
-        constexpr double title_text_size = 28.0;
+        if (!TTF_SetFontSize(document_font_,
+                static_cast<float>(desired_raster_size * 14.0 / base_text_size))
+            || !TTF_SetFontSize(caption_font_,
+                static_cast<float>(desired_raster_size * 12.0 / base_text_size))) {
+            throw_sdl("DPI-aware document font sizing");
+        }
+        constexpr double title_text_size = 29.0;
         if (!TTF_SetFontSize(
                 title_font_,
                 static_cast<float>(
@@ -6213,14 +7259,10 @@ void GpuRenderer::build_text_geometry(
         text_color(palette.on_primary);
     const double scale = toolbar.scale();
     const double reveal = toolbar.reveal();
-    constexpr double modal_background_alpha = 0.38;
     const double chrome_reveal = reveal
-        * std::clamp(background_opacity, 0.0, 1.0)
-        * (toolbar.style_color_editor_open()
-            ? modal_background_alpha
-            : 1.0);
+        * std::clamp(background_opacity, 0.0, 1.0);
     std::optional<UiRect> modal_bounds;
-    if (toolbar.style_color_editor_open()
+    if (toolbar.settings_open()
         && toolbar.panels().size() >= 2U) {
         modal_bounds =
             toolbar.panels()[toolbar.panels().size() - 2U].bounds;
@@ -6236,12 +7278,7 @@ void GpuRenderer::build_text_geometry(
         return chrome_reveal;
     };
 
-    // Mirror the geometry entrance: top chrome slides down, the bottom bar
-    // rises, and labels fade in alongside their panels.
-    const auto slide = [&](const double y) {
-        const double offset = (1.0 - reveal) * 18.0 * scale;
-        return y < toolbar.viewport_height() * 0.5 ? -offset : offset;
-    };
+    const auto slide = [](double) { return 0.0; };
     const auto faded = [](std::array<float, 4> color, const double alpha) {
         color[3] *= static_cast<float>(std::clamp(alpha, 0.0, 1.0));
         return color;
@@ -6263,15 +7300,15 @@ void GpuRenderer::build_text_geometry(
         status.y += slide(status.y);
         const std::array<float, 4> status_text =
             faded(text, base_text_alpha(status));
-        const double text_x = status.x
-            + (toolbar.dirty() ? 27.0 : 13.0) * scale;
-        const double baseline = centered_text_top(status.y, status.height);
+        const double text_x = status.x + 12.0 * scale;
+        const double baseline = toolbar.filename_editing()
+            ? centered_text_top(status.y, status.height) : status.y + 3.0 * scale;
         const std::string raw_filename{toolbar.filename()};
         std::string filename{raw_filename};
         if (const UiControl* const rename =
                 toolbar.find(UiAction::rename_board)) {
             const double available = std::max(
-                12.0 * scale, rename->bounds.x - text_x - 8.0 * scale);
+                12.0 * scale, status.x + status.width - text_x - 12.0 * scale);
             const auto text_width = [&](const std::string& value) {
                 int width = 0;
                 int height = 0;
@@ -6411,19 +7448,18 @@ void GpuRenderer::build_text_geometry(
                         camera,
                         palette.focus);
                 }
-            } else if (!fits(filename)) {
-                while (!filename.empty()
-                       && !fits(filename + "...")) {
-                    filename.erase(previous_codepoint(
-                        filename, filename.size()));
-                }
-                filename.append("...");
-                queue_text(filename, text_x, baseline, status_text);
             } else {
-                queue_text(filename, text_x, baseline, status_text);
+                queue_text(fit_text_to_width(filename, available, TextStyle::document),
+                    text_x, baseline, status_text, TextStyle::document);
             }
         } else {
-            queue_text(filename, text_x, baseline, status_text);
+            queue_text(filename, text_x, baseline, status_text, TextStyle::document);
+        }
+        if (!toolbar.filename_editing()) {
+            const double status_budget = status.x + status.width - text_x - 12.0 * scale;
+            const auto status_color = text_color(mix_color(palette.muted, palette.surface, 0.12));
+            queue_text(fit_text_to_width(toolbar.document_status(), status_budget, TextStyle::caption),
+                text_x, status.y + 23.0 * scale, faded(status_color, base_text_alpha(status)), TextStyle::caption);
         }
         if (!toolbar.error_message().empty()) {
             UiRect error = toolbar.error_bounds();
@@ -6440,29 +7476,49 @@ void GpuRenderer::build_text_geometry(
                 centered_text_top(error.y, error.height),
                 faded(text, base_text_alpha(error)),
                 TextStyle::bold);
+        } else if (!toolbar.status_message().empty()) {
+            UiRect activity = toolbar.status_bounds();
+            activity.y += slide(activity.y);
+            const double text_budget = std::max(
+                activity.width - 24.0 * scale, 1.0);
+            queue_text(
+                fit_text_to_width(
+                    toolbar.status_message(),
+                    text_budget,
+                    TextStyle::regular),
+                activity.x + 12.0 * scale,
+                centered_text_top(activity.y, activity.height),
+                faded(status_text, base_text_alpha(activity)));
         }
     }
 
-    if (const UiControl* const save_as = toolbar.find(UiAction::save_as);
-        save_as != nullptr && !save_as->label.empty()) {
-        int label_width = 0;
-        int label_height = 0;
-        if (!TTF_GetStringSize(
-                font_, save_as->label.data(), save_as->label.size(),
-                &label_width, &label_height)) {
-            throw_sdl("Save-label measurement");
-        }
-        static_cast<void>(label_height);
+    if (toolbar.properties_surface_bounds().width > 0.0) {
+        const UiRect panel = toolbar.properties_surface_bounds();
+        const UiControl* toggle = toolbar.find(UiAction::properties_menu);
+        if (toggle != nullptr) queue_text("Style", panel.x + 12.0 * scale,
+            centered_text_top(toggle->bounds.y, toggle->bounds.height),
+            faded(muted, base_text_alpha(panel)), TextStyle::bold);
+    }
+    for (const UiAction action : {UiAction::file_menu}) {
+        const UiControl* const control = toolbar.find(action);
+        if (control == nullptr || control->label.empty()) continue;
+        UiRect label_bounds = control->bounds;
+        if (action == UiAction::file_menu) label_bounds.width -= 18.0 * scale;
+        if (action == UiAction::properties_menu) label_bounds.width -= 32.0 * scale;
+        const TextStyle label_style = action == UiAction::file_menu
+            ? TextStyle::secondary : TextStyle::bold;
+        const std::string label = fit_text_to_width(control->label,
+            label_bounds.width - 12.0 * scale, label_style);
+        const double label_width = measure_text_width(label, label_style);
         queue_text(
-            save_as->label,
-            save_as->bounds.x
-                + (save_as->bounds.width
-                    - static_cast<double>(label_width)
-                        * text_geometry_scale_) * 0.5,
-            centered_text_top(save_as->bounds.y, save_as->bounds.height)
-                + slide(save_as->bounds.y),
-            faded(text, base_text_alpha(save_as->bounds)),
-            TextStyle::bold);
+            label,
+            label_bounds.x + (label_bounds.width - label_width) * 0.5,
+            centered_text_top(control->bounds.y, control->bounds.height),
+            faded(!control->enabled ? muted
+                    : (control->selected && uses_soft_property_selection(action)
+                        ? text_color(palette.focus) : (control->selected ? selected_text : text)),
+                base_text_alpha(control->bounds)),
+            label_style);
     }
 
     if (const UiControl* const zoom = toolbar.find(UiAction::zoom_menu)) {
@@ -6485,17 +7541,19 @@ void GpuRenderer::build_text_geometry(
                         * text_geometry_scale_) * 0.5,
             centered_text_top(zoom->bounds.y, zoom->bounds.height)
                 + slide(zoom->bounds.y),
-            faded(muted, base_text_alpha(zoom->bounds)));
+            faded(zoom->selected ? selected_text : text, base_text_alpha(zoom->bounds)));
     }
 
+    const UiRect clip = toolbar.properties_clip();
+    if (clip.width > 0.0) {
+        text_clip_ = std::array<double, 4>{clip.x, clip.y, clip.width, clip.height};
+    }
+    const auto properties_text_alpha = [&](const UiRect bounds) {
+        return base_text_alpha(bounds) * toolbar.properties_reveal();
+    };
     constexpr std::array context_label_actions{
-        UiAction::color_target_stroke,
-        UiAction::color_target_fill,
-        UiAction::width_cycle,
-        UiAction::stabilization_off,
-        UiAction::stabilization_light,
-        UiAction::stabilization_default,
-        UiAction::stabilization_strong,
+        UiAction::color_target_stroke, UiAction::color_target_fill,
+        UiAction::fill_none, UiAction::width_cycle,
     };
     for (const UiAction action : context_label_actions) {
         const UiControl* const control = toolbar.find(action);
@@ -6513,23 +7571,17 @@ void GpuRenderer::build_text_geometry(
             throw_sdl("Context-label measurement");
         }
         static_cast<void>(label_height);
-        const bool color_well =
-            action == UiAction::color_target_stroke
-            || action == UiAction::color_target_fill;
-        const double label_area_x = color_well
-            ? control->bounds.x + 17.0 * scale
-            : control->bounds.x;
-        const double label_area_width = color_well
-            ? std::max(0.0, control->bounds.width - 20.0 * scale)
-            : control->bounds.width;
+        const double label_area_x = control->bounds.x;
+        const double label_area_width = control->bounds.width;
         const bool soft_selected =
             control->selected && uses_soft_property_selection(action);
+        const std::string fitted_label = fit_text_to_width(control->label,
+            std::max(1.0, label_area_width - 12.0 * scale), TextStyle::regular);
+        const double fitted_width = measure_text_width(fitted_label, TextStyle::regular);
         queue_text(
-            control->label,
+            fitted_label,
             label_area_x
-                + (label_area_width
-                    - static_cast<double>(label_width)
-                        * text_geometry_scale_) * 0.5,
+                + (label_area_width - fitted_width) * 0.5,
             centered_text_top(
                 control->bounds.y, control->bounds.height)
                 + slide(control->bounds.y),
@@ -6537,9 +7589,9 @@ void GpuRenderer::build_text_geometry(
                 !control->enabled
                     ? muted
                     : (soft_selected
-                        ? text_color(palette.primary)
+                        ? text_color(palette.focus)
                         : (control->selected ? selected_text : text)),
-                base_text_alpha(control->bounds)),
+                properties_text_alpha(control->bounds)),
             TextStyle::regular);
     }
 
@@ -6554,24 +7606,23 @@ void GpuRenderer::build_text_geometry(
                     + slide(first->bounds.y),
                 faded(
                     muted,
-                    base_text_alpha({
+                    properties_text_alpha({
                         first->bounds.x,
                         first->bounds.y - font_line_height - 2.0 * scale,
                         100.0 * scale,
                         font_line_height + 3.0 * scale,
-                    })));
+                    })), TextStyle::bold);
         };
     context_section_label(UiAction::color_white, "Color");
     context_section_label(UiAction::width_thin, "Width");
     context_section_label(UiAction::roundness_square, "Corners");
-    context_section_label(
-        UiAction::stabilization_off, "Stabilization");
+    text_clip_.reset();
 
     if (toolbar.settings_open()) {
         // Settings labels fade and rise with the flyout geometry.
         const double settings_alpha = toolbar.settings_reveal();
         const auto settings_shift = [&](const double y) {
-            return slide(y) + (1.0 - settings_alpha) * 10.0 * scale;
+            return slide(y);
         };
         const std::array<float, 4> settings_text = faded(text, settings_alpha);
         const std::array<float, 4> settings_muted =
@@ -6581,7 +7632,11 @@ void GpuRenderer::build_text_geometry(
         const UiControl* const back = toolbar.find(UiAction::settings_close);
         if (back != nullptr) {
             std::string_view title = "Canvas settings";
-            if (toolbar.settings_page() == SettingsPage::canvas) {
+            if (toolbar.settings_page() == SettingsPage::file) {
+                title = "File";
+            } else if (toolbar.settings_page() == SettingsPage::preferences) {
+                title = "Board settings";
+            } else if (toolbar.settings_page() == SettingsPage::canvas) {
                 title = "Canvas settings";
             } else if (toolbar.settings_page() == SettingsPage::view) {
                 title = "Zoom and framing";
@@ -6603,7 +7658,7 @@ void GpuRenderer::build_text_geometry(
             }
             queue_text(
                 title,
-                back->bounds.x + back->bounds.width + 10.0 * scale,
+                toolbar.panels()[toolbar.panels().size() - 2U].bounds.x + 16.0 * scale,
                 centered_text_top(back->bounds.y, back->bounds.height)
                     + settings_shift(back->bounds.y),
                 settings_text,
@@ -6622,13 +7677,74 @@ void GpuRenderer::build_text_geometry(
             }
         };
         if (toolbar.settings_page() == SettingsPage::canvas) {
-            section_label(UiAction::bg_color_0, "Background color");
-            section_label(UiAction::grid_color_auto, "Grid color");
-            section_label(UiAction::grid_solid, "Grid pattern");
+            const double section_height = static_cast<double>(TTF_GetFontHeight(document_font_)) * text_geometry_scale_;
+            const double caption_height = static_cast<double>(TTF_GetFontHeight(caption_font_)) * text_geometry_scale_;
+            const auto canvas_heading = [&](const UiAction first_action, const std::string_view label) {
+                if (const UiControl* first = toolbar.find(first_action)) {
+                    queue_text(label, first->bounds.x, first->bounds.y - section_height - 6.0 * scale,
+                        settings_muted, TextStyle::document);
+                }
+            };
+            canvas_heading(UiAction::bg_color_6, "Background");
+            canvas_heading(UiAction::grid_color_6, "Grid color");
+            canvas_heading(UiAction::grid_solid, "Pattern");
+            for (const UiControl& control : toolbar.controls()) {
+                if (!is_canvas_pattern(control.action) || control.label.empty()) continue;
+                const std::string label = fit_text_to_width(control.label,
+                    control.bounds.width - 8.0 * scale, TextStyle::caption);
+                const double width = measure_text_width(label, TextStyle::caption);
+                queue_text(label, control.bounds.x + (control.bounds.width - width) * 0.5,
+                    control.bounds.y + control.bounds.height - 18.0 * scale
+                        + (16.0 * scale - caption_height) * 0.5,
+                    control.selected ? faded(text_color(palette.focus), settings_alpha) : settings_muted,
+                    TextStyle::caption);
+            }
+            for (const UiAction action : {UiAction::grid_color_auto, UiAction::edit_background_custom}) {
+                const UiControl* control = toolbar.find(action);
+                if (control == nullptr) continue;
+                UiRect label = control->bounds;
+                if (action == UiAction::edit_background_custom) {
+                    label.x += 32.0 * scale;
+                    label.width -= 36.0 * scale;
+                }
+                const std::string value = fit_text_to_width(control->label, label.width - 4.0 * scale, TextStyle::caption);
+                const double width = measure_text_width(value, TextStyle::caption);
+                queue_text(value, label.x + (label.width - width) * 0.5,
+                    label.y + (label.height - caption_height) * 0.5,
+                    control->selected ? faded(text_color(palette.focus), settings_alpha) : settings_text,
+                    TextStyle::caption);
+            }
         } else if (toolbar.settings_page() == SettingsPage::color_editor) {
             section_label(UiAction::custom_hue_field, "Hue");
             section_label(
-                UiAction::custom_sv_field, "Saturation / brightness");
+                UiAction::custom_sv_field, "Saturation & brightness");
+            const UiRect preview = toolbar.custom_color_preview_bounds();
+            const Color color = toolbar.custom_color();
+            std::array<char, 16> hex{};
+            std::array<char, 32> rgb{};
+            static_cast<void>(std::snprintf(hex.data(), hex.size(), "#%02X%02X%02X",
+                static_cast<unsigned>(color.red), static_cast<unsigned>(color.green),
+                static_cast<unsigned>(color.blue)));
+            static_cast<void>(std::snprintf(rgb.data(), rgb.size(), "RGB %u, %u, %u",
+                static_cast<unsigned>(color.red), static_cast<unsigned>(color.green),
+                static_cast<unsigned>(color.blue)));
+            const double text_x = preview.x + preview.height + 8.0 * scale;
+            const std::string hex_label = toolbar.hex_editing()
+                ? std::string{toolbar.hex_text()} + (toolbar.hex_selected() ? "" : "|") : std::string{hex.data()};
+            queue_text(hex_label, text_x + 8.0 * scale, preview.y + 3.0 * scale,
+                settings_text, TextStyle::bold);
+            queue_text(toolbar.hex_valid() ? std::string_view{rgb.data()} : "Use #RRGGBB or #RGB",
+                text_x + 8.0 * scale, preview.y + 23.0 * scale,
+                toolbar.hex_valid() ? settings_muted
+                    : faded(text_color(toolbar.theme() == Theme::light
+                        ? RenderColor{0.72F, 0.18F, 0.24F}
+                        : RenderColor{1.0F, 0.48F, 0.54F}), settings_alpha),
+                TextStyle::secondary);
+            if (toolbar.find(UiAction::recent_color_0) == nullptr) {
+                const UiRect footer = toolbar.find(UiAction::custom_color_done)->bounds;
+                queue_text("Custom colors appear here after Apply", preview.x,
+                    footer.y - 34.0 * scale, settings_muted, TextStyle::secondary);
+            }
         }
 
         if (toolbar.settings_page() == SettingsPage::about
@@ -6773,15 +7889,19 @@ void GpuRenderer::build_text_geometry(
         }
 
         constexpr std::array label_actions{
-            UiAction::stabilization_off,
-            UiAction::stabilization_light,
-            UiAction::stabilization_default,
-            UiAction::stabilization_strong,
+            UiAction::new_board,
+            UiAction::open_board,
+            UiAction::rename_file,
+            UiAction::save_as,
+            UiAction::save_copy,
+            UiAction::format_background,
+            UiAction::toggle_theme,
+            UiAction::about,
             UiAction::zoom_reset,
             UiAction::zoom_fit_content,
             UiAction::zoom_fit_selection,
-            UiAction::grid_color_auto,
             UiAction::custom_color_done,
+            UiAction::custom_color_cancel,
         };
         for (const auto action : label_actions) {
             const UiControl* const control = toolbar.find(action);
@@ -6797,9 +7917,21 @@ void GpuRenderer::build_text_geometry(
                 throw_sdl("Settings-label measurement");
             }
             static_cast<void>(label_height);
+            const bool menu_row = toolbar.settings_page() == SettingsPage::file
+                || toolbar.settings_page() == SettingsPage::preferences;
+            const std::string_view shortcut = action == UiAction::rename_file ? "F2"
+                : action == UiAction::new_board ? "Ctrl+N"
+                : (action == UiAction::open_board ? "Ctrl+O"
+                    : (action == UiAction::save_as ? "Ctrl+S"
+                        : (action == UiAction::save_copy ? "Ctrl+Shift+S" : (action == UiAction::toggle_theme ? "T" : ""))));
+            const double shortcut_width = shortcut.empty() ? 0.0 : measure_text_width(shortcut, TextStyle::secondary);
+            const std::string label = menu_row
+                ? fit_text_to_width(control->label,
+                    control->bounds.width - 48.0 * scale - shortcut_width, TextStyle::regular)
+                : std::string{control->label};
             queue_text(
-                control->label,
-                control->bounds.x
+                label,
+                menu_row ? control->bounds.x + 36.0 * scale : control->bounds.x
                     + (control->bounds.width
                         - static_cast<double>(label_width)
                             * text_geometry_scale_) * 0.5,
@@ -6811,29 +7943,34 @@ void GpuRenderer::build_text_geometry(
                     : (control->selected
                         ? settings_selected
                         : settings_text));
+            if (menu_row && !shortcut.empty()) queue_text(shortcut,
+                control->bounds.x + control->bounds.width - shortcut_width - 8.0 * scale,
+                centered_text_top(control->bounds.y, control->bounds.height), settings_muted, TextStyle::secondary);
         }
 
     }
 
-    const UiControl* const hovered = toolbar.hovered_control();
-    const UiControl* const focused = toolbar.focused_tooltip_control();
-    const UiControl* const described =
-        hovered != nullptr ? hovered : focused;
-    const double described_visibility = hovered != nullptr
-        ? toolbar.animation(hovered->action).hover
-        : (focused != nullptr ? 1.0 : 0.0);
-    if (described != nullptr && described_visibility > 0.08) {
-        if (const auto bounds = tooltip_bounds(toolbar, described)) {
+    const UiControl* const described = toolbar.tooltip_control();
+    const double described_visibility = described == nullptr ? 0.0 : 1.0;
+    tooltip_first_text_batch_ = text_batches_.size();
+    text_clip_.reset();
+    if (tooltip_allowed_this_frame_ && described != nullptr && described_visibility > 0.08) {
+        const Vec2d tooltip_extent = tooltip_text_extent(toolbar, *described);
+        if (const auto bounds = tooltip_bounds(toolbar, described,
+                tooltip_extent.x, tooltip_extent.y)) {
             const double visibility = described_visibility;
             const double offset =
                 (1.0 - visibility) * 4.0 * scale + slide(bounds->y);
             const std::array<float, 4> tooltip_text =
                 text_color(palette.background);
             queue_text(
-                described->tooltip,
+                described->action == UiAction::rename_board ? described->tooltip
+                    : fit_text_to_width(described->tooltip, bounds->width - 24.0 * scale),
                 bounds->x + 12.0 * scale,
-                centered_text_top(bounds->y + offset, bounds->height),
-                faded(tooltip_text, visibility));
+                tooltip_extent.y > 0.0 ? bounds->y + offset + 6.0 * scale
+                    : centered_text_top(bounds->y + offset, bounds->height),
+                faded(tooltip_text, visibility), TextStyle::regular,
+                tooltip_extent.y > 0.0 ? bounds->width - 24.0 * scale : 0.0);
         }
     }
 }
@@ -6931,6 +8068,9 @@ void GpuRenderer::build_home_text_geometry(
 {
     const double font_line_height = prepare_text_frame(
         home.viewport_width(), home.viewport_height(), home.scale());
+    const double date_line_height =
+        static_cast<double>(TTF_GetFontHeight(caption_font_))
+        * text_geometry_scale_;
     for (auto cached = thumbnail_textures_.begin();
          cached != thumbnail_textures_.end();) {
         if (cached->second.owner.expired()) {
@@ -7009,11 +8149,6 @@ void GpuRenderer::build_home_text_geometry(
     };
 
     const auto& boards = home.boards();
-    const double thumbnail_horizontal_margin =
-        HomeView::card_preview_margin * scale;
-    const double thumbnail_top_margin = 38.0 * scale;
-    const double thumbnail_bottom_margin =
-        HomeView::card_preview_margin * scale;
     const double vertical_margin = 20.0 * scale;
     for (std::size_t index = 0U; index < boards.size(); ++index) {
         if (boards[index].preview == nullptr
@@ -7027,13 +8162,7 @@ void GpuRenderer::build_home_text_geometry(
             || card.y > home.viewport_height() + vertical_margin) {
             continue;
         }
-        const UiRect thumbnail{
-            card.x + thumbnail_horizontal_margin,
-            card.y + thumbnail_top_margin,
-            card.width - thumbnail_horizontal_margin * 2.0,
-            card.height - HomeView::card_text_area * scale
-                - thumbnail_top_margin - thumbnail_bottom_margin,
-        };
+        const UiRect thumbnail = home.board_preview_bounds(index);
         queue_home_thumbnail(
             boards[index].preview,
             thumbnail,
@@ -7054,29 +8183,38 @@ void GpuRenderer::build_home_text_geometry(
         faded(strong, reveal),
         TextStyle::title);
     queue_text(
-        std::to_string(home.boards().size()),
+        std::to_string(boards.size()) + (boards.size() == 1U ? " board" : " boards"),
         heading.x + measure(heading_text, TextStyle::title) + 12.0 * scale,
-        centered_text_top(heading.y, heading.height) + header_shift,
-        faded(muted, reveal));
+        heading.y + (heading.height - date_line_height) * 0.5 + header_shift,
+        faded(muted, reveal), TextStyle::caption);
 
-    if (!home.error_message().empty()
+    if ((!home.error_message().empty() || !home.status_message().empty())
         && home.status_bounds().width > 1.0) {
         UiRect status = home.status_bounds();
         status.y += panel_shift;
         const double text_x = status.x + 42.0 * scale;
         const double budget = std::max(
             status.width - 54.0 * scale, 1.0);
-        queue_text(
-            "Could not complete that action",
-            text_x,
-            status.y + 5.0 * scale,
-            faded(danger, reveal),
-            TextStyle::bold);
-        queue_text(
-            fit(std::string{home.error_message()}, budget),
-            text_x,
-            status.y + 5.0 * scale + font_line_height,
-            faded(muted, reveal));
+        if (!home.error_message().empty()) {
+            queue_text(
+                "Could not complete that action",
+                text_x,
+                status.y + 5.0 * scale,
+                faded(danger, reveal),
+                TextStyle::bold);
+            queue_text(
+                fit(std::string{home.error_message()}, budget),
+                text_x,
+                status.y + 5.0 * scale + font_line_height,
+                faded(muted, reveal));
+        } else {
+            queue_text(
+                fit(std::string{home.status_message()}, budget),
+                text_x,
+                centered_text_top(status.y, status.height),
+                faded(text, reveal),
+                TextStyle::regular);
+        }
     }
 
     for (std::size_t index = 0U; index < home.controls().size(); ++index) {
@@ -7091,7 +8229,8 @@ void GpuRenderer::build_home_text_geometry(
             centered_text_top(control.bounds.y, control.bounds.height)
                 + home.control_offset(index),
             faded(control.selected ? on_accent : text,
-                home.entrance(index)));
+                home.entrance(index)),
+            TextStyle::bold);
     }
 
     if (boards.empty() && !home.panels().empty()) {
@@ -7111,18 +8250,10 @@ void GpuRenderer::build_home_text_geometry(
             empty.y + 98.0 * scale + panel_shift,
             faded(muted, reveal));
     }
-    const double text_area = HomeView::card_text_area * scale;
     for (std::size_t index = 0U; index < boards.size(); ++index) {
         const UiControl& card = home.controls()[index];
-        const bool card_active =
-            card.selected || home.focused_control() == &card;
-        const std::array<float, 4> card_name_color =
-            card_active ? on_accent : text;
-        std::array<float, 4> card_date_color =
-            card_active ? on_accent : muted;
-        if (card_active) {
-            card_date_color[3] = 0.92F;
-        }
+        const std::array<float, 4> card_name_color = text;
+        const std::array<float, 4> card_date_color = muted;
         const double entrance = home.entrance(index);
         const double offset = home.control_offset(index);
         const double card_top = card.bounds.y + offset;
@@ -7130,10 +8261,11 @@ void GpuRenderer::build_home_text_geometry(
             || card_top > home.viewport_height() + vertical_margin) {
             continue;
         }
-        const double name_x = card.bounds.x;
-        const double budget = card.bounds.width;
-        const double name_y = card.bounds.y + card.bounds.height
-            - text_area + 6.0 * scale + offset;
+        const UiRect name = home.board_name_bounds(index);
+        const UiRect date = home.board_date_bounds(index);
+        const double name_x = name.x;
+        const double budget = name.width;
+        const double name_y = name.y + (name.height - font_line_height) * 0.5;
         if (boards[index].editing) {
             const std::string& raw_name = boards[index].name;
             const std::size_t cursor =
@@ -7209,18 +8341,14 @@ void GpuRenderer::build_home_text_geometry(
                     },
                     3.0 * scale,
                     camera,
-                    card_active
-                        ? palette.on_primary
-                        : palette.primary);
+                    palette.primary);
                 queue_text(
                     before, name_x, name_y,
                     faded(card_name_color, entrance), TextStyle::bold);
                 queue_text(
                     selected, name_x + before_width, name_y,
                     faded(
-                        card_active
-                            ? text_color(palette.primary)
-                            : on_accent,
+                        on_accent,
                         entrance),
                     TextStyle::bold);
                 queue_text(
@@ -7243,9 +8371,7 @@ void GpuRenderer::build_home_text_geometry(
                      name_y + font_line_height - 1.0 * scale},
                     1.5 * scale,
                     camera,
-                    card_active
-                        ? palette.on_primary
-                        : palette.focus);
+                    palette.focus);
             }
         } else {
             queue_text(
@@ -7256,122 +8382,134 @@ void GpuRenderer::build_home_text_geometry(
                 TextStyle::bold);
         }
         queue_text(
-            fit(boards[index].date, budget),
+            fit(boards[index].display_date, date.width, TextStyle::caption),
             name_x,
-            name_y + font_line_height + 2.0 * scale,
-            faded(card_date_color, entrance));
+            date.y + (date.height - date_line_height) * 0.5,
+            faded(card_date_color, entrance),
+            TextStyle::caption);
     }
+    if (const auto described = home.date_tooltip(); tooltip_allowed_this_frame_ && described) {
+        const std::string& timestamp = boards[*described].date;
+        const UiRect date = home.board_date_bounds(*described);
+        const double padding = 12.0 * scale;
+        const double width = std::min(measure(timestamp) + padding * 2.0,
+            std::max(home.viewport_width() - padding * 2.0, 1.0));
+        const double height = font_line_height + 16.0 * scale;
+        const double x = std::clamp(date.x, padding,
+            std::max(padding, home.viewport_width() - width - padding));
+        const double y = std::clamp(date.y - height - 8.0 * scale, padding,
+            std::max(padding, home.viewport_height() - height - padding));
+        const UiRect bounds{x, y, width, height};
+        tooltip_first_vertex_ = static_cast<std::uint32_t>(geometry_.size());
+        tooltip_first_text_batch_ = text_batches_.size();
+        text_clip_.reset();
+        append_soft_shadow(geometry_, geometry_spans_, bounds, 8.0 * scale,
+            camera, RenderColor{0.0F, 0.0F, 0.0F}, scale, 0.7);
+        append_screen_rounded_rect(geometry_, bounds, 8.0 * scale, camera, palette.text);
+        queue_text(fit(timestamp, width - padding * 2.0), x + padding,
+            y + (height - font_line_height) * 0.5, text_color(palette.background));
+    }
+
 }
 
-void GpuRenderer::tessellate_indexed_stroke(
-    std::vector<CachedWorldVertex>& output,
-    const Stroke& stroke,
-    const Style& style,
-    const std::uint32_t detail,
-    const double zoom,
-    const Aabb& visible,
-    const StrokeSegmentIndex& index) const
+bool GpuRenderer::tessellate_indexed_stroke(
+    std::vector<CachedWorldVertex>& output, const Stroke& stroke,
+    const Style& style, const std::uint32_t detail, const double zoom,
+    const Aabb& visible, const StrokeSegmentIndex& index)
 {
     output.clear();
-    if (stroke.points.size() < 2U) {
-        tessellate_polyline(output, stroke.points, style, detail);
-        return;
-    }
-
-    const std::size_t stride = std::max<std::size_t>(
-        1U,
-        static_cast<std::size_t>(std::ceil(
-            (0.65 / std::max(zoom, 1.0e-9))
-            / index.average_segment_length())));
-
-    std::vector<std::uint32_t> segments;
-    index.query(visible, segments);
-    const std::size_t segment_budget = maximum_stroke_segments(
-        detail, maximum_vertex_count);
-    const std::size_t budget_stride = std::max<std::size_t>(
-        1U,
-        (segments.size() + segment_budget - 1U) / segment_budget);
-    std::vector<Vec2d> run;
-    std::uint32_t previous = 0U;
-    std::size_t stride_candidate = 0U;
-    const auto flush_run = [&]() {
-        if (run.size() >= 2U) {
-            tessellate_polyline(output, run, style, detail);
-        }
-        run.clear();
-    };
-    for (const auto segment : segments) {
-        if (stride != 1U && segment % stride != 0U) {
-            continue;
-        }
-        if (stride_candidate++ % budget_stride != 0U) {
-            continue;
-        }
-        if (segment == 0U || segment >= stroke.points.size()) {
-            continue;
-        }
-        if (!run.empty()
-            && static_cast<std::size_t>(segment - previous)
-                > stride * budget_stride * 2U) {
-            flush_run();
-        }
-        if (run.empty()) {
-            const std::size_t sampled_stride = stride * budget_stride;
-            const std::size_t start = segment > sampled_stride
-                ? static_cast<std::size_t>(segment) - sampled_stride
-                : static_cast<std::size_t>(segment - 1U);
-            run.push_back(stroke.points[start]);
-        }
-        run.push_back(stroke.points[segment]);
-        previous = segment;
-    }
-    flush_run();
+    const bool complete = visit_indexed_stroke(stroke, style, detail, zoom, visible, index,
+        [&](const std::span<const CachedWorldVertex> page) {
+            if (page.size() > maximum_cached_stroke_vertices - output.size()) return false;
+            const std::size_t required = output.size() + page.size();
+            if (output.capacity() < required) {
+                output.reserve(std::min(maximum_cached_stroke_vertices,
+                    std::max(required, output.capacity() * 2U)));
+            }
+            output.insert(output.end(), page.begin(), page.end());
+            return true;
+        });
+    if (!complete) std::vector<CachedWorldVertex>{}.swap(output);
+    return complete;
 }
 
-void GpuRenderer::prune_cache()
+bool GpuRenderer::visit_indexed_stroke(
+    const Stroke& stroke, const Style& style, const std::uint32_t detail,
+    const double zoom, const Aabb& visible, const StrokeSegmentIndex& index,
+    const std::function<bool(std::span<const CachedWorldVertex>)>& consume)
 {
-    const std::size_t total_bytes = geometry_cache_bytes_;
-    if (stats_.frame % 120U != 0U
-        && total_bytes <= geometry_cache_budget
-        && object_cache_.size() <= maximum_cache_entries) {
-        return;
+    stroke_page_vertices_.clear();
+    stroke_page_vertices_.reserve(stroke_page_vertex_count);
+    const std::function<bool(std::span<const CachedWorldVertex>)> consume_page = [&](const auto page) {
+        stats_.peak_stroke_page_vertices = std::max(stats_.peak_stroke_page_vertices, page.size());
+        return consume(page);
+    };
+    PagedStrokeGeometry output{stroke_page_vertices_, consume_page, visible};
+    // Keep the callback alive for every page flush.
+    try {
+        if (stroke.points.size() < 2U) {
+            tessellate_polyline(output, stroke.points, style, detail);
+        } else {
+            const double padding = std::max(style.stroke_width, 0.5) * 0.5;
+            index.query({visible.min_x - padding, visible.min_y - padding,
+                visible.max_x + padding, visible.max_y + padding}, stroke_segment_scratch_);
+            for (std::size_t first = 0U; first < stroke_segment_scratch_.size();) {
+                std::size_t last = first;
+                while (last + 1U < stroke_segment_scratch_.size()
+                    && stroke_segment_scratch_[last + 1U] == stroke_segment_scratch_[last] + 1U) ++last;
+                const std::size_t begin = stroke_segment_scratch_[first] - 1U;
+                const std::size_t end = stroke_segment_scratch_[last];
+                simplify_stroke_for_rendering(
+                    std::span<const Vec2d>{stroke.points}.subspan(begin, end - begin + 1U),
+                    stroke_detail_tolerance(zoom), stroke_render_points_);
+                tessellate_polyline(output, stroke_render_points_, style, detail);
+                first = last + 1U;
+            }
+        }
+        output.flush();
+    } catch (const StrokePageStopped&) {
+        stroke_page_vertices_.clear();
+        return false;
     }
+    return true;
+}
 
-    std::vector<std::pair<std::uint64_t, ObjectId>> candidates;
-    candidates.reserve(object_cache_.size());
-    for (const auto& [id, cached] : object_cache_) {
-        if (cached.last_used_frame + 600U < stats_.frame
-            || total_bytes > geometry_cache_budget
-            || object_cache_.size() > maximum_cache_entries) {
-            candidates.emplace_back(cached.last_used_frame, id);
+void GpuRenderer::prune_cache(const ObjectId* const protected_id)
+{
+    const bool pressure = geometry_cache_bytes_ + geometry_metadata_bytes()
+        > geometry_cache_budget || object_cache_.size() > maximum_cache_entries;
+    const std::size_t byte_target = pressure ? geometry_cache_budget * 9U / 10U : geometry_cache_budget;
+    const std::size_t entry_target = pressure ? maximum_cache_entries * 9U / 10U : maximum_cache_entries;
+    std::size_t stale_removed = 0U;
+    while (const auto oldest = geometry_recency_.oldest()) {
+        if (protected_id != nullptr && *oldest == *protected_id) {
+            if (geometry_recency_.size() == 1U) break;
+            geometry_recency_.touch(*oldest);
+            continue;
         }
-    }
-    std::ranges::sort(candidates, {}, &std::pair<std::uint64_t, ObjectId>::first);
-    std::size_t current_bytes = geometry_cache_bytes_;
-    std::size_t current_entries = object_cache_.size();
-    for (const auto& [last_used, id] : candidates) {
-        const bool stale = last_used + 600U < stats_.frame;
-        if (!stale && current_bytes <= geometry_cache_budget
-            && current_entries <= maximum_cache_entries) {
-            break;
-        }
-        if (const auto cached = object_cache_.find(id);
-            cached != object_cache_.end()) {
-            const std::size_t bytes =
-                cached->second.vertices.capacity()
-                * sizeof(CachedWorldVertex);
-            geometry_cache_bytes_ -= bytes;
-            current_bytes -= bytes;
-            object_cache_.erase(cached);
-            --current_entries;
-        }
+        const auto cached = object_cache_.find(*oldest);
+        const bool over_target = geometry_cache_bytes_ + geometry_metadata_bytes()
+            > byte_target || object_cache_.size() > entry_target;
+        const bool stale = cached->second.last_used_frame + 600U < stats_.frame;
+        if (!over_target && (!stale || stale_removed >= 64U)) break;
+        release_mesh(cached->second);
+        if (cached->second.alternate) release_mesh(*cached->second.alternate);
+        geometry_cache_bytes_ -= cached->second.capacity_bytes();
+        object_cache_.erase(cached);
+        geometry_recency_.erase(*oldest);
+        ++stale_removed;
         ++total_evictions_;
     }
 }
 
 void GpuRenderer::trim_board_caches_for_home()
 {
+    release_mesh_storage();
     decltype(object_cache_){}.swap(object_cache_);
+    geometry_recency_.clear();
+    visibility_cache_.clear();
+    std::vector<ObjectId>{}.swap(resident_scene_ids_);
+    std::vector<DocumentChange>{}.swap(mesh_changes_);
     geometry_cache_bytes_ = 0U;
     scene_valid_ = false;
     draft_cache_active_ = false;
@@ -7393,6 +8531,34 @@ void GpuRenderer::trim_board_caches_for_home()
         initial_scene_vertex_capacity);
     reset_capacity(image_vertices_, 0U);
     reset_capacity(scene_draws_, 0U);
+    reset_capacity(scene_stream_draws_, 0U);
+    reset_capacity(scene_batch_geometry_, 0U);
+    reset_capacity(scene_batch_draws_, 0U);
+    reset_capacity(stroke_render_points_, 0U);
+    reset_capacity(stroke_page_vertices_, 0U);
+    reset_capacity(stroke_segment_scratch_, 0U);
+    release_batch_slots();
+    if (scene_stream_texture_ != nullptr) {
+        SDL_ReleaseGPUTexture(device_, scene_stream_texture_);
+        scene_stream_texture_ = nullptr;
+    }
+    if (scene_stream_quad_ != nullptr) {
+        SDL_ReleaseGPUBuffer(device_, scene_stream_quad_);
+        scene_stream_quad_ = nullptr;
+    }
+    if (pixel_readback_surface_ != nullptr) {
+        SDL_ReleaseGPUTexture(device_, pixel_readback_surface_);
+        pixel_readback_surface_ = nullptr;
+    }
+    if (pixel_readback_transfer_ != nullptr) {
+        SDL_ReleaseGPUTransferBuffer(device_, pixel_readback_transfer_);
+        pixel_readback_transfer_ = nullptr;
+    }
+    pixel_readback_width_ = pixel_readback_height_ = 0U;
+    pixel_readback_position_.reset();
+    pixel_readback_result_.reset();
+    scene_stream_width_ = scene_stream_height_ = 0U;
+    scene_stream_capacity_width_ = scene_stream_capacity_height_ = 0U;
     reset_capacity(
         draft_gpu_geometry_,
         initial_draft_vertex_capacity);
@@ -7450,6 +8616,105 @@ void GpuRenderer::trim_board_caches_for_home()
     image_textures_.clear();
     image_texture_bytes_ = 0U;
     image_decode_cache_.clear();
+}
+
+GpuRenderer::CachedGeometry& GpuRenderer::cached_geometry_for(
+    const Object& object, const Document& document,
+    const Camera& camera, const Aabb& geometry_visible)
+{
+    const std::uint32_t detail =
+        geometry_detail(object.geometry, object.style, camera.zoom());
+    const auto* const stroke = std::get_if<Stroke>(&object.geometry);
+    const int stroke_lod = stroke_detail_bucket(camera.zoom());
+    const bool region_limited =
+        stroke != nullptr && stroke->points.size() > 4'096U;
+    const auto region_min_x = static_cast<std::int64_t>(
+        std::floor(
+            geometry_visible.min_x / SpatialChunkIndex::chunk_size));
+    const auto region_min_y = static_cast<std::int64_t>(
+        std::floor(
+            geometry_visible.min_y / SpatialChunkIndex::chunk_size));
+    const auto region_max_x = static_cast<std::int64_t>(
+        std::floor(
+            geometry_visible.max_x / SpatialChunkIndex::chunk_size));
+    const auto region_max_y = static_cast<std::int64_t>(
+        std::floor(
+            geometry_visible.max_y / SpatialChunkIndex::chunk_size));
+    auto& cached = object_cache_[object.id];
+    const auto matches = [&](const CachedMesh& mesh) {
+        // A finer stroke remains safe when zooming out. Never delay an
+        // upgrade past the quarter-pixel tolerance when zooming in.
+        return mesh.revision == object.revision && mesh.detail == detail
+            && (stroke == nullptr || (mesh.stroke_detail >= stroke_lod
+                && mesh.stroke_detail <= stroke_lod + 1))
+            && (!region_limited || (mesh.region_limited
+                && mesh.region_min_x <= region_min_x && mesh.region_min_y <= region_min_y
+                && mesh.region_max_x >= region_max_x && mesh.region_max_y >= region_max_y));
+    };
+    if (!matches(cached) && cached.alternate && matches(*cached.alternate))
+        std::swap(static_cast<CachedMesh&>(cached), *cached.alternate);
+    if (!matches(cached)) {
+        geometry_cache_bytes_ -= cached.capacity_bytes();
+        if (cached.alternate) release_mesh(*cached.alternate);
+        if (cached.revision == object.revision && !cached.vertices.empty())
+            cached.alternate = std::move(static_cast<CachedMesh&>(cached));
+        else { release_mesh(cached); cached.alternate.reset(); }
+        static_cast<CachedMesh&>(cached) = {};
+        if (region_limited) {
+            bool index_built = false;
+            const StrokeSegmentIndex* const segment_index =
+                document.stroke_segment_index(
+                    object.id, &index_built);
+            if (segment_index == nullptr) {
+                throw std::logic_error{
+                    "Stroke object has no segment index"};
+            }
+            if (index_built) {
+                ++stats_.segment_index_builds;
+            }
+            cached.paged = !tessellate_indexed_stroke(
+                cached.vertices,
+                *stroke,
+                object.style,
+                detail,
+                camera.zoom(),
+                {static_cast<double>(region_min_x) * SpatialChunkIndex::chunk_size,
+                 static_cast<double>(region_min_y) * SpatialChunkIndex::chunk_size,
+                 static_cast<double>(region_max_x + 1) * SpatialChunkIndex::chunk_size,
+                 static_cast<double>(region_max_y + 1) * SpatialChunkIndex::chunk_size},
+                *segment_index);
+        } else if (stroke != nullptr) {
+            cached.paged = false;
+            simplify_stroke_for_rendering(
+                stroke->points, stroke_detail_tolerance(camera.zoom()), stroke_render_points_);
+            cached.vertices.clear();
+            tessellate_polyline(cached.vertices, stroke_render_points_, object.style, detail);
+        } else {
+            cached.paged = false;
+            tessellate_geometry(
+                cached.vertices,
+                object.geometry,
+                object.style,
+                detail);
+        }
+        geometry_cache_bytes_ += cached.capacity_bytes();
+        cached.revision = object.revision;
+        cached.detail = detail;
+        cached.stroke_detail = stroke_lod;
+        cached.region_limited = region_limited;
+        cached.region_min_x = region_min_x;
+        cached.region_min_y = region_min_y;
+        cached.region_max_x = region_max_x;
+        cached.region_max_y = region_max_y;
+        ++stats_.tessellated_objects;
+    } else {
+        ++stats_.cache_hits;
+    }
+    cached.last_used_frame = stats_.frame;
+    geometry_recency_.touch(object.id);
+    if (geometry_cache_bytes_ + geometry_metadata_bytes() > geometry_cache_budget
+        || object_cache_.size() > maximum_cache_entries) prune_cache(&object.id);
+    return cached;
 }
 
 void GpuRenderer::build_board_geometry(
@@ -7520,12 +8785,18 @@ void GpuRenderer::build_board_geometry(
     stats_.scene_rebuilt = rebuild_scene;
     if (rebuild_scene) {
         scene_geometry_.clear();
+        resident_scene_ids_.clear();
         image_vertices_.clear();
         scene_draws_.clear();
+        scene_stream_draws_.clear();
+        scene_streamed_ = false;
+        scene_rendered_images_ = 0U;
+        scene_rendered_residents_ = 0U;
+        // A skipped/minimized frame or failed submission must never make a
+        // previous document view look like the newly rebuilt raster scene.
+        scene_stream_width_ = scene_stream_height_ = 0U;
 
     const auto background_start = std::chrono::steady_clock::now();
-    const RenderColor active_board_color =
-        to_render_color(toolbar.background_color());
     const RenderColor active_border_color = mix_color(
         toolbar.previous_theme() == Theme::light
             ? RenderColor{0.58F, 0.62F, 0.69F}
@@ -7534,22 +8805,6 @@ void GpuRenderer::build_board_geometry(
             ? RenderColor{0.58F, 0.62F, 0.69F}
             : border_color,
         smooth_theme_transition(toolbar));
-    append_quad(
-        scene_geometry_, min_x, min_y, max_x, max_y, camera_position,
-        active_board_color);
-
-    append_background_pattern(
-        scene_geometry_,
-        camera_position,
-        toolbar.background_style(),
-        active_board_color,
-        toolbar.grid_color(),
-        min_x,
-        min_y,
-        max_x,
-        max_y,
-        grid_world_spacing,
-        camera.zoom());
 
     const double border_width = 2.0 / camera.zoom();
     if (visible.min_x <= -edge + border_width) {
@@ -7573,12 +8828,17 @@ void GpuRenderer::build_board_geometry(
             camera_position, active_border_color);
     }
     const auto background_end = std::chrono::steady_clock::now();
+    scene_background_vertices_ = scene_geometry_.size();
+    scene_total_vertices_ = scene_background_vertices_;
+    scene_stream_draws_.push_back({SceneDraw::Kind::vector, 0U,
+        static_cast<std::uint32_t>(scene_background_vertices_), nullptr, nullptr});
     stats_.background_milliseconds =
         std::chrono::duration<double, std::milli>(
             background_end - background_start).count();
 
     const auto query_start = std::chrono::steady_clock::now();
-    document.query(visible, visible_objects_, visible_object_ids_);
+    if (visibility_cache_.query(document, visible, 128.0 / camera.zoom(),
+            visible_objects_, visible_object_ids_)) ++stats_.visibility_query_reuses;
     const auto query_end = std::chrono::steady_clock::now();
     stats_.query_milliseconds =
         std::chrono::duration<double, std::milli>(
@@ -7586,85 +8846,10 @@ void GpuRenderer::build_board_geometry(
     stats_.visible_objects = visible_objects_.size();
     scene_visible_objects_ = visible_objects_.size();
     const auto objects_start = std::chrono::steady_clock::now();
-    const auto cached_geometry_for =
-        [&](const Object& object,
-            const Aabb& geometry_visible) -> CachedGeometry& {
-        const std::uint32_t detail =
-            geometry_detail(object.geometry, object.style, camera.zoom());
-        const auto* const stroke = std::get_if<Stroke>(&object.geometry);
-        const bool region_limited =
-            stroke != nullptr && stroke->points.size() > 4'096U;
-        const auto region_min_x = static_cast<std::int64_t>(
-            std::floor(
-                geometry_visible.min_x / SpatialChunkIndex::chunk_size));
-        const auto region_min_y = static_cast<std::int64_t>(
-            std::floor(
-                geometry_visible.min_y / SpatialChunkIndex::chunk_size));
-        const auto region_max_x = static_cast<std::int64_t>(
-            std::floor(
-                geometry_visible.max_x / SpatialChunkIndex::chunk_size));
-        const auto region_max_y = static_cast<std::int64_t>(
-            std::floor(
-                geometry_visible.max_y / SpatialChunkIndex::chunk_size));
-        auto& cached = object_cache_[object.id];
-        const bool region_matches = !region_limited
-            || (cached.region_limited
-                && cached.region_min_x == region_min_x
-                && cached.region_min_y == region_min_y
-                && cached.region_max_x == region_max_x
-                && cached.region_max_y == region_max_y);
-        if (cached.revision != object.revision || cached.detail != detail
-            || !region_matches) {
-            geometry_cache_bytes_ -=
-                cached.vertices.capacity()
-                * sizeof(CachedWorldVertex);
-            if (region_limited) {
-                bool index_built = false;
-                const StrokeSegmentIndex* const segment_index =
-                    document.stroke_segment_index(
-                        object.id, &index_built);
-                if (segment_index == nullptr) {
-                    throw std::logic_error{
-                        "Stroke object has no segment index"};
-                }
-                if (index_built) {
-                    ++stats_.segment_index_builds;
-                }
-                tessellate_indexed_stroke(
-                    cached.vertices,
-                    *stroke,
-                    object.style,
-                    detail,
-                    camera.zoom(),
-                    geometry_visible,
-                    *segment_index);
-            } else {
-                tessellate_geometry(
-                    cached.vertices,
-                    object.geometry,
-                    object.style,
-                    detail);
-            }
-            geometry_cache_bytes_ +=
-                cached.vertices.capacity()
-                * sizeof(CachedWorldVertex);
-            cached.revision = object.revision;
-            cached.detail = detail;
-            cached.region_limited = region_limited;
-            cached.region_min_x = region_min_x;
-            cached.region_min_y = region_min_y;
-            cached.region_max_x = region_max_x;
-            cached.region_max_y = region_max_y;
-            ++stats_.tessellated_objects;
-        } else {
-            ++stats_.cache_hits;
-        }
-        cached.last_used_frame = stats_.frame;
-        return cached;
-    };
 
     std::size_t vector_run_start = 0U;
     const auto flush_vector_run = [&]() {
+        if (scene_streamed_) return;
         if (scene_geometry_.size() <= vector_run_start) return;
         scene_draws_.push_back({
             SceneDraw::Kind::vector,
@@ -7689,19 +8874,65 @@ void GpuRenderer::build_board_geometry(
         }
         if (const auto* image = std::get_if<Image>(&object->geometry)) {
             flush_vector_run();
+            const std::size_t before = image_vertices_.size();
+            const std::size_t first_draw = scene_draws_.size();
             append_image_draws(*image, camera);
+            scene_stream_draws_.insert(scene_stream_draws_.end(),
+                scene_draws_.begin() + static_cast<std::ptrdiff_t>(first_draw),
+                scene_draws_.end());
+            if (image_vertices_.size() > before) {
+                ++stats_.rendered_objects;
+                ++scene_rendered_images_;
+            }
             vector_run_start = scene_geometry_.size();
             continue;
         }
-        auto& cached = cached_geometry_for(*object, visible);
-        const std::size_t cached_vertices =
-            cached.vertices.size();
-        if (scene_geometry_.size() + cached_vertices
-            > maximum_vertex_count) {
+        const auto existing = object_cache_.find(object->id);
+        if (scene_streamed_ && (existing == object_cache_.end()
+                || existing->second.resident.empty() || existing->second.revision != object->revision)) {
+            // Build remaining meshes once, when their batch is consumed.
+            // Filling the LRU first would evict and then retessellate them.
+            scene_stream_draws_.push_back({SceneDraw::Kind::vector, 0U, 0U, nullptr, object});
             continue;
         }
-        append_cached_geometry(
-            scene_geometry_, cached.vertices, camera_position);
+        auto& cached = cached_geometry_for(*object, document, camera, visible);
+        if (ensure_resident_mesh(cached, *object)) {
+            resident_scene_ids_.push_back(object->id);
+            flush_vector_run();
+            const auto append_draw = [](std::vector<SceneDraw>& draws, const SceneDraw& draw) {
+                if (!draws.empty() && draws.back().kind == SceneDraw::Kind::resident
+                    && draws.back().buffer == draw.buffer && draws.back().origin == draw.origin
+                    && draws.back().first_vertex + draws.back().vertex_count == draw.first_vertex)
+                    draws.back().vertex_count += draw.vertex_count;
+                else draws.push_back(draw);
+            };
+            for (const auto range : cached.resident) {
+                const SceneDraw draw{SceneDraw::Kind::resident, range.first, range.count, nullptr,
+                    object, mesh_pages_[range.page], cached.origin};
+                append_draw(scene_stream_draws_, draw);
+                if (!scene_streamed_) append_draw(scene_draws_, draw);
+            }
+            scene_total_vertices_ += cached.vertices.size();
+            ++stats_.rendered_objects;
+            ++scene_rendered_residents_;
+            continue;
+        }
+        const std::size_t cached_vertices =
+            cached.vertices.size();
+        scene_stream_draws_.push_back({SceneDraw::Kind::vector, 0U,
+            static_cast<std::uint32_t>(cached_vertices), nullptr, object});
+        scene_total_vertices_ += cached_vertices;
+        if (!scene_streamed_
+            && (cached.paged || scene_geometry_.size() + cached_vertices > scene_batch_vertex_count)) {
+            scene_streamed_ = true;
+            scene_geometry_.resize(scene_background_vertices_);
+            scene_draws_.clear();
+        }
+        if (!scene_streamed_) {
+            append_cached_geometry(
+                scene_geometry_, cached.vertices, camera_position);
+        }
+        if (cached_vertices != 0U) ++stats_.rendered_objects;
     }
     flush_vector_run();
     const auto objects_end = std::chrono::steady_clock::now();
@@ -7709,9 +8940,24 @@ void GpuRenderer::build_board_geometry(
         std::chrono::duration<double, std::milli>(
             objects_end - objects_start).count();
         scene_signature_ = signature;
-        scene_valid_ = true;
+        scene_rendered_objects_ = stats_.rendered_objects;
+        // A streamed scene is already captured in its raster target; its
+        // mesh descriptors are rebuilt before the next raster regeneration.
+        scene_valid_ = scene_streamed_ || !resident_scene_invalidated_;
     } else {
         stats_.visible_objects = scene_visible_objects_;
+        if (!scene_streamed_) {
+            // The draw list can outlive many UI-only frames. Pin every
+            // participating mesh, including objects merged into one draw.
+            for (const auto id : resident_scene_ids_) {
+                const auto found = object_cache_.find(id);
+                if (found == object_cache_.end() || found->second.resident.empty()) continue;
+                found->second.last_submission = submitted_mesh_serial_ + 1U;
+                found->second.last_used_frame = stats_.frame;
+                geometry_recency_.touch(id);
+            }
+        }
+        stats_.rendered_objects = scene_rendered_objects_;
     }
 
     const auto overlay_start = std::chrono::steady_clock::now();
@@ -7805,6 +9051,7 @@ void GpuRenderer::build_board_geometry(
                     continue;
                 }
                 cached->second.last_used_frame = stats_.frame;
+                geometry_recency_.touch(id);
                 const std::size_t cached_vertices =
                     cached->second.vertices.size();
                 if (!can_append_vertices(
@@ -7979,6 +9226,16 @@ void GpuRenderer::build_board_geometry(
         draft_upload_pending_ = false;
     }
 
+    // Only copied drawing previews are present here. Keep UI, selection handles
+    // and the pointer indicator on their own interface palette.
+    const double preview_theme_amount = board_theme_amount(toolbar);
+    if (preview_theme_amount > 0.0) {
+        for (auto& vertex : geometry_) {
+            const auto color = board_display_color(
+                {vertex.color[0], vertex.color[1], vertex.color[2], vertex.color[3]}, preview_theme_amount);
+            vertex.color = {color.red, color.green, color.blue, color.alpha};
+        }
+    }
     append_selection_geometry(
         geometry_,
         geometry_spans_,
@@ -8014,7 +9271,15 @@ void GpuRenderer::build_board_geometry(
                 cursor_segments);
         }
     }
-    append_toolbar_geometry(geometry_, geometry_spans_, camera, toolbar);
+    Vec2d tooltip_extent{};
+    if (const UiControl* described = toolbar.tooltip_control();
+        described != nullptr && !described->tooltip.empty()) {
+        static_cast<void>(prepare_text_frame(toolbar.viewport_width(),
+            toolbar.viewport_height(), toolbar.scale()));
+        tooltip_extent = tooltip_text_extent(toolbar, *described);
+    }
+    append_toolbar_geometry(geometry_, geometry_spans_, camera, toolbar,
+        tooltip_extent.x, tooltip_extent.y, tooltip_allowed_this_frame_, tooltip_first_vertex_);
     trim_geometry_to_vertex_budget(geometry_, geometry_spans_);
     const auto overlay_end = std::chrono::steady_clock::now();
     stats_.overlay_ui_milliseconds =
@@ -8026,7 +9291,7 @@ void GpuRenderer::build_board_geometry(
     // draw list, after every texture referenced by the new list was touched.
     if (rebuild_scene) prune_image_cache();
 
-    if (scene_geometry_.size() > maximum_vertex_count) {
+    if (scene_geometry_.size() > scene_batch_vertex_count) {
         throw std::runtime_error{"Scene exceeded its vertex budget"};
     }
     if (geometry_.size() > maximum_vertex_count) {
@@ -8094,6 +9359,10 @@ void GpuRenderer::release() noexcept
         TTF_CloseFont(font_);
         font_ = nullptr;
     }
+    if (secondary_font_ != nullptr) {
+        TTF_CloseFont(secondary_font_);
+        secondary_font_ = nullptr;
+    }
     if (bold_font_ != nullptr) {
         TTF_CloseFont(bold_font_);
         bold_font_ = nullptr;
@@ -8101,6 +9370,14 @@ void GpuRenderer::release() noexcept
     if (title_font_ != nullptr) {
         TTF_CloseFont(title_font_);
         title_font_ = nullptr;
+    }
+    if (document_font_ != nullptr) {
+        TTF_CloseFont(document_font_);
+        document_font_ = nullptr;
+    }
+    if (caption_font_ != nullptr) {
+        TTF_CloseFont(caption_font_);
+        caption_font_ = nullptr;
     }
     TTF_Quit();
 
@@ -8148,6 +9425,23 @@ void GpuRenderer::release() noexcept
         SDL_ReleaseGPUTexture(device_, msaa_resolve_texture_);
         msaa_resolve_texture_ = nullptr;
     }
+    release_mesh_storage();
+    if (retained_pipeline_ != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(device_, retained_pipeline_);
+        retained_pipeline_ = nullptr;
+    }
+    if (retained_pipeline_direct_ != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(device_, retained_pipeline_direct_);
+        retained_pipeline_direct_ = nullptr;
+    }
+    if (background_pipeline_ != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(device_, background_pipeline_);
+        background_pipeline_ = nullptr;
+    }
+    if (background_pipeline_direct_ != nullptr) {
+        SDL_ReleaseGPUGraphicsPipeline(device_, background_pipeline_direct_);
+        background_pipeline_direct_ = nullptr;
+    }
     if (pipeline_ != nullptr) {
         SDL_ReleaseGPUGraphicsPipeline(device_, pipeline_);
         pipeline_ = nullptr;
@@ -8172,6 +9466,28 @@ void GpuRenderer::release() noexcept
         SDL_ReleaseGPUBuffer(device_, scene_vertex_buffer_);
         scene_vertex_buffer_ = nullptr;
     }
+    release_batch_slots();
+    if (scene_stream_texture_ != nullptr) {
+        SDL_ReleaseGPUTexture(device_, scene_stream_texture_);
+        scene_stream_texture_ = nullptr;
+    }
+    if (scene_stream_quad_ != nullptr) {
+        SDL_ReleaseGPUBuffer(device_, scene_stream_quad_);
+        scene_stream_quad_ = nullptr;
+    }
+    if (pixel_readback_surface_ != nullptr) {
+        SDL_ReleaseGPUTexture(device_, pixel_readback_surface_);
+        pixel_readback_surface_ = nullptr;
+    }
+    if (pixel_readback_transfer_ != nullptr) {
+        SDL_ReleaseGPUTransferBuffer(device_, pixel_readback_transfer_);
+        pixel_readback_transfer_ = nullptr;
+    }
+    pixel_readback_width_ = pixel_readback_height_ = 0U;
+    pixel_readback_position_.reset();
+    pixel_readback_result_.reset();
+    scene_stream_width_ = scene_stream_height_ = 0U;
+    scene_stream_capacity_width_ = scene_stream_capacity_height_ = 0U;
     if (draft_vertex_buffer_ != nullptr) {
         SDL_ReleaseGPUBuffer(device_, draft_vertex_buffer_);
         draft_vertex_buffer_ = nullptr;

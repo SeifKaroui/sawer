@@ -1,4 +1,6 @@
 #include "storage/BoardFile.hpp"
+#include "core/CommandLine.hpp"
+#include "core/Filesystem.hpp"
 #include "storage/SawerRecord.hpp"
 
 #include <nlohmann/json.hpp>
@@ -175,15 +177,16 @@ void print_usage()
 
 } // namespace
 
-int main(const int argc, char** const argv)
+static int run_format(const std::vector<std::string>& argv)
 {
+    const auto argc = argv.size();
     if (argc < 3 || argc > 4) { print_usage(); return 2; }
     const std::string_view command{argv[1]};
-    const std::filesystem::path board_path{argv[2]};
+    const auto board_path = sawer::path_from_utf8(argv[2]);
     try {
         if (command == "extract") {
             if (argc != 4) { print_usage(); return 2; }
-            extract(board_path, argv[3]);
+            extract(board_path, sawer::path_from_utf8(argv[3]));
             return 0;
         }
         if (command == "compact") {
@@ -208,6 +211,16 @@ int main(const int argc, char** const argv)
                       << "last sequence: " << info.last_sequence << '\n';
         }
         return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "sawer-format: " << error.what() << '\n';
+        return 1;
+    }
+}
+
+int main(const int argc, char* argv[])
+{
+    try {
+        return run_format(sawer::command_line_arguments(argc, argv));
     } catch (const std::exception& error) {
         std::cerr << "sawer-format: " << error.what() << '\n';
         return 1;

@@ -5,6 +5,7 @@
 #include "ui/Toolbar.hpp"
 
 #include <filesystem>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <string>
@@ -22,6 +23,7 @@ struct HomeBoard final {
     bool editing{};
     std::size_t edit_cursor{};
     std::size_t edit_anchor{};
+    std::string display_date{};
 };
 
 // Full-screen gallery of recently opened board files. Cards are stored first
@@ -31,10 +33,13 @@ class HomeView final {
 public:
     // Logical (pre-scale) card metrics shared with the renderer so the preview
     // thumbnail and the name/date text agree on where the card is divided.
-    static constexpr double card_width = 276.0;
-    static constexpr double card_height = 242.0;
-    static constexpr double card_text_area = 50.0;
-    static constexpr double card_preview_margin = 18.0;
+    static constexpr double card_width = 288.0;
+    static constexpr double card_height = 262.0;
+    static constexpr double card_text_area = 72.0;
+    static constexpr double card_preview_margin = 12.0;
+
+    [[nodiscard]] static std::string format_date(
+        std::string_view timestamp, std::chrono::year_month_day today);
 
     void update(
         double viewport_width,
@@ -42,7 +47,8 @@ public:
         double display_scale,
         Theme theme,
         std::vector<HomeBoard> boards,
-        std::string error_message = {});
+        std::string error_message = {},
+        std::string status_message = {});
 
     // Recompute responsive geometry without replacing board/preview data.
     // Used by live window resize so no file I/O or preview copying occurs.
@@ -65,7 +71,8 @@ public:
     void clear_focus() noexcept;
     void tick(double elapsed_seconds) noexcept;
     [[nodiscard]] bool animating() const noexcept;
-    // Restarts the staggered entrance animation for cards and header actions.
+    // Kept as a lifecycle hook; Home intentionally appears without staged
+    // motion so recent files are ready to use immediately.
     void play_entrance() noexcept;
 
     [[nodiscard]] std::optional<UiAction> action_at(Vec2d point) const noexcept;
@@ -106,9 +113,13 @@ public:
     [[nodiscard]] UiRect heading_bounds() const noexcept;
     [[nodiscard]] UiRect status_bounds() const noexcept;
     [[nodiscard]] UiRect board_name_bounds(std::size_t index) const noexcept;
+    [[nodiscard]] UiRect board_date_bounds(std::size_t index) const noexcept;
+    [[nodiscard]] UiRect board_preview_bounds(std::size_t index) const noexcept;
+    [[nodiscard]] std::optional<std::size_t> date_tooltip() const noexcept;
     [[nodiscard]] UiRect scrollbar_track() const noexcept;
     [[nodiscard]] UiRect scrollbar_thumb() const noexcept;
     [[nodiscard]] std::string_view error_message() const noexcept;
+    [[nodiscard]] std::string_view status_message() const noexcept;
     [[nodiscard]] double grid_top() const noexcept;
     [[nodiscard]] std::size_t top_row() const noexcept;
     [[nodiscard]] std::size_t maximum_top_row() const noexcept;
@@ -127,10 +138,13 @@ private:
     std::vector<double> rename_hovers_;
     std::vector<HomeBoard> boards_;
     std::string error_message_;
+    std::string status_message_;
     std::optional<Vec2d> pointer_;
     std::optional<std::size_t> pressed_control_;
     std::optional<std::size_t> pressed_rename_;
     std::optional<std::size_t> focused_control_;
+    std::optional<std::size_t> hovered_date_;
+    double date_hover_seconds_{};
     UiRect content_bounds_{};
     UiRect header_bounds_{};
     UiRect heading_bounds_{};

@@ -15,6 +15,8 @@
 
 namespace sawer {
 
+class ImageDecodeCache;
+
 // Best-effort, read-only load of a board's objects for previews/thumbnails.
 // Never writes to the file, never throws on malformed content, and stops once
 // max_objects have been replayed so huge boards stay cheap to preview.
@@ -27,10 +29,13 @@ public:
     static BoardFileSession create(
         const std::filesystem::path& path,
         const Document& document);
+    // Optional bounded output for pixels already decoded by validation.
+    // Document and cache are published only after a successful open.
     static BoardFileSession open(
         const std::filesystem::path& path,
         Document& document,
-        bool& recovered_final_line);
+        bool& recovered_final_line,
+        ImageDecodeCache* decoded_images = nullptr);
 
     BoardFileSession(BoardFileSession&&) noexcept = default;
     BoardFileSession& operator=(BoardFileSession&&) noexcept = default;

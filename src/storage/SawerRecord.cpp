@@ -1,5 +1,7 @@
 #include "storage/SawerRecord.hpp"
 
+#include "core/Crc32c.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <array>
@@ -58,28 +60,15 @@ void write_u64_le(std::array<std::uint8_t, sawer_record_header_size>& bytes,
     return value;
 }
 
-[[nodiscard]] std::uint32_t crc32c_update(
-    std::uint32_t crc, const std::uint8_t* const bytes, const std::size_t size)
-{
-    for (std::size_t index = 0U; index < size; ++index) {
-        crc ^= bytes[index];
-        for (std::size_t bit = 0U; bit < 8U; ++bit) {
-            crc = (crc >> 1U) ^ ((crc & 1U) != 0U ? 0x82F63B78U : 0U);
-        }
-    }
-    return crc;
-}
-
 [[nodiscard]] std::uint32_t crc32c(
     const std::array<std::uint8_t, sawer_record_header_size>& header,
     const std::vector<std::uint8_t>& metadata,
     const std::vector<std::uint8_t>& payload)
 {
-    std::uint32_t crc = 0xFFFFFFFFU;
-    crc = crc32c_update(crc, header.data() + 4U, 24U);
-    crc = crc32c_update(crc, metadata.data(), metadata.size());
-    crc = crc32c_update(crc, payload.data(), payload.size());
-    return ~crc;
+    std::uint32_t crc = crc32c_extend(0U,
+        std::span<const std::uint8_t>{header}.subspan(4U, 24U));
+    crc = crc32c_extend(crc, metadata);
+    return crc32c_extend(crc, payload);
 }
 
 [[nodiscard]] bool read_exact(std::istream& input, std::uint8_t* const bytes,

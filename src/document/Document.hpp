@@ -1,6 +1,7 @@
 #pragma once
 
 #include "document/Object.hpp"
+#include "core/ObjectRecency.hpp"
 #include "document/SpatialChunkIndex.hpp"
 #include "document/StrokeSegmentIndex.hpp"
 
@@ -12,6 +13,12 @@
 namespace sawer {
 
 class CommandHistory;
+
+struct DocumentChange final {
+    std::uint64_t sequence{};
+    ObjectId id;
+    bool removed{};
+};
 
 struct DocumentMemoryStats final {
     std::size_t object_count{};
@@ -49,12 +56,17 @@ public:
     [[nodiscard]] std::size_t spatial_chunk_count() const noexcept;
     [[nodiscard]] std::size_t oversized_object_count() const noexcept;
     [[nodiscard]] std::uint64_t revision() const noexcept;
+    [[nodiscard]] ObjectId cache_identity() const noexcept { return cache_identity_; }
+    // False indicates a gap/reset: rebuild disposable consumer state.
+    [[nodiscard]] bool changes_since(std::uint64_t sequence,
+        std::vector<DocumentChange>& result) const;
     [[nodiscard]] DocumentMemoryStats memory_stats() const noexcept;
     void query_stroke_segments(
         ObjectId id,
         const Aabb& bounds,
         std::vector<std::uint32_t>& result) const;
     [[nodiscard]] const StrokeSegmentIndex* stroke_segment_index(
+        // Borrowed until another index request, geometry mutation, or cache clear.
         ObjectId id,
         bool* built = nullptr) const;
     void clear_transient_caches() const noexcept;
@@ -65,8 +77,10 @@ public:
 private:
     friend class CommandHistory;
 
-    void erase_stroke_segment_index(ObjectId id) noexcept;
+    void erase_stroke_segment_index(ObjectId id) const noexcept;
     void set_dirty(bool dirty) noexcept;
+    void prepare_change();
+    void record_change(ObjectId id, bool removed = false) noexcept;
 
     std::unordered_map<ObjectId, Object, ObjectIdHash> objects_;
     SpatialChunkIndex spatial_index_;
@@ -75,9 +89,14 @@ private:
         StrokeSegmentIndex,
         ObjectIdHash> stroke_segment_indices_;
     mutable std::size_t stroke_segment_index_bytes_{};
+    mutable ObjectRecency stroke_segment_recency_;
     std::int64_t next_z_order_{};
     std::uint64_t revision_{};
     bool dirty_{};
+    static constexpr std::size_t maximum_changes = 4'096U;
+    ObjectId cache_identity_{ObjectId::random()};
+    std::vector<DocumentChange> changes_;
+    std::size_t next_change_{};
 };
 
 } // namespace sawer

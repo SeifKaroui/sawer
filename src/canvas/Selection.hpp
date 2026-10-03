@@ -53,6 +53,7 @@ public:
     void clear() noexcept;
     void select(ObjectId id);
     void select(std::vector<ObjectId> ids);
+    void toggle(ObjectId id);
     void prune(const Document& document);
     void set_marquee(std::optional<Aabb> bounds) noexcept;
 

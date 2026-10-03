@@ -37,6 +37,16 @@ TEST_CASE("home gallery uses a centered responsive content grid")
     REQUIRE(home.controls().front().bounds.width >= 228.0);
     REQUIRE(home.controls().front().bounds.width <= 296.0);
     REQUIRE(home.controls()[4U].bounds.y > home.controls().front().bounds.y);
+    REQUIRE(
+        home.controls()[4U].bounds.y
+            - (home.controls().front().bounds.y
+                + home.controls().front().bounds.height)
+        == Catch::Approx(20.0));
+    const auto name_bounds = home.board_name_bounds(0U);
+    REQUIRE(name_bounds.x
+        == Catch::Approx(home.controls().front().bounds.x + 16.0));
+    REQUIRE(name_bounds.width
+        == Catch::Approx(home.rename_buttons().front().x - 10.0 - name_bounds.x));
 
     const auto& open_board = home.controls()[6U];
     REQUIRE(open_board.action == sawer::UiAction::open_board);
@@ -195,6 +205,54 @@ TEST_CASE("home cards ease hover press and rename feedback")
     REQUIRE(home.rename_hover(0U) > 0.5);
 }
 
+TEST_CASE("home card feedback keeps edge targets fixed and settles on exit")
+{
+    for (const auto theme : {sawer::Theme::light, sawer::Theme::dark}) {
+        for (const double scale : {0.85, 1.0, 1.5}) {
+            sawer::HomeView home;
+            home.update(1280.0, 900.0, scale, theme, boards(2U));
+            const auto card = home.controls().front().bounds;
+            const auto preview = home.board_preview_bounds(0U);
+            const auto rename = home.rename_buttons().front();
+            const sawer::Vec2d edge{card.x + 1.0, card.y + 1.0};
+
+            home.set_pointer(edge);
+            for (int frame = 0; frame < 12; ++frame) home.tick(0.1);
+            REQUIRE(home.animation(0U).hover == 1.0);
+            REQUIRE(home.board_at(edge) == 0U);
+            home.pointer_down(edge);
+            for (int frame = 0; frame < 12; ++frame) home.tick(0.1);
+            REQUIRE(home.animation(0U).press == 1.0);
+            REQUIRE(home.pointer_up(edge));
+            REQUIRE(home.controls().front().bounds == card);
+            REQUIRE(home.board_preview_bounds(0U) == preview);
+            REQUIRE(home.rename_buttons().front() == rename);
+            REQUIRE(home.control_offset(0U) == 0.0);
+
+            home.clear_pointer();
+            home.clear_focus();
+            for (int frame = 0; frame < 12; ++frame) home.tick(0.1);
+            REQUIRE(home.animation(0U).hover == 0.0);
+            REQUIRE(home.animation(0U).press == 0.0);
+        }
+    }
+}
+
+TEST_CASE("home opens without staged card motion")
+{
+    sawer::HomeView home;
+    home.update(
+        1000.0, 700.0, 1.0, sawer::Theme::light, boards(8U));
+
+    home.play_entrance();
+
+    REQUIRE(home.reveal() == 1.0);
+    for (std::size_t index = 0U; index < home.controls().size(); ++index) {
+        REQUIRE(home.entrance(index) == 1.0);
+        REQUIRE(home.control_offset(index) == 0.0);
+    }
+}
+
 TEST_CASE("home activates only a matching press and release target")
 {
     sawer::HomeView home;
@@ -253,6 +311,20 @@ TEST_CASE("home error status takes layout space without covering cards")
     REQUIRE(home.controls().front().bounds.y >= home.grid_top());
 }
 
+TEST_CASE("home shows file activity without treating it as an error")
+{
+    sawer::HomeView home;
+    home.update(
+        1280.0, 720.0, 1.0, sawer::Theme::light, {}, {},
+        "Opening board.sawer...");
+
+    REQUIRE(home.error_message().empty());
+    REQUIRE(home.status_message() == "Opening board.sawer...");
+    REQUIRE(home.status_bounds().width > 1.0);
+    REQUIRE(home.grid_top()
+        > home.status_bounds().y + home.status_bounds().height);
+}
+
 TEST_CASE("home gallery scrolls by complete rows and exposes its position")
 {
     sawer::HomeView home;
@@ -296,4 +368,88 @@ TEST_CASE("home gallery scrolls by complete rows and exposes its position")
         1280.0, 720.0, 1.0, sawer::Theme::light,
         std::move(replacement));
     REQUIRE(home.top_row() == 0U);
+}
+
+TEST_CASE("home dates use local calendar days across month and year boundaries")
+{
+    using namespace std::chrono;
+    const year_month_day today{year{2026}, month{10}, day{1}};
+    REQUIRE(sawer::HomeView::format_date("2026-10-01 17:21", today) == "Today 17:21");
+    REQUIRE(sawer::HomeView::format_date("2026-09-30 23:59", today) == "Yesterday 23:59");
+    REQUIRE(sawer::HomeView::format_date("2026-09-19 14:20", today) == "19 Sep 2026");
+    REQUIRE(sawer::HomeView::format_date("2025-12-31 12:00",
+        year{2026}/January/1) == "Yesterday 12:00");
+    REQUIRE(sawer::HomeView::format_date("2024-02-29 12:00",
+        year{2024}/March/1) == "Yesterday 12:00");
+    REQUIRE(sawer::HomeView::format_date("2026-10-02 01:00", today) == "2 Oct 2026");
+    for (const std::string_view invalid : {"", "Today", "2026-02-30 12:00",
+             "2026-13-01 12:00", "2026-10-01 24:00", "2026-10-01 12:60"}) {
+        REQUIRE(sawer::HomeView::format_date(invalid, today) == invalid);
+    }
+}
+
+TEST_CASE("home footer actions leave previews and Unicode names clear at every scale")
+{
+    sawer::HomeView home;
+    for (const double width : {320.0, 480.0, 760.0, 1280.0, 1920.0}) {
+        for (const double scale : {1.0, 1.5}) {
+            auto recent = boards(12U);
+            recent[0].name = "Long Unicode board \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e";
+            home.update(width, 720.0, scale, sawer::Theme::dark, std::move(recent));
+            const auto card = home.controls().front().bounds;
+            const auto rename = home.rename_buttons().front();
+            const auto name = home.board_name_bounds(0U);
+            const auto date = home.board_date_bounds(0U);
+            const auto preview = home.board_preview_bounds(0U);
+            const double footer_top = card.y + card.height - sawer::HomeView::card_text_area * home.scale();
+            REQUIRE(rename.y >= footer_top);
+            REQUIRE(rename.y + rename.height <= card.y + card.height);
+            REQUIRE(rename.width >= 32.0);
+            REQUIRE(name.width > 0.0);
+            REQUIRE(name.x + name.width < rename.x);
+            REQUIRE(date.x + date.width < rename.x);
+            REQUIRE(date.y + date.height < card.y + card.height);
+            REQUIRE(preview.y + preview.height < footer_top);
+            REQUIRE(preview.width / preview.height == Catch::Approx(256.0 / 144.0));
+            REQUIRE(preview.x + preview.width * 0.5 == Catch::Approx(card.x + card.width * 0.5));
+            REQUIRE(preview.y + preview.height * 0.5 == Catch::Approx(card.y + (footer_top - card.y) * 0.5));
+            const sawer::Vec2d rename_center{rename.x + rename.width * 0.5, rename.y + rename.height * 0.5};
+            home.pointer_down(rename_center);
+            REQUIRE(home.pointer_up(rename_center));
+            REQUIRE(home.rename_at(rename_center) == 0U);
+        }
+    }
+}
+
+TEST_CASE("home timestamp tooltip waits for hover and follows scroll and layout")
+{
+    sawer::HomeView home;
+    auto recent = boards(20U);
+    for (auto& board : recent) board.date = "2026-09-19 14:20";
+    home.update(1280.0, 720.0, 1.0, sawer::Theme::light, std::move(recent));
+    REQUIRE(home.boards().front().date == "2026-09-19 14:20");
+    REQUIRE(home.boards().front().display_date != home.boards().front().date);
+    const auto date = home.board_date_bounds(0U);
+    const sawer::Vec2d point{date.x + 4.0, date.y + 4.0};
+    home.set_pointer(point);
+    for (int frame = 0; frame < 4; ++frame) home.tick(0.1);
+    REQUIRE_FALSE(home.date_tooltip().has_value());
+    home.set_pointer({point.x + 1.0, point.y});
+    home.tick(0.1);
+    REQUIRE(home.date_tooltip() == 0U);
+    for (int frame = 0; frame < 20; ++frame) home.tick(0.1);
+    REQUIRE_FALSE(home.animating());
+    home.pointer_down(point);
+    REQUIRE_FALSE(home.date_tooltip().has_value());
+    REQUIRE(home.pointer_up(point));
+    for (int frame = 0; frame < 5; ++frame) home.tick(0.1);
+    REQUIRE(home.date_tooltip() == 0U);
+    home.scroll_rows(1);
+    REQUIRE_FALSE(home.date_tooltip().has_value());
+    for (int frame = 0; frame < 5; ++frame) home.tick(0.1);
+    REQUIRE(home.date_tooltip() == 4U);
+    home.relayout(480.0, 720.0, 1.5, sawer::Theme::dark);
+    REQUIRE_FALSE(home.date_tooltip().has_value());
+    home.clear_pointer();
+    REQUIRE_FALSE(home.date_tooltip().has_value());
 }

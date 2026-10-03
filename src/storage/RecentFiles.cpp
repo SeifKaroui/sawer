@@ -1,4 +1,5 @@
 #include "storage/RecentFiles.hpp"
+#include "core/Filesystem.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -101,6 +102,17 @@ std::optional<double> RecentFiles::zoom(
         : std::nullopt;
 }
 
+bool RecentFiles::light_theme() const noexcept
+{
+    return light_theme_;
+}
+
+void RecentFiles::set_light_theme(const bool light_theme)
+{
+    light_theme_ = light_theme;
+    save();
+}
+
 const std::vector<std::filesystem::path>& RecentFiles::entries() const noexcept
 {
     return entries_;
@@ -131,7 +143,7 @@ void RecentFiles::load()
         for (const auto& entry : *recent) {
             if (entry.is_string() && entries_.size() < limit_) {
                 const auto path =
-                    normalized_path(entry.get<std::string>());
+                    normalized_path(path_from_utf8(entry.get<std::string>()));
                 if (std::ranges::find(entries_, path) == entries_.end()) {
                     entries_.push_back(path);
                 }
@@ -148,11 +160,18 @@ void RecentFiles::load()
                 }
                 const double zoom = entry.at("value").get<double>();
                 const auto path = normalized_path(
-                    entry.at("path").get<std::string>());
+                    path_from_utf8(entry.at("path").get<std::string>()));
                 if (std::isfinite(zoom) && zoom > 0.0
                     && std::ranges::find(entries_, path) != entries_.end()) {
                     zoom_levels_[path] = zoom;
                 }
+            }
+        }
+        if (value.is_object() && value.contains("drawing")
+            && value.at("drawing").is_object()) {
+            const auto& drawing = value.at("drawing");
+            if (drawing.contains("light_theme") && drawing.at("light_theme").is_boolean()) {
+                light_theme_ = drawing.at("light_theme").get<bool>();
             }
         }
     } catch (const std::exception&) {
@@ -168,14 +187,14 @@ void RecentFiles::save() const
 
     nlohmann::json recent = nlohmann::json::array();
     for (const auto& entry : entries_) {
-        recent.push_back(entry.string());
+        recent.push_back(path_to_utf8(entry));
     }
     nlohmann::json zoom = nlohmann::json::array();
     for (const auto& entry : entries_) {
         const auto found = zoom_levels_.find(entry);
         if (found != zoom_levels_.end()) {
             zoom.push_back({
-                {"path", entry.string()},
+                {"path", path_to_utf8(entry)},
                 {"value", found->second},
             });
         }
@@ -184,6 +203,9 @@ void RecentFiles::save() const
         {"version", 1},
         {"recent", std::move(recent)},
         {"zoom", std::move(zoom)},
+        {"drawing", {
+            {"light_theme", light_theme_},
+        }},
     };
 
     std::ofstream output{

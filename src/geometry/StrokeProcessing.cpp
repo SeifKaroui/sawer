@@ -446,6 +446,86 @@ void append_smooth_tail(
         points, start, control, endpoint, tolerance * tolerance, 0);
 }
 
+void IncrementalStrokeCurve::reset(
+    const Vec2d initial_point,
+    const double flatness_tolerance)
+{
+    before_ = initial_point;
+    start_ = initial_point;
+    end_ = initial_point;
+    flatness_tolerance_ = std::max(flatness_tolerance, 1.0e-4);
+    stable_point_count_ = 1U;
+    knot_count_ = 1U;
+    finished_ = false;
+}
+
+void IncrementalStrokeCurve::append_preview(std::vector<Vec2d>& output) const
+{
+    if (output.empty()) {
+        output.push_back(start_);
+    }
+    append_smooth_tail(output, end_, flatness_tolerance_);
+}
+
+bool IncrementalStrokeCurve::push(
+    const Vec2d point,
+    std::vector<Vec2d>& output)
+{
+    if (finished_ || knot_count_ == 0U) {
+        return false;
+    }
+    if (std::hypot(point.x - end_.x, point.y - end_.y) <= 1.0e-9) {
+        return false;
+    }
+    before_ = start_;
+    start_ = end_;
+    end_ = point;
+    stable_point_count_ = output.size();
+    append_preview(output);
+    ++knot_count_;
+    return true;
+}
+
+bool IncrementalStrokeCurve::finish(
+    const Vec2d endpoint,
+    std::vector<Vec2d>& output)
+{
+    if (finished_) {
+        return false;
+    }
+    bool changed = false;
+    if (std::hypot(endpoint.x - end_.x, endpoint.y - end_.y) > 1.0e-9) {
+        before_ = start_;
+        start_ = end_;
+        end_ = endpoint;
+        stable_point_count_ = output.size();
+        append_preview(output);
+        ++knot_count_;
+        changed = true;
+    }
+    if (output.empty()) {
+        output.push_back(endpoint);
+        changed = true;
+    } else if (output.back() != endpoint) {
+        // The release sample is semantic input, not merely another noisy
+        // motion point. Preserve it exactly without revisiting the prefix.
+        output.push_back(endpoint);
+        changed = true;
+    }
+    finished_ = true;
+    return changed;
+}
+
+std::size_t IncrementalStrokeCurve::stable_point_count() const noexcept
+{
+    return stable_point_count_;
+}
+
+bool IncrementalStrokeCurve::finished() const noexcept
+{
+    return finished_;
+}
+
 std::vector<Vec2d> complete_stroke_points(
     std::vector<Vec2d> points,
     const Vec2d release_point,

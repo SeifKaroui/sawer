@@ -1,5 +1,6 @@
 #include "storage/BoardFile.hpp"
 #include "storage/RecentFiles.hpp"
+#include "core/Filesystem.hpp"
 #include "storage/SawerRecord.hpp"
 
 #include "canvas/Selection.hpp"
@@ -7,6 +8,7 @@
 #include "document/Object.hpp"
 #include "document/ObjectId.hpp"
 #include "image/ImageCodec.hpp"
+#include "image/ImageDecodeCache.hpp"
 #include "image/Sha256.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -176,6 +178,126 @@ TEST_CASE("image assets are persisted before their placements")
     REQUIRE(image->asset->id == asset->id);
     REQUIRE(image->asset->png == asset->png);
     REQUIRE(image->asset->preview == asset->preview);
+}
+
+TEST_CASE("board opening returns validated pixels once for repeated image placements")
+{
+    TemporaryBoard temporary;
+    auto asset = std::make_shared<sawer::ImageAsset>();
+    const sawer::DecodedImage pixels{2U, 1U, {10U, 20U, 30U, 255U, 40U, 50U, 60U, 128U}};
+    asset->pixel_width = pixels.width;
+    asset->pixel_height = pixels.height;
+    asset->png = sawer::encode_png_rgba(pixels);
+    asset->id = sawer::sha256(asset->png);
+    asset->preview = asset->png;
+    sawer::Document original;
+    for (std::uint64_t id = 1U; id <= 3U; ++id) {
+        REQUIRE(original.insert(sawer::Object::make_image(
+            sawer::ObjectId::from_u64(id), static_cast<std::int64_t>(id),
+            {asset, {0.0, 0.0}, {2.0, 1.0}})));
+    }
+    static_cast<void>(sawer::BoardFileSession::create(temporary.path(), original));
+    for (const std::size_t budget : {0U, 4U, 8U, 16U}) {
+        sawer::ImageDecodeCache cache{budget};
+        sawer::Document loaded;
+        bool recovered = false;
+        static_cast<void>(sawer::BoardFileSession::open(
+            temporary.path(), loaded, recovered, &cache));
+        REQUIRE_FALSE(recovered);
+        REQUIRE(loaded.size() == 3U);
+        REQUIRE(cache.bytes() <= budget);
+        const auto decoded = cache.find(asset->id);
+        if (budget < pixels.rgba.size()) {
+            REQUIRE_FALSE(decoded);
+        } else {
+            REQUIRE(decoded);
+            REQUIRE(decoded->rgba == pixels.rgba);
+            REQUIRE(decoded->width == pixels.width);
+            REQUIRE(decoded->height == pixels.height);
+            REQUIRE(cache.bytes() == pixels.rgba.size());
+        }
+    }
+}
+
+TEST_CASE("a late loading failure preserves the live document and decoded image cache")
+{
+    TemporaryBoard temporary;
+    const sawer::DecodedImage pixels{1U, 1U, {1U, 2U, 3U, 255U}};
+    auto asset = std::make_shared<sawer::ImageAsset>();
+    asset->pixel_width = 1U;
+    asset->pixel_height = 1U;
+    asset->png = sawer::encode_png_rgba(pixels);
+    asset->id = sawer::sha256(asset->png);
+    sawer::Document incoming;
+    REQUIRE(incoming.insert(sawer::Object::make_image(
+        sawer::ObjectId::from_u64(1U), 0, {asset, {0.0, 0.0}, {1.0, 1.0}})));
+    static_cast<void>(sawer::BoardFileSession::create(temporary.path(), incoming));
+    {
+        std::ofstream output{temporary.path(), std::ios::binary | std::ios::app};
+        sawer::write_sawer_record(output, {
+            .kind = sawer::SawerRecordKind::operation,
+            .sequence = 2U,
+            .metadata = {{"op", "delete"}, {"id", sawer::ObjectId::from_u64(999U).to_string()}},
+            .payload = {},
+        });
+    }
+    sawer::Document live;
+    REQUIRE(live.insert(test_line(88U)));
+    sawer::ImageDecodeCache cache{16U};
+    sawer::AssetId live_id{};
+    const auto live_pixels = std::make_shared<const sawer::DecodedImage>(pixels);
+    cache.insert(live_id, live_pixels);
+    bool recovered = false;
+    REQUIRE_THROWS(sawer::BoardFileSession::open(temporary.path(), live, recovered, &cache));
+    REQUIRE(live.size() == 1U);
+    REQUIRE(live.find(sawer::ObjectId::from_u64(88U)) != nullptr);
+    REQUIRE(cache.bytes() == 4U);
+    REQUIRE(cache.find(live_id) == live_pixels);
+    REQUIRE_FALSE(cache.find(asset->id));
+}
+
+TEST_CASE("board loading validates embedded image previews before publishing pixels")
+{
+    TemporaryBoard temporary;
+    const sawer::DecodedImage pixels{1U, 1U, {1U, 2U, 3U, 255U}};
+    auto asset = std::make_shared<sawer::ImageAsset>();
+    asset->pixel_width = 1U;
+    asset->pixel_height = 1U;
+    asset->png = sawer::encode_png_rgba(pixels);
+    asset->id = sawer::sha256(asset->png);
+    sawer::Document original;
+    REQUIRE(original.insert(sawer::Object::make_image(
+        sawer::ObjectId::from_u64(1U), 0, {asset, {0.0, 0.0}, {1.0, 1.0}})));
+    static_cast<void>(sawer::BoardFileSession::create(temporary.path(), original));
+    sawer::SawerRecord header;
+    sawer::SawerRecord image;
+    {
+        std::ifstream input{temporary.path(), std::ios::binary};
+        sawer::validate_sawer_file_prologue(input);
+        REQUIRE(sawer::read_sawer_record(input, header, 1024U, 0U)
+            == sawer::SawerRecordReadResult::record);
+        REQUIRE(sawer::read_sawer_record(input, image, 1024U, 1024U)
+            == sawer::SawerRecordReadResult::record);
+    }
+    SECTION("malformed preview") {
+        image.metadata["preview"] = nlohmann::json::binary({1U, 2U, 3U});
+    }
+    SECTION("oversized preview") {
+        const sawer::DecodedImage preview{257U, 1U, std::vector<std::uint8_t>(257U * 4U, 255U)};
+        image.metadata["preview"] = nlohmann::json::binary(sawer::encode_png_rgba(preview));
+    }
+    {
+        std::ofstream output{temporary.path(), std::ios::binary | std::ios::trunc};
+        sawer::write_sawer_file_prologue(output);
+        sawer::write_sawer_record(output, header);
+        sawer::write_sawer_record(output, image);
+    }
+    sawer::Document loaded;
+    sawer::ImageDecodeCache cache;
+    bool recovered = false;
+    REQUIRE_THROWS(sawer::BoardFileSession::open(temporary.path(), loaded, recovered, &cache));
+    REQUIRE(loaded.size() == 0U);
+    REQUIRE(cache.bytes() == 0U);
 }
 
 TEST_CASE("append operations replay puts and deletes")
@@ -574,6 +696,37 @@ TEST_CASE("external modification creates a conflict copy")
         sawer::BoardFileSession::open(session.path(), loaded, recovered));
     REQUIRE(loaded.size() == 1U);
     REQUIRE(loaded.find(object.id) != nullptr);
+}
+
+TEST_CASE("Unicode boards survive compaction rename and external modification")
+{
+    const TemporaryDirectory directory;
+    const auto original = directory.path()
+        / sawer::path_from_utf8("\xe7\x94\xbb\xe6\x9d\xbf.sawer");
+    const auto renamed = directory.path()
+        / sawer::path_from_utf8("\xf0\x9f\x96\x8a renamed.sawer");
+    sawer::Document document;
+    auto first = test_line(30U);
+    REQUIRE(document.insert(first));
+    auto session = sawer::BoardFileSession::create(original, document);
+    session.compact(document);
+    session.rename(renamed);
+    REQUIRE_FALSE(std::filesystem::exists(original));
+    REQUIRE(std::filesystem::exists(renamed));
+    auto second = test_line(31U);
+    REQUIRE(document.insert(second));
+    session.queue_put(second);
+    { std::ofstream external{renamed, std::ios::binary | std::ios::app}; external << ' '; }
+    session.flush(document);
+    REQUIRE(session.conflict_created());
+    REQUIRE(sawer::path_to_utf8(session.path().stem()).starts_with(
+        "\xf0\x9f\x96\x8a renamed (conflict-"));
+    sawer::Document loaded;
+    bool recovered = false;
+    static_cast<void>(sawer::BoardFileSession::open(session.path(), loaded, recovered));
+    REQUIRE_FALSE(recovered);
+    REQUIRE(loaded.find(first.id) != nullptr);
+    REQUIRE(loaded.find(second.id) != nullptr);
 }
 
 TEST_CASE("failed conflict creation preserves the active session")

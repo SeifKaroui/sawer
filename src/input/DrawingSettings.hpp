@@ -1,8 +1,17 @@
 #pragma once
 
 #include <cstddef>
+#include <algorithm>
 
 namespace sawer {
+
+struct AdaptiveStrokeSettings final {
+    // 0 is the most direct response; 1 applies the most correction.
+    double strength{0.32};
+    // Maximum permitted distance between the pointer and filtered point in
+    // screen pixels. This is a hard latency bound, independent of zoom.
+    double max_trailing_pixels{8.0};
+};
 
 enum class StrokeStabilization {
     off,
@@ -12,6 +21,15 @@ enum class StrokeStabilization {
 };
 
 struct DrawingSettings final {
+    // Mouse drawing always uses the Responsive filter.
+    [[nodiscard]] constexpr AdaptiveStrokeSettings
+    adaptive_stroke_settings() const noexcept
+    {
+        return {.strength = 0.32, .max_trailing_pixels = 8.0};
+    }
+
+    // Compatibility settings for the previous drawing pipeline. They remain
+    // available for the legacy processing helpers.
 #if defined(_WIN32)
     StrokeStabilization stabilization{StrokeStabilization::light};
 #else

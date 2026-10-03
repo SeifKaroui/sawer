@@ -1,9 +1,11 @@
 #include "storage/BoardFile.hpp"
+#include "core/Filesystem.hpp"
 
 #include "storage/SawerRecord.hpp"
 
 #include "document/Object.hpp"
 #include "image/ImageCodec.hpp"
+#include "image/ImageDecodeCache.hpp"
 #include "image/Sha256.hpp"
 
 #include <nlohmann/json.hpp>
@@ -166,9 +168,9 @@ Json serialize_asset_metadata(const ImageAsset& asset)
     };
 }
 
-void validate_canonical_asset(const ImageAsset& asset)
+DecodedImage validate_canonical_asset(const ImageAsset& asset)
 {
-    const DecodedImage decoded = decode_image_rgba(asset.png);
+    DecodedImage decoded = decode_image_rgba(asset.png);
     if (decoded.width != asset.pixel_width || decoded.height != asset.pixel_height
         || encode_png_rgba(decoded) != asset.png) {
         storage_error("image asset is not a canonical PNG");
@@ -179,6 +181,7 @@ void validate_canonical_asset(const ImageAsset& asset)
             storage_error("image preview exceeds its size limit");
         }
     }
+    return decoded;
 }
 
 void write_asset_record(std::ostream& output, const ImageAsset& asset)
@@ -186,7 +189,7 @@ void write_asset_record(std::ostream& output, const ImageAsset& asset)
     if (asset.id != sha256(asset.png)) {
         storage_error("image asset ID does not match canonical PNG payload");
     }
-    validate_canonical_asset(asset);
+    static_cast<void>(validate_canonical_asset(asset));
     write_sawer_record(output, {
         .kind = SawerRecordKind::asset,
         .sequence = 0U,
@@ -195,7 +198,10 @@ void write_asset_record(std::ostream& output, const ImageAsset& asset)
     });
 }
 
-void replay_asset(const SawerRecord& record, AssetTable& assets)
+void replay_asset(
+    const SawerRecord& record,
+    AssetTable& assets,
+    ImageDecodeCache* const decoded_images = nullptr)
 {
     if (record.metadata.at("op").get<std::string>() != "asset_put"
         || record.metadata.at("mime").get<std::string>() != "image/png") {
@@ -213,16 +219,20 @@ void replay_asset(const SawerRecord& record, AssetTable& assets)
     if (asset->id != sha256(asset->png)) {
         storage_error("image asset ID does not match PNG payload");
     }
-    validate_canonical_asset(*asset);
     if (record.metadata.contains("preview")) {
         const auto& preview = record.metadata.at("preview");
         if (!preview.is_binary()) storage_error("invalid image preview");
         asset->preview = preview.get_binary();
     }
+    DecodedImage decoded = validate_canonical_asset(*asset);
     const auto existing = assets.find(asset->id);
     if (existing != assets.end()) {
         if (existing->second->png != asset->png) storage_error("conflicting image asset");
         return;
+    }
+    if (decoded_images != nullptr && decoded.rgba.size() <= decoded_images->budget()) {
+        decoded_images->insert(asset->id,
+            std::make_shared<const DecodedImage>(std::move(decoded)));
     }
     assets.emplace(asset->id, std::move(asset));
 }
@@ -620,9 +630,9 @@ void atomic_replace(
 std::filesystem::path temporary_path_for(
     const std::filesystem::path& destination)
 {
-    return destination.parent_path()
-        / (destination.filename().string() + ".tmp-"
-           + ObjectId::random().to_string());
+    auto name = destination.filename();
+    name += ".tmp-" + ObjectId::random().to_string();
+    return destination.parent_path() / name;
 }
 
 } // namespace
@@ -745,12 +755,16 @@ BoardFileSession BoardFileSession::create(
 BoardFileSession BoardFileSession::open(
     const std::filesystem::path& path,
     Document& document,
-    bool& recovered_final_line)
+    bool& recovered_final_line,
+    ImageDecodeCache* const decoded_images)
 {
+    // Keep the caller's live cache untouched on failed opens, including a
+    // malformed late record or a file changing while it is being read.
+    ImageDecodeCache prepared_images{decoded_images != nullptr ? decoded_images->budget() : 0U};
     const FileStamp initial_stamp = capture_stamp(path);
     std::ifstream input{path, std::ios::binary};
     if (!input) {
-        storage_error("cannot open " + path.string());
+        storage_error("cannot open " + path_to_utf8(path));
     }
 
     if (input.peek() == 'S') {
@@ -801,7 +815,8 @@ BoardFileSession BoardFileSession::open(
                     if (record.sequence != 0U) {
                         storage_error("asset record has a non-zero sequence");
                     }
-                    replay_asset(record, assets);
+                    replay_asset(record, assets,
+                        decoded_images != nullptr ? &prepared_images : nullptr);
                     continue;
                 }
                 if (record.kind != SawerRecordKind::operation
@@ -829,10 +844,12 @@ BoardFileSession BoardFileSession::open(
             sequence = write_snapshot(path, board_id, loaded);
             replayed_stamp = capture_stamp(path);
         }
-        document = std::move(loaded);
-        return BoardFileSession{
+        BoardFileSession session{
             path, board_id, sequence, replayed_stamp,
-            referenced_assets(document)};
+            referenced_assets(loaded)};
+        document = std::move(loaded);
+        if (decoded_images != nullptr) *decoded_images = std::move(prepared_images);
+        return session;
     }
 
     Document loaded;
@@ -921,10 +938,12 @@ BoardFileSession BoardFileSession::open(
         replayed_stamp = capture_stamp(path);
     }
 
-    document = std::move(loaded);
-    return BoardFileSession{
+    BoardFileSession session{
         path, board_id, sequence, replayed_stamp,
-        referenced_assets(document), true};
+        referenced_assets(loaded), true};
+    document = std::move(loaded);
+    if (decoded_images != nullptr) *decoded_images = std::move(prepared_images);
+    return session;
 }
 
 BoardFileSession::BoardFileSession(
@@ -1138,7 +1157,7 @@ void BoardFileSession::rename(const std::filesystem::path& new_path)
     std::error_code error;
     std::filesystem::rename(path_, new_path, error);
     if (error) {
-        storage_error("could not rename board to " + new_path.string());
+        storage_error("could not rename board to " + path_to_utf8(new_path));
     }
     path_ = new_path;
     expected_stamp_ = capture_stamp(path_);
@@ -1231,9 +1250,10 @@ void BoardFileSession::create_conflict_copy(const Document& document)
 {
     const ObjectId conflict_id = ObjectId::random();
     const std::string suffix = conflict_id.to_string().substr(0U, 8U);
-    const auto conflict_path = path_.parent_path()
-        / (path_.stem().string() + " (conflict-" + suffix + ")"
-           + path_.extension().string());
+    auto name = path_.stem();
+    name += " (conflict-" + suffix + ")";
+    name += path_.extension();
+    const auto conflict_path = path_.parent_path() / name;
 
     const std::uint64_t conflict_sequence =
         write_snapshot(conflict_path, conflict_id, document);
@@ -1275,7 +1295,7 @@ BoardFileSession::FileStamp BoardFileSession::append_operations(
     }
     std::ofstream output{path, std::ios::binary | std::ios::app};
     if (!output) {
-        storage_error("cannot append to " + path.string());
+        storage_error("cannot append to " + path_to_utf8(path));
     }
     for (const auto& operation : operations) {
         Json metadata;

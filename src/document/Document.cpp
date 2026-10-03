@@ -58,6 +58,7 @@ bool Document::insert(Object object)
         || !object.within_board_bounds()) {
         return false;
     }
+    prepare_change();
     const auto [iterator, inserted] =
         objects_.emplace(object.id, std::move(object));
     if (!inserted) {
@@ -66,6 +67,7 @@ bool Document::insert(Object object)
     spatial_index_.insert(iterator->first, iterator->second.bounds);
     advance_z_order(next_z_order_, iterator->second.z_order);
     ++revision_;
+    record_change(iterator->first);
     return true;
 }
 
@@ -76,11 +78,13 @@ std::optional<Object> Document::remove(const ObjectId id)
         return std::nullopt;
     }
 
+    prepare_change();
     Object removed = std::move(iterator->second);
     spatial_index_.remove(id);
     erase_stroke_segment_index(id);
     objects_.erase(iterator);
     ++revision_;
+    record_change(id, true);
     return removed;
 }
 
@@ -106,6 +110,7 @@ std::optional<Object> Document::exchange(Object object)
         return std::nullopt;
     }
 
+    prepare_change();
     object.revision = iterator->second.revision + 1U;
     object.recompute_bounds();
     Object previous = std::move(iterator->second);
@@ -114,6 +119,7 @@ std::optional<Object> Document::exchange(Object object)
     spatial_index_.update(iterator->first, iterator->second.bounds);
     advance_z_order(next_z_order_, iterator->second.z_order);
     ++revision_;
+    record_change(iterator->first);
     return previous;
 }
 
@@ -126,11 +132,13 @@ bool Document::translate(const ObjectId id, const Vec2d delta)
     if (!iterator->second.can_translate(delta)) {
         return false;
     }
+    prepare_change();
     iterator->second.translate(delta);
     erase_stroke_segment_index(iterator->first);
     ++iterator->second.revision;
     spatial_index_.update(iterator->first, iterator->second.bounds);
     ++revision_;
+    record_change(id);
     return true;
 }
 
@@ -143,12 +151,14 @@ std::optional<Style> Document::exchange_style(
         return std::nullopt;
     }
 
+    prepare_change();
     Style previous = std::move(iterator->second.style);
     iterator->second.style = std::move(style);
     ++iterator->second.revision;
     iterator->second.recompute_bounds();
     spatial_index_.update(iterator->first, iterator->second.bounds);
     ++revision_;
+    record_change(id);
     return previous;
 }
 
@@ -221,7 +231,8 @@ DocumentMemoryStats Document::memory_stats() const noexcept
     DocumentMemoryStats stats;
     stats.object_count = objects_.size();
     constexpr std::size_t node_links = 2U * sizeof(void*);
-    stats.object_storage_bytes =
+    stats.object_storage_bytes = changes_.capacity() * sizeof(DocumentChange)
+        +
         sizeof(*this) - sizeof(spatial_index_)
             - sizeof(stroke_segment_indices_)
         + objects_.bucket_count() * sizeof(void*)
@@ -238,7 +249,8 @@ DocumentMemoryStats Document::memory_stats() const noexcept
     }
     stats.spatial_index_bytes =
         spatial_index_.estimated_memory_bytes();
-    stats.spatial_index_bytes += stroke_segment_index_bytes_;
+    stats.spatial_index_bytes += stroke_segment_index_bytes_
+        + stroke_segment_recency_.memory_bytes();
     stats.total_bytes = stats.object_storage_bytes
         + stats.stroke_point_capacity_bytes
         + stats.spatial_index_bytes;
@@ -275,14 +287,17 @@ const StrokeSegmentIndex* Document::stroke_segment_index(
     }
     auto index = stroke_segment_indices_.find(id);
     if (index == stroke_segment_indices_.end()) {
-        if (stroke_segment_indices_.size()
-                >= maximum_stroke_segment_cache_entries
-            || stroke_segment_index_bytes_
-                >= stroke_segment_cache_budget) {
-            clear_transient_caches();
+        StrokeSegmentIndex prepared{*stroke};
+        const std::size_t bytes = prepared.estimated_memory_bytes();
+        while (stroke_segment_indices_.size() >= maximum_stroke_segment_cache_entries
+            || stroke_segment_index_bytes_ + bytes
+                + stroke_segment_recency_.memory_bytes() > stroke_segment_cache_budget) {
+            const auto victim = stroke_segment_recency_.oldest();
+            if (!victim) break;
+            erase_stroke_segment_index(*victim);
         }
         index = stroke_segment_indices_
-                    .emplace(id, StrokeSegmentIndex{*stroke})
+                    .emplace(id, std::move(prepared))
                     .first;
         stroke_segment_index_bytes_ +=
             index->second.estimated_memory_bytes();
@@ -290,6 +305,7 @@ const StrokeSegmentIndex* Document::stroke_segment_index(
             *built = true;
         }
     }
+    stroke_segment_recency_.touch(id);
     return &index->second;
 }
 
@@ -297,6 +313,7 @@ void Document::clear_transient_caches() const noexcept
 {
     decltype(stroke_segment_indices_){}.swap(stroke_segment_indices_);
     stroke_segment_index_bytes_ = 0U;
+    stroke_segment_recency_.clear();
 }
 
 std::int64_t Document::next_z_order()
@@ -316,14 +333,15 @@ void Document::clear() noexcept
 {
     decltype(objects_){}.swap(objects_);
     spatial_index_ = {};
-    decltype(stroke_segment_indices_){}.swap(stroke_segment_indices_);
-    stroke_segment_index_bytes_ = 0U;
+    clear_transient_caches();
     next_z_order_ = 0;
     ++revision_;
+    decltype(changes_){}.swap(changes_);
+    next_change_ = 0U;
     dirty_ = false;
 }
 
-void Document::erase_stroke_segment_index(const ObjectId id) noexcept
+void Document::erase_stroke_segment_index(const ObjectId id) const noexcept
 {
     const auto found = stroke_segment_indices_.find(id);
     if (found == stroke_segment_indices_.end()) {
@@ -335,11 +353,39 @@ void Document::erase_stroke_segment_index(const ObjectId id) noexcept
         ? stroke_segment_index_bytes_ - bytes
         : 0U;
     stroke_segment_indices_.erase(found);
+    stroke_segment_recency_.erase(id);
 }
 
 void Document::set_dirty(const bool dirty) noexcept
 {
     dirty_ = dirty;
+}
+
+void Document::prepare_change()
+{
+    if (changes_.capacity() < maximum_changes) changes_.reserve(maximum_changes);
+}
+
+void Document::record_change(const ObjectId id, const bool removed) noexcept
+{
+    const DocumentChange change{revision_, id, removed};
+    if (changes_.size() < maximum_changes) changes_.push_back(change);
+    else changes_[next_change_] = change;
+    next_change_ = (next_change_ + 1U) % maximum_changes;
+}
+
+bool Document::changes_since(const std::uint64_t sequence, std::vector<DocumentChange>& result) const
+{
+    result.clear();
+    if (sequence == revision_) return true;
+    if (sequence > revision_ || changes_.empty()) return false;
+    const auto oldest = changes_.size() == maximum_changes ? next_change_ : 0U;
+    const auto first_sequence = changes_[oldest].sequence;
+    if (sequence + 1U < first_sequence) return false;
+    const auto skip = static_cast<std::size_t>(sequence + 1U - first_sequence);
+    for (std::size_t offset = skip; offset < changes_.size(); ++offset)
+        result.push_back(changes_[(oldest + offset) % changes_.size()]);
+    return true;
 }
 
 } // namespace sawer

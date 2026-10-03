@@ -2,10 +2,47 @@
 
 #include <algorithm>
 #include <cmath>
+#include <array>
+#include <charconv>
+#include <ctime>
 #include <limits>
 #include <utility>
 
 namespace sawer {
+
+std::string HomeView::format_date(
+    const std::string_view timestamp, const std::chrono::year_month_day today)
+{
+    if (timestamp.size() != 16U || timestamp[4] != '-' || timestamp[7] != '-'
+        || timestamp[10] != ' ' || timestamp[13] != ':') {
+        return std::string{timestamp};
+    }
+    const auto number = [&](const std::size_t start, const std::size_t count) {
+        int value = -1;
+        const char* first = timestamp.data() + start;
+        const auto parsed = std::from_chars(first, first + count, value);
+        return parsed.ec == std::errc{} && parsed.ptr == first + count ? value : -1;
+    };
+    const int year = number(0U, 4U);
+    const int month = number(5U, 2U);
+    const int day = number(8U, 2U);
+    const int hour = number(11U, 2U);
+    const int minute = number(14U, 2U);
+    const std::chrono::year_month_day date{
+        std::chrono::year{year}, std::chrono::month{static_cast<unsigned>(month)},
+        std::chrono::day{static_cast<unsigned>(day)}};
+    if (year < 1 || month < 1 || month > 12 || day < 1 || !date.ok()
+        || !today.ok() || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+        return std::string{timestamp};
+    }
+    const auto age = std::chrono::sys_days{today} - std::chrono::sys_days{date};
+    if (age == std::chrono::days{0}) return "Today " + std::string{timestamp.substr(11U)};
+    if (age == std::chrono::days{1}) return "Yesterday " + std::string{timestamp.substr(11U)};
+    constexpr std::array months{"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+    return std::to_string(day) + " " + months[static_cast<std::size_t>(month - 1)]
+        + " " + std::to_string(year);
+}
 
 void HomeView::update(
     const double viewport_width,
@@ -13,7 +50,8 @@ void HomeView::update(
     const double display_scale,
     const Theme theme,
     std::vector<HomeBoard> boards,
-    std::string error_message)
+    std::string error_message,
+    std::string status_message)
 {
     const bool source_changed = boards_.size() != boards.size()
         || !std::equal(
@@ -27,8 +65,23 @@ void HomeView::update(
         rename_hovers_.clear();
         focused_control_.reset();
     }
+    const std::time_t now = std::time(nullptr);
+    std::tm calendar{};
+#ifdef _WIN32
+    const bool have_today = localtime_s(&calendar, &now) == 0;
+#else
+    const bool have_today = localtime_r(&now, &calendar) != nullptr;
+#endif
+    const std::chrono::year_month_day today{
+        std::chrono::year{calendar.tm_year + 1900},
+        std::chrono::month{static_cast<unsigned>(calendar.tm_mon + 1)},
+        std::chrono::day{static_cast<unsigned>(calendar.tm_mday)}};
+    for (auto& board : boards) {
+        board.display_date = have_today ? format_date(board.date, today) : board.date;
+    }
     boards_ = std::move(boards);
     error_message_ = std::move(error_message);
+    status_message_ = std::move(status_message);
     relayout(viewport_width, viewport_height, display_scale, theme);
 }
 
@@ -64,15 +117,15 @@ void HomeView::relayout(
     visible_rows_ = 1U;
     row_step_ = 0.0;
 
-    const double outer = 36.0 * scale_;
+    const double outer = 40.0 * scale_;
     const double content_width = std::min(
         std::max(viewport_width_ - outer * 2.0, 1.0),
-        1180.0 * scale_);
+        1200.0 * scale_);
     content_bounds_ = {
         (viewport_width_ - content_width) * 0.5,
-        20.0 * scale_,
+        28.0 * scale_,
         content_width,
-        std::max(viewport_height_ - 40.0 * scale_, 1.0),
+        std::max(viewport_height_ - 56.0 * scale_, 1.0),
     };
 
     const auto finish_layout = [&]() {
@@ -88,9 +141,10 @@ void HomeView::relayout(
 
     controls_.reserve(boards_.size() + 3U);
 
-    const double gap = 16.0 * scale_;
-    const bool compact_header = content_bounds_.width < 620.0 * scale_;
-    const double header_height = (compact_header ? 108.0 : 54.0) * scale_;
+    const double column_gap = 20.0 * scale_;
+    const double row_gap = 20.0 * scale_;
+    const bool compact_header = content_bounds_.width < 680.0 * scale_;
+    const double header_height = (compact_header ? 112.0 : 56.0) * scale_;
     header_bounds_ = {
         content_bounds_.x,
         content_bounds_.y,
@@ -99,44 +153,50 @@ void HomeView::relayout(
     };
     heading_bounds_ = {
         content_bounds_.x,
-        header_bounds_.y + (compact_header ? 4.0 : 5.0) * scale_,
+        header_bounds_.y + (compact_header ? 2.0 : 6.0) * scale_,
         content_bounds_.width,
         44.0 * scale_,
     };
-    if (!error_message_.empty()) {
+    if (!error_message_.empty() || !status_message_.empty()) {
         status_bounds_ = {
             heading_bounds_.x,
-            header_bounds_.y + header_bounds_.height + 18.0 * scale_,
+            header_bounds_.y + header_bounds_.height + 20.0 * scale_,
             std::min(heading_bounds_.width, 680.0 * scale_),
             54.0 * scale_,
         };
         grid_top_ =
-            status_bounds_.y + status_bounds_.height + 14.0 * scale_;
+            status_bounds_.y + status_bounds_.height + 20.0 * scale_;
     } else {
         grid_top_ =
-            header_bounds_.y + header_bounds_.height + 24.0 * scale_;
+            header_bounds_.y + header_bounds_.height + 28.0 * scale_;
     }
 
     // Board cards first, in board order, so board_at() and the renderer can
     // match a control to its board by index.
     const double usable_width = content_bounds_.width;
-    const double minimum_card = 230.0 * scale_;
+    const double minimum_card = 236.0 * scale_;
     columns_ = std::max<std::size_t>(
         1U,
         static_cast<std::size_t>(
-            std::floor((usable_width + gap) / (minimum_card + gap))));
+            std::floor(
+                (usable_width + column_gap)
+                / (minimum_card + column_gap))));
     const double card_w = std::min(
         card_width * scale_,
-        (usable_width - static_cast<double>(columns_ - 1U) * gap)
+        (usable_width
+            - static_cast<double>(columns_ - 1U) * column_gap)
             / static_cast<double>(columns_));
+    // Keep previews generous while reserving a readable metadata footer.
     const double card_h = std::clamp(
-        card_w * 0.87, 210.0 * scale_, card_height * scale_);
+        card_w * 0.90 + 6.0 * scale_,
+        218.0 * scale_,
+        card_height * scale_);
     const double grid_width = static_cast<double>(columns_) * card_w
-        + static_cast<double>(columns_ - 1U) * gap;
+        + static_cast<double>(columns_ - 1U) * column_gap;
     const double grid_left = content_bounds_.x
         + std::max(0.0, (usable_width - grid_width) * 0.5);
     rename_buttons_.reserve(boards_.size());
-    row_step_ = card_h + gap;
+    row_step_ = card_h + row_gap;
     row_count_ = boards_.empty()
         ? 0U
         : (boards_.size() + columns_ - 1U) / columns_;
@@ -145,18 +205,19 @@ void HomeView::relayout(
     visible_rows_ = std::max<std::size_t>(
         1U,
         static_cast<std::size_t>(
-            std::floor((gallery_height + gap) / row_step_)));
+            std::floor((gallery_height + row_gap) / row_step_)));
     maximum_top_row_ = row_count_ > visible_rows_
         ? row_count_ - visible_rows_
         : 0U;
     top_row_ = std::min(top_row_, maximum_top_row_);
 
-    const double chip = std::max(26.0 * scale_, 32.0);
+    const double chip = std::max(32.0 * scale_, 32.0);
     for (std::size_t index = 0U; index < boards_.size(); ++index) {
         const std::size_t row = index / columns_;
         const std::size_t column = index % columns_;
         const UiRect bounds{
-            grid_left + static_cast<double>(column) * (card_w + gap),
+            grid_left
+                + static_cast<double>(column) * (card_w + column_gap),
             grid_top_
                 + (static_cast<double>(row) - static_cast<double>(top_row_))
                     * row_step_,
@@ -173,11 +234,11 @@ void HomeView::relayout(
             .selected = false,
             .accent = std::nullopt,
         });
-        // Rename stays contextual and sits on the preview, keeping metadata
-        // beneath the canvas free of permanent button chrome.
+        // Keep contextual actions in the footer, clear of the drawing.
         rename_buttons_.push_back(UiRect{
-            bounds.x + bounds.width - chip - 8.0 * scale_,
-            bounds.y + 8.0 * scale_,
+            bounds.x + bounds.width - chip - 10.0 * scale_,
+            bounds.y + bounds.height - card_text_area * scale_
+                + (card_text_area * scale_ - chip) * 0.5,
             chip,
             chip,
         });
@@ -263,23 +324,37 @@ void HomeView::relayout(
         focused_control_.reset();
     }
     ensure_focused_visible();
+    hovered_date_.reset();
+    date_hover_seconds_ = 0.0;
+    if (pointer_) set_pointer(*pointer_);
 }
 
 void HomeView::set_pointer(const Vec2d point) noexcept
 {
     pointer_ = point;
+    const auto board = board_at(point);
+    const auto date = board && !boards_[*board].editing
+        && !boards_[*board].date.empty()
+        && board_date_bounds(*board).contains(point) ? board : std::nullopt;
+    if (date != hovered_date_) {
+        hovered_date_ = date;
+        date_hover_seconds_ = 0.0;
+    }
 }
 
 void HomeView::clear_pointer() noexcept
 {
     pointer_.reset();
+    hovered_date_.reset();
+    date_hover_seconds_ = 0.0;
     pressed_control_.reset();
     pressed_rename_.reset();
 }
 
 void HomeView::pointer_down(const Vec2d point) noexcept
 {
-    pointer_ = point;
+    set_pointer(point);
+    date_hover_seconds_ = 0.0;
     pressed_control_.reset();
     pressed_rename_ = rename_at(point);
     if (pressed_rename_.has_value()) {
@@ -341,6 +416,9 @@ void HomeView::scroll_rows(const int rows) noexcept
         rename_buttons_[index].y += shift;
     }
     top_row_ = next;
+    hovered_date_.reset();
+    date_hover_seconds_ = 0.0;
+    if (pointer_) set_pointer(*pointer_);
     pressed_control_.reset();
     pressed_rename_.reset();
 }
@@ -371,44 +449,33 @@ void HomeView::clear_focus() noexcept
 
 void HomeView::play_entrance() noexcept
 {
-    open_seconds_ = 0.0;
+    open_seconds_ = 100.0;
 }
-
-namespace {
-
-// Cubic ease-out over [0, 1].
-double eased(const double amount) noexcept
-{
-    const double clamped = std::clamp(amount, 0.0, 1.0);
-    const double inverted = 1.0 - clamped;
-    return 1.0 - inverted * inverted * inverted;
-}
-
-} // namespace
 
 double HomeView::entrance(const std::size_t index) const noexcept
 {
-    const double delay = index < boards_.size()
-        ? 0.06 + 0.035 * static_cast<double>(std::min<std::size_t>(index, 16U))
-        : 0.0;
-    return eased((open_seconds_ - delay) / 0.38);
+    static_cast<void>(index);
+    return 1.0;
 }
 
 double HomeView::reveal() const noexcept
 {
-    return eased(open_seconds_ / 0.30);
+    return 1.0;
 }
 
 double HomeView::control_offset(const std::size_t index) const noexcept
 {
-    const double entrance_rise = (1.0 - entrance(index)) * 16.0 * scale_;
-    return entrance_rise;
+    static_cast<void>(index);
+    return 0.0;
 }
 
 void HomeView::tick(const double elapsed_seconds) noexcept
 {
     const double elapsed = std::clamp(elapsed_seconds, 0.0, 0.1);
     open_seconds_ += elapsed;
+    if (hovered_date_ && !pressed_control_ && !pressed_rename_) {
+        date_hover_seconds_ = std::min(0.45, date_hover_seconds_ + elapsed);
+    }
     theme_transition_ = std::min(
         1.0,
         theme_transition_ + elapsed / 0.24);
@@ -443,7 +510,9 @@ void HomeView::tick(const double elapsed_seconds) noexcept
             && rename_buttons_[index].y
                 + rename_buttons_[index].height > grid_top_
             && visual_rename_bounds(index).contains(*pointer_);
-        approach(rename_hovers_[index], hovered ? 1.0 : 0.0, 16.0);
+        // Match the card-hover response so the contextual control's surface,
+        // glyph, and hover color do not appear to run on separate clocks.
+        approach(rename_hovers_[index], hovered ? 1.0 : 0.0, 15.0);
     }
 }
 
@@ -571,7 +640,8 @@ std::optional<std::size_t> HomeView::focused_index() const noexcept
 
 bool HomeView::animating() const noexcept
 {
-    if (reveal() < 1.0 || theme_transition_ < 1.0
+    if ((hovered_date_ && date_hover_seconds_ < 0.45)
+        || reveal() < 1.0 || theme_transition_ < 1.0
         || pressed_control_.has_value() || pressed_rename_.has_value()) {
         return true;
     }
@@ -648,16 +718,46 @@ UiRect HomeView::status_bounds() const noexcept
 
 UiRect HomeView::board_name_bounds(const std::size_t index) const noexcept
 {
-    if (index >= boards_.size()) {
-        return {};
-    }
+    if (index >= boards_.size()) return {};
     const UiRect card = visual_control_bounds(index);
+    const double x = card.x + 16.0 * scale_;
     return {
-        card.x,
-        card.y + card.height - card_text_area * scale_,
-        card.width,
-        card_text_area * scale_ * 0.55,
+        x,
+        card.y + card.height - card_text_area * scale_ + 12.0 * scale_,
+        std::max(visual_rename_bounds(index).x - 10.0 * scale_ - x, 1.0),
+        24.0 * scale_,
     };
+}
+
+UiRect HomeView::board_date_bounds(const std::size_t index) const noexcept
+{
+    UiRect date = board_name_bounds(index);
+    if (date.width <= 0.0) return {};
+    date.y += 28.0 * scale_;
+    date.height = 18.0 * scale_;
+    return date;
+}
+
+UiRect HomeView::board_preview_bounds(const std::size_t index) const noexcept
+{
+    if (index >= boards_.size()) return {};
+    const UiRect card = visual_control_bounds(index);
+    const double margin = card_preview_margin * scale_;
+    const double width = std::max(card.width - margin * 2.0, 1.0);
+    const double height = std::max(card.height - card_text_area * scale_ - margin * 2.0, 1.0);
+    const double fit = std::min(width / BoardPreview::pixel_width,
+        height / BoardPreview::pixel_height);
+    const double preview_width = BoardPreview::pixel_width * fit;
+    const double preview_height = BoardPreview::pixel_height * fit;
+    return {card.x + (card.width - preview_width) * 0.5,
+        card.y + (card.height - card_text_area * scale_ - preview_height) * 0.5,
+        preview_width, preview_height};
+}
+
+std::optional<std::size_t> HomeView::date_tooltip() const noexcept
+{
+    return date_hover_seconds_ >= 0.45 && !pressed_control_ && !pressed_rename_
+        ? hovered_date_ : std::nullopt;
 }
 
 UiRect HomeView::scrollbar_track() const noexcept
@@ -699,6 +799,11 @@ UiRect HomeView::scrollbar_thumb() const noexcept
 std::string_view HomeView::error_message() const noexcept
 {
     return error_message_;
+}
+
+std::string_view HomeView::status_message() const noexcept
+{
+    return status_message_;
 }
 
 UiRect HomeView::visual_control_bounds(const std::size_t index) const noexcept

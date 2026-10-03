@@ -1,4 +1,5 @@
 #include "storage/BoardPath.hpp"
+#include "core/Filesystem.hpp"
 
 #include <array>
 #include <chrono>
@@ -31,10 +32,10 @@ std::filesystem::path unique_board_path(
         ? std::string{untitled_board_name}
         : std::string{base_name};
     std::filesystem::path candidate =
-        directory / (base + std::string{board_extension});
+        directory / path_from_utf8(base + std::string{board_extension});
     for (int suffix = 2; std::filesystem::exists(candidate); ++suffix) {
         candidate = directory
-            / (base + " " + std::to_string(suffix)
+            / path_from_utf8(base + " " + std::to_string(suffix)
                + std::string{board_extension});
     }
     return candidate;

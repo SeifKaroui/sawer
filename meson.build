@@ -9,6 +9,7 @@ project(
     'cpp_std=c++20',
     'default_library=static',
     'warning_level=3',
+    'b_ndebug=if-release',
     'b_vscrt=static_from_buildtype',
   ],
 )
@@ -41,7 +42,7 @@ endif
 
 platform_deps = []
 if host_machine.system() == 'windows'
-  foreach library : ['winmm', 'imm32', 'version', 'setupapi', 'dinput8']
+  foreach library : ['winmm', 'imm32', 'version', 'setupapi', 'dinput8', 'shell32']
     platform_deps += cpp.find_library(library, required: true)
   endforeach
 endif
@@ -109,19 +110,22 @@ embedded_notice_source = custom_target(
 
 font_specs = [
   [
-    'SourceSans3-Regular.ttf',
-    'source_sans_3_regular',
-    '4644c81b86ec9caaa76b634889968ed3c4f4f52f054855933acc7c2b21e53b0f',
+    'Inter-Regular.ttf',
+    'inter_regular',
+    '40d692fce188e4471e2b3cba937be967878f631ad3ebbbdcd587687c7ebe0c82',
+    'extras/ttf/Inter-Regular.ttf',
   ],
   [
-    'SourceSans3-Medium.ttf',
-    'source_sans_3_medium',
-    'a7af35c1cab5dd0b29d742f86f2edfdf83fa7ec213643e765c5c51a2dc24edbc',
+    'Inter-Medium.ttf',
+    'inter_medium',
+    '97ad806f526e41546d46365bb3a393145f75b7b1568913db74549ad8b8dba872',
+    'extras/ttf/Inter-Medium.ttf',
   ],
   [
-    'SourceSans3-Semibold.ttf',
-    'source_sans_3_semibold',
-    'a3f4f8dcf343a8f24dc61951de93f3ba1558b15cd250ba24af8a40e957081b7d',
+    'Inter-SemiBold.ttf',
+    'inter_semibold',
+    '78a843fade9d4612a5567302fb595b56976eb5fcebf4fea5a5912d638bafcde3',
+    'extras/ttf/Inter-SemiBold.ttf',
   ],
 ]
 
@@ -134,7 +138,9 @@ foreach spec : font_specs
       python,
       font_fetcher,
       '--url',
-      'https://raw.githubusercontent.com/adobe-fonts/source-sans/3.052R/TTF/' + spec[0],
+      'https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip',
+      '--archive-member',
+      spec[3],
       '--sha256',
       spec[2],
       '--output',
@@ -159,6 +165,8 @@ core_sources = files(
   'src/canvas/Camera.cpp',
   'src/canvas/Selection.cpp',
   'src/core/BuildInfo.cpp',
+  'src/core/CommandLine.cpp',
+  'src/core/Crc32c.cpp',
   'src/core/Log.cpp',
   'src/core/ThirdPartyNotices.cpp',
   'src/document/Command.cpp',
@@ -169,6 +177,7 @@ core_sources = files(
   'src/document/StrokeSegmentIndex.cpp',
   'src/geometry/StrokeProcessing.cpp',
   'src/input/PointerResampler.cpp',
+  'src/input/AdaptiveStrokeFilter.cpp',
   'src/input/VelocityGaussianStabilizer.cpp',
   'src/image/ImageCodec.cpp',
   'src/image/ImageDecodeCache.cpp',
@@ -232,6 +241,7 @@ sawer_core = static_library(
 sawer_core_dep = declare_dependency(
   link_with: sawer_core,
   include_directories: source_includes,
+  dependencies: platform_deps,
 )
 
 sawer_storage = static_library(
@@ -258,6 +268,7 @@ sawer_format = executable(
 sawer_renderer = static_library(
   'sawer_renderer',
   renderer_sources,
+  files('src/renderer/RetainedGeometry.cpp'),
   embedded_font_sources,
   include_directories: [source_includes, asset_includes],
   dependencies: [sawer_core_dep, sdl3_dep, sdl3_ttf_dep],
@@ -276,7 +287,9 @@ windows_release_subsystem = (
 
 sawer_executable = executable(
   'Sawer',
-  files('src/app/Application.cpp', 'src/app/Clipboard.cpp', 'src/app/main.cpp')
+  files('src/app/Application.cpp', 'src/app/BoardLoadingChecks.cpp',
+        'src/app/RenderingPerformanceChecks.cpp',
+        'src/app/Clipboard.cpp', 'src/app/main.cpp')
     + windows_resources,
   include_directories: source_includes,
   dependencies: [sawer_renderer_dep, sawer_storage_dep, sdl3_dep],
@@ -353,11 +366,14 @@ if get_option('tests')
       'tests/canvas/CameraTests.cpp',
       'tests/canvas/SelectionTests.cpp',
       'tests/core/BuildInfoTests.cpp',
+      'tests/core/FilesystemTests.cpp',
+      'tests/core/Crc32cTests.cpp',
       'tests/core/LogTests.cpp',
       'tests/core/ThirdPartyNoticesTests.cpp',
       'tests/document/DocumentTests.cpp',
       'tests/geometry/StrokeProcessingTests.cpp',
       'tests/input/DrawingSettingsTests.cpp',
+      'tests/input/AdaptiveStrokeFilterTests.cpp',
       'tests/input/PointerResamplerTests.cpp',
       'tests/input/VelocityGaussianStabilizerTests.cpp',
       'tests/image/ImageCodecTests.cpp',
@@ -366,10 +382,15 @@ if get_option('tests')
       'tests/storage/ClipboardFragmentTests.cpp',
       'tests/storage/SawerRecordTests.cpp',
       'tests/storage/PreviewCacheTests.cpp',
+      'tests/storage/RecentFilesTests.cpp',
       'tests/ui/HomeViewTests.cpp',
+      'tests/ui/NavigationTransitionTests.cpp',
       'tests/ui/BoardPreviewTests.cpp',
       'tests/ui/ToolbarTests.cpp',
       'tests/ui/UnsavedDialogTests.cpp',
+      'tests/renderer/BackgroundGridTests.cpp',
+      'tests/renderer/BoardThemeTests.cpp',
+      'tests/renderer/CacheTests.cpp',
     ),
     dependencies: [
       sawer_core_dep,
@@ -380,6 +401,9 @@ if get_option('tests')
   )
 
   test('unit', sawer_tests, timeout: 180)
+  test('font fetch recovery', python, args: files('tests/tools/FetchFileTests.py'))
+  test('Unicode file commands', python,
+    args: [files('tests/tools/UnicodeFileCommands.py'), sawer_format])
   test('version command', sawer_executable, args: ['--version'])
   test(
     'third-party notices command',
@@ -395,6 +419,8 @@ if get_option('tests')
   test('window lifecycle', sawer_executable, args: ['--smoke-test'])
   test('GPU diagnostics', sawer_executable, args: ['--gpu-info'])
   test('GPU render submission', sawer_executable, args: ['--render-test'], timeout: 10)
+  test('board image loading reuse', sawer_executable,
+    args: ['--board-loading-test'], timeout: 30)
   test(
     'GPU renderer recovery',
     sawer_executable,
@@ -411,6 +437,7 @@ if get_option('tests')
     args: ['--large-board-test'],
     timeout: 120,
     suite: 'performance',
+    is_parallel: false,
   )
   test(
     'live drawing regression',
@@ -418,6 +445,7 @@ if get_option('tests')
     args: ['--drawing-performance-test'],
     timeout: 30,
     suite: 'performance',
+    is_parallel: false,
   )
   test(
     'geometry buffer growth',
@@ -425,9 +453,30 @@ if get_option('tests')
     args: ['--buffer-growth-test'],
     timeout: 30,
     suite: 'performance',
+    is_parallel: false,
   )
+  test('rendering navigation performance', sawer_executable,
+    args: ['--rendering-performance-test'], timeout: 90, suite: 'performance', is_parallel: false)
   test('Home recent navigation', sawer_executable, args: ['--home-test'], timeout: 10)
+  test(
+    'Home board transition rendering', sawer_executable,
+    args: ['--navigation-transition-test'], timeout: 30,
+  )
+  test(
+    'busy board stroke visibility',
+    sawer_executable,
+    args: ['--stroke-visibility-test'],
+    timeout: 60,
+  )
   test('per-board zoom state', sawer_executable, args: ['--zoom-state-test'])
+
+  loading_benchmark = executable(
+    'sawer-loading-benchmark',
+    files('tests/performance/BoardLoadingBenchmark.cpp'),
+    dependencies: [sawer_storage_dep],
+    override_options: sawer_target_options,
+  )
+  benchmark('board loading', loading_benchmark, timeout: 180, suite: 'performance')
 
   diagnostic_output = meson.current_build_dir() / 'sawer-exported-diagnostics.log'
   test(
