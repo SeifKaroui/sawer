@@ -8,14 +8,14 @@ Sawer is a simple, fast, native whiteboard for Windows and Linux. It is built
 around local files: each board is one portable `.sawer` file that you can keep
 in any ordinary folder, copy, move, and share.
 
-> **Status:** Pre-release — automated Windows AMD64 installer and portable
-> builds are configured; Linux binaries still need to be built from source.
+> **Status:** Sawer 0.9.0 is prerelease software. A Windows AMD64 release
+> workflow is configured; Linux currently requires a source build.
 
 ## Download
 
 ### Installer (recommended)
 
-Download `Sawer-Setup.exe` from the
+When a Windows release is available, download `Sawer-Setup.exe` from the
 [GitHub Releases page](https://github.com/SeifKaroui/sawer/releases), run it,
 and choose **Install**. Sawer installs for your Windows account without an
 administrator prompt, adds Start Menu and desktop shortcuts, registers
@@ -53,6 +53,8 @@ are not yet code-signed, so SmartScreen may show a warning.
   colors, widths, and shape fills.
 - Select, marquee-select, move, resize, duplicate, delete, and restyle board
   objects with undo and redo.
+- Copy and paste selections between boards, or paste PNG/BMP images from
+  the clipboard. Image data stays inside the board file.
 - Create, open, save, autosave, and safely recover independent `.sawer`
   boards. Recent boards appear on Home.
 - Pan a finite board and zoom beneath the cursor. Rendering is designed for
@@ -64,7 +66,7 @@ are not yet code-signed, so SmartScreen may show a warning.
 - SDL Render fallback, complete device-loss recovery, and broad mixed-DPI
   validation are still in progress.
 - Linux Flatpak/AppImage packaging remains a future milestone.
-- Pen, touch, text, images, PDF import, sync, collaboration, and plugins are
+- Pen, touch, text, PDF import, sync, collaboration, and plugins are
   intentionally deferred until after the mouse-first 1.0 release.
 
 ## Quick start
@@ -84,12 +86,14 @@ On Linux, use the same `build` directory and run `build/Sawer`. See
 
 ### Create and save a board
 
-1. On Home, choose **New board**, draw with the Pencil, then choose **Save
-   As** to select any destination.
+1. Sawer starts with a new, unsaved **Untitled** board. Draw with the Pencil,
+   then choose **Save As** to select any destination. You can also choose
+   **New board** from Home.
 2. To reopen it later, use **Open board**, click it from Home’s recent-board
    list, or pass the file path when launching Sawer.
-3. Sawer autosaves completed actions after roughly one second. Press `Ctrl+S`
-   to flush immediately.
+3. After the first save, Sawer autosaves completed actions after roughly one
+   second. Press `Ctrl+S` to flush immediately. An unsaved Untitled board stays
+   in memory until you choose a file; Sawer prompts before leaving unsaved work.
 
 Create a new board at a chosen path, or open an existing one:
 
@@ -99,24 +103,33 @@ Create a new board at a chosen path, or open an existing one:
 
 | Task | Control |
 | --- | --- |
-| Pan | Middle-drag, or `Space` + left-drag |
-| Zoom | Mouse wheel beneath the cursor |
+| Pan | `H` then left-drag, middle-drag, or `Space` + left-drag |
+| Zoom | Mouse wheel beneath the cursor; `Ctrl+-` / `Ctrl++` at the viewport center |
+| Reset zoom to 100% | `Ctrl+0` |
 | Choose Pencil / Line / Rectangle / Ellipse | `P` / `L` / `R` / `E` |
 | Draw | Left-drag with the current tool |
 | Constrain a line or shape | Hold `Shift` while drawing |
 | Toggle shape fill | `F` |
 | Select and edit objects | `V`, then click or drag a marquee |
 | Move or resize a selection | Drag selected objects or their handles |
+| Select all / nudge selection | `Ctrl+A` / arrow keys (`Shift` for a larger step) |
+| Copy / Cut / Paste | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` |
 | Duplicate / delete selection | `Ctrl+D` / `Delete` |
 | Undo / redo | `Ctrl+Z` / `Ctrl+Shift+Z` or `Ctrl+Y` |
 | Cancel the active gesture | `Escape` |
 | Choose color / adjust width | `1`–`7` / `[` and `]` |
 | New / Open / Save / Save As | `Ctrl+N` / `Ctrl+O` / `Ctrl+S` / `Ctrl+Shift+S` |
+| Rename the current board | Rename icon, File → Rename, or `F2`; `Enter` confirms and `Escape` cancels |
 | Toggle theme | `T` |
 
 The toolbar also provides file, drawing, style, history, zoom, Home, and
 theme controls. Hover a control to see its shortcut and purpose. The board is
 finite and clamped to +/-1,000,000 logical units.
+
+Dark mode also adapts white and default light board backgrounds to graphite.
+On these boards, neutral black ink becomes off-white and white ink/fills become
+graphite. Other colors, colored backgrounds, and images keep their colors.
+This changes the display only: saved colors stay intact and return in light mode.
 
 ## Your boards stay yours
 
@@ -136,11 +149,12 @@ the automated regression workload.
 ## Requirements
 
 - Meson 1.7 or newer and Ninja.
+- Python 3.10 or newer for Meson and the build-time asset tools.
 - A C++20 compiler: MSVC, GCC, or Clang.
 - CMake 3.28 or newer. Meson uses it internally to build SDL3 because SDL3
   does not provide an upstream Meson definition.
-- Network access during the first configuration to download pinned
-  dependencies.
+- Network access during the first configuration and build to download pinned
+  dependencies and embedded fonts.
 
 Git is not required to configure or build Sawer. SDL3 is linked statically on
 Windows and Linux. Windows MinGW release and development builds also link the
@@ -178,14 +192,16 @@ Run the Windows debug executable:
 
     build/Sawer.exe
 
-Close the window normally to exit. Available non-interactive checks and
-diagnostics include:
+Close the window normally to exit. Automated checks and diagnostics include
+the following; rendering checks can briefly open visible windows:
 
     build/Sawer.exe --version
     build/Sawer.exe --third-party-notices
     build/Sawer.exe --smoke-test
     build/Sawer.exe --gpu-info
     build/Sawer.exe --render-test
+    build/Sawer.exe --board-loading-test
+    build/Sawer.exe --rendering-performance-test
     build/Sawer.exe --export-diagnostics diagnostics.log
 
 `--third-party-notices` prints the complete license text embedded in the
@@ -195,20 +211,30 @@ selected GPU backend, adapter, and driver version. `--render-test` presents
 three frames before exiting. `--export-diagnostics` exports the local log and
 current GPU startup diagnostics without opening a visible window.
 
+`--rendering-performance-test` checks retained navigation, incremental edits,
+stroke detail reuse and all procedural grid styles. Implementation bounds and
+validation results are in [rendering performance](docs/rendering-performance.md).
+Image preparation and loader measurements are documented in
+[board loading performance](docs/board-loading-performance.md).
+
 ## Package
 
 After a Release build, create a portable archive through Meson:
 
     meson compile -C build package
 
-The archive contains the statically linked `Sawer.exe`, this README, and
+The archive is written into `build/` and contains the statically linked
+application, this README, `assets/banner.png`, technical documentation under
+`docs/`, linked shader references, and
 [third-party notices](THIRD_PARTY_NOTICES.md). Extract it anywhere and run
-`Sawer.exe`; no installer is required. Linux builds produce an equivalent
-relocatable `.tar.gz` archive.
+`Sawer.exe`; no installer is required. Linux builds produce a `.tar.gz` with
+the same contents, but still need compatible operating-system libraries.
+The local archive is separate from the Windows installer workflow.
 
-Official Windows releases publish `Sawer-Setup.exe` as the recommended
-one-click installer and `Sawer-Portable.exe` as the no-install alternative.
-Both come from the same tested executable and include SHA-256 checksums and
+The Windows release workflow is configured to publish `Sawer-Setup.exe` as
+the recommended one-click installer and `Sawer-Portable.exe` as the no-install
+alternative.
+Both come from the same executable. Tag runs generate SHA-256 checksums and
 GitHub build-provenance attestations. Maintainer steps are documented in
 [docs/releasing.md](docs/releasing.md).
 
@@ -218,3 +244,9 @@ The project uses C++20, Meson, Ninja, SDL3, SDL GPU, SDL_ttf, and
 nlohmann/json. Production code is organised under `src/`; automated unit and
 application checks are under `tests/`. `meson test` runs the default test set;
 performance regression checks are defined in Meson’s `performance` suite.
+
+The board format and inspection tool are described in
+[docs/file-format.md](docs/file-format.md). The format tool is built from
+source and is not included in the current application downloads.
+
+Third-party licenses are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
