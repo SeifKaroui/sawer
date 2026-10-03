@@ -105,8 +105,10 @@ The `headless` suite covers document/storage/geometry tests, Unicode paths,
 font-fetch recovery, package contents, versions, and embedded notices. The
 `graphics` suite runs serially under Xvfb/Openbox and headless Weston, forcing
 the requested SDL backend and Mesa lavapipe Vulkan. Isolated XDG directories
-keep test preferences away from the runner account. Backend processes are
-terminated on success and failure; readiness and command waits are bounded.
+keep test preferences away from the runner account. X11 waits for Openbox's
+post-initialization startup hook before launching clients: its WM property is
+published too early to guarantee window-mapping events are handled. Backend
+processes are terminated on success and failure; readiness and command waits are bounded.
 Each download/Flatpak command has a 120-second deadline; full graphics suites
 allow 900 seconds. Timeout cleanup stops the command's process group, including
 launcher children. Logs include command output, display diagnostics, application

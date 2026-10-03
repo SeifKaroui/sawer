@@ -149,11 +149,17 @@ def run_session(backend: str, command: list[str], log_dir: Path,
                     if not number.isdecimal():
                         raise RuntimeError(f"invalid Xvfb display number: {number!r}")
                     environment["DISPLAY"] = f":{number}"
-                    manager = subprocess.Popen(["openbox", "--sm-disable"], env=environment,
-                                               stdout=log, stderr=log)
+                    startup_ready = root / "openbox-ready"
+                    manager = subprocess.Popen([
+                        "openbox", "--sm-disable", "--startup",
+                        shlex.join(["touch", str(startup_ready)]),
+                    ], env=environment, stdout=log, stderr=log)
                     processes.append(manager)
-                    # A responding window manager is required for resize synchronization.
+                    # Openbox publishes its WM property before listening for events.
+                    # Its startup hook runs after event setup and initial window management.
                     def manager_ready() -> bool:
+                        if not startup_ready.is_file():
+                            return False
                         result = subprocess.run(
                             ["xprop", "-root", "_NET_SUPPORTING_WM_CHECK"],
                             env=environment, capture_output=True, text=True, timeout=2)

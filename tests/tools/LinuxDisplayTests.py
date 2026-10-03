@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -9,7 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 SOURCE = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(SOURCE / "tools"))
@@ -89,6 +90,49 @@ class LinuxDisplayTests(unittest.TestCase):
                 stop.assert_called_once_with(popen.return_value)
             self.assertEqual((log_dir / "wayland-preferences/data/Sawer/Sawer.log").read_bytes(),
                              b"startup failed")
+
+    def test_x11_waits_for_startup_hook_even_when_wm_property_exists(self):
+        with tempfile.TemporaryDirectory(prefix="sawer WM ready ") as temporary:
+            server = Mock()
+            server.poll.return_value = None
+            manager = Mock()
+            marker = None
+            def launch(command, **kwargs):
+                nonlocal marker
+                if command[0] == "Xvfb":
+                    os.write(kwargs["pass_fds"][0], b"97\n")
+                    return server
+                self.assertEqual(command[:2], ["openbox", "--sm-disable"])
+                startup = shlex.split(command[command.index("--startup") + 1])
+                self.assertEqual(startup[0], "touch")
+                marker = Path(startup[1])
+                return manager
+            def ready(process, predicate, name):
+                if name == "Xvfb":
+                    self.assertTrue(predicate())
+                else:
+                    # The property is already valid, but the manager is not ready.
+                    self.assertFalse(predicate())
+                    query.assert_not_called()
+                    marker.touch()
+                    self.assertTrue(predicate())
+            original_glob = Path.glob
+            def driver_glob(path, pattern, *args, **kwargs):
+                if pattern == "lvp_icd*.json":
+                    return iter([Path("/fake/lvp_icd.json")])
+                return original_glob(path, pattern, *args, **kwargs)
+            with patch.object(test_linux_display.Path, "glob", autospec=True, side_effect=driver_glob), \
+                    patch.object(test_linux_display.subprocess, "Popen", side_effect=launch), \
+                    patch.object(test_linux_display.subprocess, "run") as query, \
+                    patch.object(test_linux_display, "wait_until_ready", side_effect=ready), \
+                    patch.object(test_linux_display, "stop_process"), \
+                    patch.object(test_linux_display, "run_logged_command", return_value=0) as run:
+                query.return_value = subprocess.CompletedProcess(
+                    ["xprop"], 0, "_NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x1234", "")
+                self.assertEqual(test_linux_display.run_session(
+                    "x11", ["Sawer", "--render-test"], Path(temporary) / "logs"), 0)
+                run.assert_called_once()
+                query.assert_called_once()
 
     @unittest.skipUnless(sys.platform == "linux", "Linux process-group integration")
     def test_launcher_children_are_stopped_on_success_and_timeout(self):
