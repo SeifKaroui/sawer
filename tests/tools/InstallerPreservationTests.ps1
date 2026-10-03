@@ -47,7 +47,43 @@ try {
     Assert-Rejected {
         Invoke-CheckedProcess $helper @('-NoProfile', '-Command', '"exit 2"')
     } '*exited with 2, expected 0'
-    Write-Output 'Installer preservation and exit-code regression checks passed'
+    # Execute the workflow's actual download block with simulated transfers.
+    $sourceRoot = Split-Path (Split-Path (Resolve-Path -LiteralPath $InstallerScript).Path -Parent) -Parent
+    $workflow = Get-Content (Join-Path $sourceRoot '.github/workflows/windows-release.yml') -Raw
+    $step = [regex]::Match($workflow, '(?ms)^      - name: Set up pinned NSIS compiler\r?\n.*?        run: \|\r?\n(?<body>.*?)(?=^      - name:)')
+    Assert-Condition $step.Success 'NSIS setup step was not found'
+    $setup = [regex]::Replace($step.Groups['body'].Value, '(?m)^          ', '')
+    $download = $setup.Substring(0, $setup.IndexOf('Expand-Archive'))
+    $download = [regex]::Replace($download, "(?m)^\`$expected = '[0-9a-f]+'", ('$expected = ''' + $boardHash + ''''))
+    $previousRunnerTemp = $env:RUNNER_TEMP
+    function curl.exe {
+        param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+        $script:downloadCalls++
+        Assert-Condition ($Arguments -contains '--proto' -and $Arguments -contains '--proto-redir') 'Download must restrict both initial and redirect protocols'
+        Assert-Condition (@($Arguments | Where-Object { $_ -eq '=https' }).Count -eq 2) 'Download allowed a non-HTTPS protocol'
+        if (-not $script:badDownload -and $script:downloadCalls -eq 1) {
+            $global:LASTEXITCODE = 22
+            return
+        }
+        $output = $Arguments[[Array]::IndexOf($Arguments, '--output') + 1]
+        $bytes = if ($script:badDownload) { [byte[]]@(9, 9) } else { [byte[]]@(1, 2, 3, 4) }
+        [IO.File]::WriteAllBytes($output, $bytes)
+        $global:LASTEXITCODE = 0
+    }
+    try {
+        $env:RUNNER_TEMP = $testRoot
+        $script:downloadCalls = 0
+        $script:badDownload = $false
+        & ([scriptblock]::Create($download))
+        Assert-Condition ($script:downloadCalls -eq 2) 'Download did not fall back after a transport failure'
+        $script:downloadCalls = 0
+        $script:badDownload = $true
+        Assert-Rejected { & ([scriptblock]::Create($download)) } 'Could not download the checksum-verified NSIS archive over HTTPS'
+    } finally {
+        $env:RUNNER_TEMP = $previousRunnerTemp
+        Remove-Item Function:\curl.exe
+    }
+    Write-Output 'Installer preservation, exit-code, HTTPS fallback and checksum regression checks passed'
 } finally {
     $resolved = [IO.Path]::GetFullPath($testRoot)
     if (-not $resolved.StartsWith($temporaryRoot.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {

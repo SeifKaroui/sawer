@@ -23,7 +23,8 @@ Pillow 12.3.0 and `tools/generate_windows_icon.py`. Archives and Meson
 installation preserve `assets/banner.png`, technical documents under `docs/`,
 and linked shader references.
 
-CI uses the official NSIS 3.12 ZIP, verified with SHA-256
+CI downloads the official NSIS 3.12 ZIP through HTTPS-only mirror fallback,
+verified with SHA-256
 `56581f90db321581c5381193d796fffcf2d24b2f8fed2160a6c6a3baa67f2c4f`.
 A running or unwritable application blocks installation/uninstall with exit code 2;
 application extraction failure returns 3. Uninstall preserves boards and
