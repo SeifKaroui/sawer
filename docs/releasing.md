@@ -26,6 +26,12 @@ and linked shader references.
 CI downloads the official NSIS 3.12 ZIP through HTTPS-only mirror fallback,
 verified with SHA-256
 `56581f90db321581c5381193d796fffcf2d24b2f8fed2160a6c6a3baa67f2c4f`.
+CI reuses MSYS2 package downloads, pip wheels, Meson dependency archives,
+verified fonts, and the extracted NSIS installation. Download caches are saved
+after the build, before tests, so later failures do not discard them. Cache
+keys include dependency definitions; NSIS and fonts retain their hash checks.
+Meson configures a fresh `build/` each run. The installer invokes NSIS by its
+exported absolute path because MSYS2 filters the inherited Windows PATH.
 A running or unwritable application blocks installation/uninstall with exit code 2;
 application extraction failure returns 3. Uninstall preserves boards and
 preferences.

@@ -53,9 +53,9 @@ try {
     $step = [regex]::Match($workflow, '(?ms)^      - name: Set up pinned NSIS compiler\r?\n.*?        run: \|\r?\n(?<body>.*?)(?=^      - name:)')
     Assert-Condition $step.Success 'NSIS setup step was not found'
     $setup = [regex]::Replace($step.Groups['body'].Value, '(?m)^          ', '')
-    $download = $setup.Substring(0, $setup.IndexOf('Expand-Archive'))
+    $download = $setup.Substring(0, $setup.IndexOf('$compilerDirectory ='))
     $download = [regex]::Replace($download, "(?m)^\`$expected = '[0-9a-f]+'", ('$expected = ''' + $boardHash + ''''))
-    $previousRunnerTemp = $env:RUNNER_TEMP
+    $previousNsisCache = $env:NSIS_CACHE_DIR
     function curl.exe {
         param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
         $script:downloadCalls++
@@ -71,19 +71,23 @@ try {
         $global:LASTEXITCODE = 0
     }
     try {
-        $env:RUNNER_TEMP = $testRoot
+        $env:NSIS_CACHE_DIR = Join-Path $testRoot 'nsis-cache'
         $script:downloadCalls = 0
         $script:badDownload = $false
         & ([scriptblock]::Create($download))
         Assert-Condition ($script:downloadCalls -eq 2) 'Download did not fall back after a transport failure'
         $script:downloadCalls = 0
+        & ([scriptblock]::Create($download))
+        Assert-Condition ($script:downloadCalls -eq 0) 'Verified cached NSIS archive triggered a download'
+        [IO.File]::WriteAllBytes((Join-Path $env:NSIS_CACHE_DIR 'nsis-3.12.zip'), [byte[]]@(0))
         $script:badDownload = $true
         Assert-Rejected { & ([scriptblock]::Create($download)) } 'Could not download the checksum-verified NSIS archive over HTTPS'
+        Assert-Condition ($script:downloadCalls -eq 2) 'Invalid cached NSIS archive did not trigger mirror downloads'
     } finally {
-        $env:RUNNER_TEMP = $previousRunnerTemp
+        $env:NSIS_CACHE_DIR = $previousNsisCache
         Remove-Item Function:\curl.exe
     }
-    Write-Output 'Installer preservation, exit-code, HTTPS fallback and checksum regression checks passed'
+    Write-Output 'Installer preservation, exit-code, HTTPS fallback, cache and checksum regression checks passed'
 } finally {
     $resolved = [IO.Path]::GetFullPath($testRoot)
     if (-not $resolved.StartsWith($temporaryRoot.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {

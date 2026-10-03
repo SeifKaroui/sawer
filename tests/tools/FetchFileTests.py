@@ -36,11 +36,13 @@ class FetchFileTests(unittest.TestCase):
         self.sleep.start()
         self.addCleanup(self.sleep.stop)
 
-    def fetch(self, archive_member: str = ""):
+    def fetch(self, archive_member: str = "", cache: Path | None = None):
         arguments = ["fetch_file.py", "--url", "https://example.com/font.zip",
                      "--output", str(self.output), "--sha256", self.checksum]
         if archive_member:
             arguments += ["--archive-member", archive_member]
+        if cache is not None:
+            arguments += ["--cache", str(cache)]
         with patch.object(fetch_file.sys, "argv", arguments):
             return fetch_file.main()
 
@@ -79,6 +81,30 @@ class FetchFileTests(unittest.TestCase):
         with patch.object(fetch_file.urllib.request, "urlopen") as network:
             self.assertEqual(self.fetch(), 0)
         network.assert_not_called()
+
+    def test_verified_cache_installs_font_without_network(self):
+        cache = self.output.parent / "cache"
+        cache.mkdir()
+        cached_font = cache / self.output.name
+        cached_font.write_bytes(self.font)
+        with patch.object(fetch_file.urllib.request, "urlopen") as network:
+            self.assertEqual(self.fetch(cache=cache), 0)
+        network.assert_not_called()
+        self.assertEqual(self.output.read_bytes(), self.font)
+        self.assertEqual(cached_font.read_bytes(), self.font)
+        self.assertCountEqual(os.listdir(self.output.parent), ["cache", self.output.name])
+
+    def test_invalid_cache_preserves_existing_output(self):
+        cache = self.output.parent / "cache"
+        cache.mkdir()
+        (cache / self.output.name).write_bytes(b"invalid cached font")
+        self.output.write_bytes(b"existing output")
+        with patch.object(fetch_file.urllib.request, "urlopen") as network:
+            with self.assertRaisesRegex(RuntimeError, "cached file has the wrong SHA-256"):
+                self.fetch(cache=cache)
+        network.assert_not_called()
+        self.assertEqual(self.output.read_bytes(), b"existing output")
+        self.assertCountEqual(os.listdir(self.output.parent), ["cache", self.output.name])
 
 
 if __name__ == "__main__":

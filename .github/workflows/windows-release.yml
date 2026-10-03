@@ -18,6 +18,9 @@ jobs:
     name: Windows AMD64
     runs-on: windows-2022
     timeout-minutes: 60
+    env:
+      PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
+      NSIS_CACHE_DIR: ${{ github.workspace }}/.cache/nsis-3.12
     permissions:
       contents: write
       id-token: write
@@ -28,6 +31,22 @@ jobs:
         uses: actions/checkout@v6.0.2
         with:
           persist-credentials: false
+
+      - name: Show checked-out revision
+        shell: pwsh
+        run: |
+          git log -1 --format='%H %s'
+          "Source commit: $env:GITHUB_SHA (attempt $env:GITHUB_RUN_ATTEMPT)" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Restore dependency downloads
+        id: dependency-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: |
+            subprojects/packagecache
+            .cache/fonts
+            .cache/pip
+          key: ${{ runner.os }}-sawer-downloads-v1-${{ hashFiles('subprojects/*.wrap', 'subprojects/packagefiles/**', 'meson.build', 'tools/fetch_file.py', 'tools/ci-requirements.txt') }}
 
       - name: Set up deterministic icon tooling
         uses: actions/setup-python@v6.2.0
@@ -40,7 +59,7 @@ jobs:
           python -m pip install `
             --disable-pip-version-check `
             --only-binary=:all: `
-            Pillow==12.3.0
+            -r tools/ci-requirements.txt
           python tools/generate_windows_icon.py `
             assets/logo.png assets/windows/Sawer.ico --check
 
@@ -49,6 +68,7 @@ jobs:
         with:
           msystem: UCRT64
           update: true
+          cache: true
           install: >-
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-gcc
@@ -56,15 +76,25 @@ jobs:
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-python
 
+      - name: Restore NSIS installation
+        id: nsis-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .cache/nsis-3.12
+          key: ${{ runner.os }}-nsis-3.12-56581f90db321581-v1
+
       - name: Set up pinned NSIS compiler
+        id: nsis
         shell: pwsh
         run: |
-          $directory = Join-Path $env:RUNNER_TEMP 'nsis-3.12'
+          $directory = $env:NSIS_CACHE_DIR
           New-Item -ItemType Directory -Path $directory -Force | Out-Null
           $archive = Join-Path $directory 'nsis-3.12.zip'
           $expected = '56581f90db321581c5381193d796fffcf2d24b2f8fed2160a6c6a3baa67f2c4f'
-          $downloaded = $false
+          $downloaded = (Test-Path -LiteralPath $archive) -and
+            (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -eq $expected
           foreach ($mirror in @('netix', 'phoenixnap')) {
+            if ($downloaded) { break }
             $url = "https://downloads.sourceforge.net/project/nsis/NSIS%203/3.12/nsis-3.12.zip?use_mirror=$mirror"
             curl.exe --fail --silent --show-error --location `
               --proto '=https' --proto-redir '=https' `
@@ -80,12 +110,21 @@ jobs:
           if (-not $downloaded) {
             throw 'Could not download the checksum-verified NSIS archive over HTTPS'
           }
-          Expand-Archive -LiteralPath $archive -DestinationPath $directory
           $compilerDirectory = Join-Path $directory 'nsis-3.12'
+          if (-not (Test-Path -LiteralPath (Join-Path $compilerDirectory 'makensis.exe'))) {
+            Expand-Archive -LiteralPath $archive -DestinationPath $directory -Force
+          }
           if ((& (Join-Path $compilerDirectory 'makensis.exe') -VERSION) -ne 'v3.12') {
             throw 'Unexpected NSIS compiler version'
           }
-          $compilerDirectory >> $env:GITHUB_PATH
+          "compiler=$(Join-Path $compilerDirectory 'makensis.exe')" >> $env:GITHUB_OUTPUT
+
+      - name: Save verified NSIS installation
+        if: steps.nsis-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .cache/nsis-3.12
+          key: ${{ steps.nsis-cache.outputs.cache-primary-key }}
 
       - name: Validate source version
         id: release
@@ -102,11 +141,29 @@ jobs:
 
       - name: Configure Release build
         shell: msys2 {0}
-        run: meson setup build --buildtype=release -Dsawer_werror=true
+        run: >-
+          meson setup build --buildtype=release -Dsawer_werror=true
+          -Dfont_cache_dir="$PWD/.cache/fonts"
 
       - name: Build Sawer and tests
         shell: msys2 {0}
         run: meson compile -C build
+
+      - name: Retain verified fonts
+        shell: msys2 {0}
+        run: |
+          mkdir -p .cache/fonts
+          cp build/Inter-{Regular,Medium,SemiBold}.ttf .cache/fonts/
+
+      - name: Save dependency downloads
+        if: steps.dependency-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: |
+            subprojects/packagecache
+            .cache/fonts
+            .cache/pip
+          key: ${{ steps.dependency-cache.outputs.cache-primary-key }}
 
       - name: Run release-safe tests
         shell: msys2 {0}
@@ -160,15 +217,17 @@ jobs:
         shell: msys2 {0}
         env:
           VERSION: ${{ steps.release.outputs.version }}
+          NSIS_COMPILER: ${{ steps.nsis.outputs.compiler }}
         run: |
-          if [[ "$(makensis -VERSION)" != "v3.12" ]]; then
+          compiler="$(cygpath -u "$NSIS_COMPILER")"
+          if [[ "$("$compiler" -VERSION)" != "v3.12" ]]; then
             echo "Unexpected NSIS compiler version" >&2
             exit 1
           fi
           portable="$(cygpath -w "$(pwd)/dist/Sawer-Portable.exe")"
           output="$(cygpath -w "$(pwd)/dist")"
           script="$(cygpath -w "$(pwd)/packaging/windows/Sawer.nsi")"
-          MSYS2_ARG_CONV_EXCL='*' makensis \
+          MSYS2_ARG_CONV_EXCL='*' "$compiler" \
             /WX \
             "/DAPP_VERSION=$VERSION" \
             "/DAPP_EXE=$portable" \
