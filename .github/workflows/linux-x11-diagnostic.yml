@@ -52,10 +52,16 @@ jobs:
               with destination.with_suffix(".gdb.txt").open("w") as log:
                   try:
                       subprocess.run(["sudo", "-n", "gdb", "--batch", "--nx", "-ex",
-                                      "set pagination off", "-ex", "thread apply all bt", "-p", str(pid)],
+                                      "set pagination off", "-ex", "set debuginfod enabled off", "-ex",
+                                      "thread apply all bt", "-ex", "info proc mappings", "-p", str(pid)],
                                      stdout=log, stderr=subprocess.STDOUT, timeout=20)
                   except subprocess.TimeoutExpired:
                       print("GDB timeout", file=log)
+              for wm_pid in subprocess.check_output(["pgrep", "-x", "openbox"], text=True).split():
+                  with destination.with_suffix(".openbox.gdb.txt").open("w") as log:
+                      subprocess.run(["sudo", "-n", "gdb", "--batch", "--nx", "-ex", "set debuginfod enabled off",
+                                      "-ex", "thread apply all bt", "-p", wm_pid],
+                                     stdout=log, stderr=subprocess.STDOUT, timeout=20)
               for query in (["xwininfo", "-root", "-tree"], ["xprop", "-root"]):
                   with destination.with_suffix("." + query[0] + ".txt").open("w") as log:
                       subprocess.run(query, stdout=log, stderr=subprocess.STDOUT,
@@ -67,7 +73,7 @@ jobs:
               display_environment = environment
               return original_run(command, environment, log_path, timeout)
           display.run_logged_command = run
-          for attempt in range(3):
+          for attempt in range(100):
               print(f"X11 startup attempt {attempt + 1}", flush=True)
               result = display.run_session("x11", [str(Path("build/linux-dist/Sawer").resolve()),
                                            "--render-test"], Path(f"build/diagnostic/{attempt}"))
