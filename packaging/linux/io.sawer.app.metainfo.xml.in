@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.sawer.app</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+  <name>Sawer</name>
+  <summary>A fast, local-first whiteboard</summary>
+  <description>
+    <p>Draw, select, and edit on a native whiteboard. Each board is one portable
+    .sawer file in a normal folder, with local saving and undo.</p>
+    <p>Sawer has no accounts, cloud service, telemetry, or database.</p>
+  </description>
+  <launchable type="desktop-id">io.sawer.app.desktop</launchable>
+  <provides><mediatype>application/x-sawer</mediatype></provides>
+  <url type="homepage">https://github.com/SeifKaroui/sawer</url>
+  <url type="bugtracker">https://github.com/SeifKaroui/sawer/issues</url>
+  <developer_name>Sawer</developer_name>
+  <content_rating type="oars-1.1"/>
+  <releases><release version="@VERSION@" date="@DATE@"/></releases>
+</component>

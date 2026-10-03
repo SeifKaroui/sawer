@@ -9,7 +9,7 @@ around local files: each board is one portable `.sawer` file that you can keep
 in any ordinary folder, copy, move, and share.
 
 > **Status:** Sawer 0.9.0 is prerelease software. A Windows AMD64 release
-> workflow and a Linux x86_64 executable/AppImage build workflow are configured.
+> workflow and a Linux x86_64 executable/AppImage/Flatpak build workflow are configured.
 
 ## Download
 
@@ -38,12 +38,14 @@ are not yet code-signed, so SmartScreen may show a warning.
 
 ### Linux downloads
 
-The **Linux release** workflow generates two x86_64 downloads:
+The **Linux release** workflow generates three x86_64 downloads:
 
 - **Sawer-x86_64.AppImage** bundles the C++ runtime libraries and needs no
   application installation.
 - **Sawer** is the plain executable. SDL and application assets are embedded,
   but compatible system C++ runtime libraries are required.
+- **Sawer-x86_64.flatpak** installs Sawer with desktop and `.sawer` file-type
+  integration, using the Freedesktop 25.08 runtime.
 
 Until Linux assets are published, download the
 `Sawer-<version>-Linux-x86_64` artifact from a successful workflow run and
@@ -60,8 +62,25 @@ build baseline and require a working Vulkan driver. AppImage does not bundle
 graphics drivers. On systems that restrict FUSE mounting, run
 `./Sawer-x86_64.AppImage --appimage-extract-and-run`.
 
+Install the Flatpak bundle with Flatpak already installed:
+
+    flatpak install --user ./Sawer-x86_64.flatpak
+    flatpak run io.sawer.app
+
+Flatpak may download its runtime from Flathub on the first installation. Its
+folder access defaults to Documents. Keep boards there, or allow the containing
+board folder before using other locations:
+
+    flatpak override --user --filesystem=/absolute/path/to/boards io.sawer.app
+
+Sawer's atomic saves, renames, and conflict recovery require access to the
+containing folder. Granting access to just one file through a portal is
+insufficient for these operations. Preferences and disposable caches remain
+inside Flatpak's application data directories.
+
 The workflow runs Debug and Release checks on X11 and Wayland with software
-Vulkan, then checks both downloads on Ubuntu 24.04. CI artifacts do not
+Vulkan, installs and tests the Flatpak bundle on both backends, then checks the
+executable and AppImage downloads on Ubuntu 24.04. CI artifacts do not
 automatically publish a Linux release.
 
 ## Built around the essentials
@@ -93,7 +112,7 @@ automatically publish a Linux release.
 
 - SDL Render fallback, complete device-loss recovery, and broad mixed-DPI
   validation are still in progress.
-- Linux Flatpak packaging and broad distribution/hardware validation remain future milestones.
+- Broad Linux distribution/hardware and Flatpak desktop-portal validation remain future milestones.
 - Pen, touch, text, PDF import, sync, collaboration, and plugins are
   intentionally deferred until after the mouse-first 1.0 release.
 

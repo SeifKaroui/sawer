@@ -440,6 +440,8 @@ if get_option('tests')
   endif
   test('Linux package payload', python, suite: 'headless',
     args: files('tests/tools/LinuxPackageTests.py'))
+  test('Flatpak package payload', python, suite: 'headless',
+    args: files('tests/tools/FlatpakPackageTests.py'))
   test('version command', sawer_executable, suite: 'headless', args: ['--version'])
   test(
     'third-party notices command',

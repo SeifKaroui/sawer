@@ -27,6 +27,7 @@ jobs:
       version: ${{ steps.release.outputs.version }}
     env:
       PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
+      FLATPAK_USER_DIR: ${{ github.workspace }}/.cache/flatpak-user
 
     steps:
       - name: Check out source
@@ -228,12 +229,62 @@ jobs:
             done
           done
 
+      - name: Install Flatpak packaging tools and runtime
+        if: matrix.buildtype == 'release'
+        run: |
+          sudo add-apt-repository --yes ppa:flatpak/stable
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            flatpak=1.18.4-1~flatpak1~22.04.1 \
+            flatpak-builder=1.4.8-1~flatpak1~22.04.1 appstream=0.15.2-2flatpak1
+          runtime="$(python -c 'import json; print(json.load(open("packaging/linux/io.sawer.app.json"))["runtime-version"])')"
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user --noninteractive --arch=x86_64 flathub \
+            "org.freedesktop.Platform//$runtime" "org.freedesktop.Sdk//$runtime" \
+            "org.freedesktop.Platform.GL.default//$runtime"
+          {
+            echo "Freedesktop runtime branch: $runtime"
+            flatpak info --user --arch=x86_64 --show-commit "org.freedesktop.Platform//$runtime"
+            flatpak info --user --arch=x86_64 --show-commit "org.freedesktop.Platform.GL.default//$runtime"
+          } > build/linux-dist/FLATPAK-RUNTIME-Linux-x86_64.txt
+
+      - name: Stage Flatpak desktop integration and release payload
+        if: matrix.buildtype == 'release'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          python tools/package_flatpak.py --appdir build/Sawer.AppDir \
+            --output build/flatpak-source --version "$VERSION" \
+            --release-date "$(git show -s --format=%cs)"
+          desktop-file-validate build/flatpak-source/payload/share/applications/io.sawer.app.desktop
+          appstreamcli validate --no-net \
+            build/flatpak-source/payload/share/metainfo/io.sawer.app.metainfo.xml
+
+      - name: Build installable Flatpak bundle
+        if: matrix.buildtype == 'release'
+        run: |
+          flatpak-builder --user --arch=x86_64 --disable-rofiles-fuse --disable-cache \
+            --state-dir=build/flatpak-state --repo=build/flatpak-repo \
+            build/Sawer.Flatpak build/flatpak-source/io.sawer.app.json
+          flatpak build-bundle --arch=x86_64 \
+            --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
+            build/flatpak-repo build/linux-dist/Sawer-x86_64.flatpak io.sawer.app stable
+
+      - name: Install and test the actual Flatpak download
+        if: matrix.buildtype == 'release'
+        run: |
+          flatpak install --user --noninteractive --bundle build/linux-dist/Sawer-x86_64.flatpak
+          dbus-run-session -- python tools/test_flatpak.py \
+            --executable build/linux-dist/Sawer --graphics --log-dir build/flatpak-logs
+          flatpak info --user --show-permissions io.sawer.app
+
       - name: Create Linux checksums
         if: matrix.buildtype == 'release'
         run: |
           cd build/linux-dist
-          sha256sum Sawer Sawer-x86_64.AppImage THIRD_PARTY_NOTICES-Linux.md \
-            DEPENDENCIES-Linux-x86_64.txt > SHA256SUMS-Linux-x86_64.txt
+          sha256sum Sawer Sawer-x86_64.AppImage Sawer-x86_64.flatpak \
+            THIRD_PARTY_NOTICES-Linux.md DEPENDENCIES-Linux-x86_64.txt \
+            FLATPAK-RUNTIME-Linux-x86_64.txt > SHA256SUMS-Linux-x86_64.txt
           sha256sum --check SHA256SUMS-Linux-x86_64.txt
 
       - name: Upload tested Linux assets
@@ -254,6 +305,7 @@ jobs:
             build/meson-logs/
             build/display-logs/
             build/download-logs/
+            build/flatpak-logs/
           if-no-files-found: ignore
           retention-days: 14
 

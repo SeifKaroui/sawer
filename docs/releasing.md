@@ -90,9 +90,9 @@ git push origin vX.Y.Z
 Tags must match the runtime/source version. Versions below 1.0.0 are
 prereleases. Do not move a published tag; release a new version for fixes.
 Linux archives require compatible system libraries. The Linux pipeline is
-described below; Flatpak remains separate work.
+described below and produces executable, AppImage, and Flatpak downloads.
 
-## Linux executable and AppImage pipeline
+## Linux executable, AppImage, and Flatpak pipeline
 
 `.github/workflows/linux-release.yml` runs on pull requests, manually, and on
 version tags. It builds all Meson targets in Debug and Release on Ubuntu
@@ -119,6 +119,10 @@ Release runs generate the following artifact contents:
 - `Sawer`: the stripped, statically linked SDL executable.
 - `Sawer-x86_64.AppImage`: that exact executable plus compiler runtime
   libraries, launcher, desktop metadata, icon, documentation, and notices.
+- `Sawer-x86_64.flatpak`: an installable bundle of the same executable and
+  compiler runtimes, with desktop, file-type, and application metadata.
+- `FLATPAK-RUNTIME-Linux-x86_64.txt`: the Freedesktop runtime branch and
+  runtime/graphics-extension commits used for the Flatpak checks.
 - `SHA256SUMS-Linux-x86_64.txt`: checksums for the downloads and companion
   dependency/notice reports.
 - `DEPENDENCIES-Linux-x86_64.txt`: the plain executable's shared dependencies.
@@ -152,6 +156,71 @@ Run **Linux release** manually from Actions to generate the
 lose executable permissions; use `chmod +x Sawer Sawer-x86_64.AppImage`.
 These runs generate and validate artifacts only. Linux release publication
 requires a separate authorized step; the existing Windows workflow is unchanged.
+
+## Flatpak packaging and installation
+
+Release jobs reuse the verified AppDir payload through `tools/package_flatpak.py`.
+The generated manifest and payload are staged under `build/flatpak-source/`;
+`flatpak-builder` installs those files into `/app` without compiling Sawer again.
+This preserves the shared GCC 15.2.0 compiler choice. The builder disables
+stripping and debug-info extraction so the executable remains byte-identical.
+Compiler runtime libraries and their licenses are retained. The existing
+application icon supplies the 256px PNG without a separate image dependency.
+
+Packaging uses the official Flatpak stable PPA's pinned Ubuntu 22.04 packages:
+Flatpak 1.18.4, flatpak-builder 1.4.8, and AppStream 0.15.2. The modern builder
+composes application metadata on the host, avoiding obsolete SDK helper tools.
+`packaging/linux/io.sawer.app.json` selects the Freedesktop Platform and SDK
+25.08 branch. Supported runtime updates within that branch are obtained from
+Flathub; their installed commits are recorded with the artifact. The SDK is
+needed only for packaging. The installable bundle points to the official
+Flathub runtime repository and includes the application, rather than an offline
+copy of the complete runtime. See the official
+[single-file bundle documentation](https://docs.flatpak.org/en/latest/single-file-bundles.html).
+
+The workflow installs the actual `.flatpak` file into a disposable per-user
+installation at `.cache/flatpak-user`. It compares the installed executable and
+notices with the release payload, checks the sandboxed version/notices commands,
+and presents frames on X11 and Wayland. Graphics checks select lavapipe from
+inside the runtime; host Vulkan ICD paths are not used by the sandbox. Display
+logs are retained under `build/flatpak-logs/`. Flatpak staging, state, and export
+repositories stay under `build/`; they are packaging outputs, not Meson build
+configurations. There is no Flathub submission or release publication.
+
+After installing Flatpak, users can install and run the artifact with:
+
+    flatpak install --user ./Sawer-x86_64.flatpak
+    flatpak run io.sawer.app
+
+The sandbox allows Wayland, fallback X11, graphics devices, and Documents.
+It grants neither network access nor access to the entire home or host
+filesystem. Documents provides directory access required by atomic compaction,
+rename, and conflict-copy creation. For boards in other locations, users must
+allow the containing folder, for example:
+
+    flatpak override --user --filesystem=/absolute/path/to/boards io.sawer.app
+
+A portal grant for one selected file alone does not permit Sawer's adjacent
+transaction/recovery files. These grants do not change Sawer's behavior: it
+opens requested boards and never scans or manages the containing folder.
+Preferences and previews use the sandbox's application data directories.
+Permission behavior is described in the official
+[sandbox documentation](https://docs.flatpak.org/en/latest/sandbox-permissions.html).
+Desktop file launching, native file chooser portals, removable drives, saving,
+rename, conflict handling, and install/uninstall should also be verified on real
+desktops before a public release.
+
+To rebuild locally after preparing the licensed AppDir payload and installing
+the runtime/SDK as shown in the workflow:
+
+    python tools/package_flatpak.py --appdir build/Sawer.AppDir --output build/flatpak-source --version X.Y.Z --release-date YYYY-MM-DD
+    flatpak-builder --user --arch=x86_64 --disable-rofiles-fuse --disable-cache --state-dir=build/flatpak-state --repo=build/flatpak-repo build/Sawer.Flatpak build/flatpak-source/io.sawer.app.json
+    flatpak build-bundle --arch=x86_64 --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo build/flatpak-repo build/linux-dist/Sawer-x86_64.flatpak io.sawer.app stable
+
+Use a fresh staging/output directory and the source version and commit date.
+After installing the bundle, run the same metadata and presentation checks:
+
+    dbus-run-session -- python tools/test_flatpak.py --executable build/linux-dist/Sawer --graphics
 
 ## Rebuild an AppImage locally
 
