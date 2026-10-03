@@ -57,6 +57,19 @@ Page custom ConfirmPage
 
 Var ConfirmDialog
 
+!macro CheckApplicationWritable
+  ${If} ${FileExists} "$INSTDIR\${APP_EXE_NAME}"
+    ClearErrors
+    FileOpen $0 "$INSTDIR\${APP_EXE_NAME}" a
+    ${If} ${Errors}
+      MessageBox MB_OK|MB_ICONEXCLAMATION "Close Sawer before continuing and check that the installation folder is writable." /SD IDOK
+      SetErrorLevel 2
+      Quit
+    ${EndIf}
+    FileClose $0
+  ${EndIf}
+!macroend
+
 Function .onInit
   ${IfNot} ${RunningX64}
     MessageBox MB_ICONSTOP "Sawer requires 64-bit Windows 10 or Windows 11."
@@ -85,9 +98,16 @@ FunctionEnd
 
 Section "Sawer" SEC_SAWER
   SetShellVarContext current
+  !insertmacro CheckApplicationWritable
   SetOutPath "$INSTDIR"
   SetOverwrite on
+  ClearErrors
   File /oname=${APP_EXE_NAME} "${APP_EXE}"
+  ${If} ${Errors}
+    MessageBox MB_OK|MB_ICONSTOP "Sawer could not be installed. Check that the installation folder is writable." /SD IDOK
+    SetErrorLevel 3
+    Quit
+  ${EndIf}
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
   CreateShortCut "$SMPROGRAMS\Sawer.lnk" "$INSTDIR\${APP_EXE_NAME}" "" "$INSTDIR\${APP_EXE_NAME}" 0
@@ -135,6 +155,7 @@ SectionEnd
 
 Section "Uninstall"
   SetShellVarContext current
+  !insertmacro CheckApplicationWritable
 
   Delete "$DESKTOP\Sawer.lnk"
   Delete "$SMPROGRAMS\Sawer.lnk"

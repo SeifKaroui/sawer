@@ -300,14 +300,28 @@ sawer_executable = executable(
   install_dir: host_machine.system() == 'windows' ? '.' : get_option('bindir'),
 )
 
-install_data(
-  'README.md',
-  'assets/banner.png',
-  'THIRD_PARTY_NOTICES.md',
-  install_dir: host_machine.system() == 'windows'
-    ? '.'
-    : get_option('datadir') / 'doc' / 'Sawer',
+documentation_directory = (
+  host_machine.system() == 'windows'
+  ? '.' : get_option('datadir') / 'doc' / 'Sawer'
 )
+technical_documents = files(
+  'docs/file-format.md',
+  'docs/releasing.md',
+  'docs/board-loading-performance.md',
+  'docs/rendering-performance.md',
+)
+install_data('README.md', 'THIRD_PARTY_NOTICES.md',
+  install_dir: documentation_directory)
+install_data('assets/banner.png',
+  install_dir: documentation_directory / 'assets')
+install_data(technical_documents,
+  install_dir: documentation_directory / 'docs')
+install_data('assets/shaders/README.md',
+  install_dir: documentation_directory / 'assets' / 'shaders')
+install_data('tools/compile_shaders.py',
+  install_dir: documentation_directory / 'tools')
+package_documents = technical_documents + files(
+  'assets/shaders/README.md', 'tools/compile_shaders.py')
 
 package_system = host_machine.system() == 'windows' ? 'Windows' : 'Linux'
 package_cpu = host_machine.cpu_family()
@@ -325,7 +339,7 @@ portable_package = custom_target(
     files('README.md'),
     files('assets/banner.png'),
     files('THIRD_PARTY_NOTICES.md'),
-  ],
+  ] + package_documents,
   output: package_root + package_extension,
   command: [
     python,
@@ -342,7 +356,10 @@ portable_package = custom_target(
     '@OUTPUT@',
     '--root',
     package_root,
-  ],
+    '--source-root',
+    meson.project_source_root(),
+    '--documentation',
+  ] + package_documents,
   build_by_default: false,
 )
 
@@ -402,8 +419,17 @@ if get_option('tests')
 
   test('unit', sawer_tests, timeout: 180)
   test('font fetch recovery', python, args: files('tests/tools/FetchFileTests.py'))
+  test('portable documentation layout', python,
+    args: files('tests/tools/PortablePackageTests.py'))
   test('Unicode file commands', python,
     args: [files('tests/tools/UnicodeFileCommands.py'), sawer_format])
+  if host_machine.system() == 'windows'
+    powershell = find_program('pwsh', 'powershell')
+    test('installer preservation helpers', powershell, args: [
+      '-NoProfile', '-File', files('tests/tools/InstallerPreservationTests.ps1'),
+      '-InstallerScript', files('tools/test_windows_installer.ps1'),
+    ])
+  endif
   test('version command', sawer_executable, args: ['--version'])
   test(
     'third-party notices command',

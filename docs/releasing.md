@@ -1,76 +1,67 @@
-# Releasing Sawer for Windows
+# Windows releases
 
-Sawer publishes two Windows AMD64 choices from the same tested executable:
+The workflow builds `Sawer-Setup.exe` (per-user installer) and
+`Sawer-Portable.exe` from one statically linked executable. Fonts, icons,
+version metadata, and third-party notices are embedded. Tag runs publish
+checksums and build provenance. Binaries are not Authenticode-signed.
 
-    Sawer-Setup.exe
-    Sawer-Portable.exe
+## Build and package
 
-`Sawer-Setup.exe` is the primary download. It performs a per-user installation
-without elevation, creates Start Menu and desktop shortcuts, registers Sawer
-as a `.sawer` handler, and launches Sawer after one Install confirmation.
-`Sawer-Portable.exe` runs directly without installing anything.
+Keep the version consistent in `meson.build`, `src/core/BuildInfo.hpp`, and
+`tests/core/BuildInfoTests.cpp`. Use the single `build/` directory:
 
-Both application forms contain the icon, Windows version metadata, embedded
-fonts, and complete third-party notices. GitHub Releases also carry
-`SHA256SUMS.txt` and a browser-readable copy of `THIRD_PARTY_NOTICES.md`.
+```text
+meson setup build --wipe --buildtype=release -Dsawer_werror=true
+meson compile -C build
+meson test -C build --no-rebuild --num-processes 1 --print-errorlogs
+python tools/check_release.py --source-root . --executable build/Sawer.exe
+meson compile -C build package
+```
 
-## Prepare a release
+Omit `--wipe` for a fresh checkout. Regenerate a changed Windows icon with
+Pillow 12.3.0 and `tools/generate_windows_icon.py`. Archives and Meson
+installation preserve `assets/banner.png`, technical documents under `docs/`,
+and linked shader references.
 
-1. Update the version in `meson.build`, `src/core/BuildInfo.hpp`, and
-   `tests/core/BuildInfoTests.cpp`.
-2. Configure `build/` as a Release build and run the complete local test set.
-3. If `assets/logo.png` changed, regenerate the committed Windows icon:
+CI uses the official NSIS 3.12 ZIP, verified with SHA-256
+`56581f90db321581c5381193d796fffcf2d24b2f8fed2160a6c6a3baa67f2c4f`.
+A running or unwritable application blocks installation/uninstall with exit code 2;
+application extraction failure returns 3. Uninstall preserves boards and
+preferences.
 
-       python -m pip install Pillow==12.3.0
-       python tools/generate_windows_icon.py assets/logo.png assets/windows/Sawer.ico
+## Installer checks
 
-4. Run the `Windows release` workflow manually. It installs the signed NSIS
-   3.12-1 package through the existing MSYS2 environment, rejects any compiler
-   version drift, and creates a tested Actions artifact without publishing a
-   GitHub Release.
-5. Download the artifact and validate both choices on supported Windows 10 and
-   Windows 11 systems.
+`tools/test_windows_installer.ps1` requires a disposable account with no
+existing Sawer registration, shortcuts, preferences, or `.sawer` association.
+It checks executable contents/metadata, shortcut targets and launches, a
+valid Unicode-named board opened through its association, blocked upgrade
+and uninstall while Sawer is running, reinstall, byte preservation of boards
+and preferences, and preservation of another default handler. It closes only
+processes started by the test. `-SkipApplicationLaunch` explicitly skips GUI
+launches on runners without SDL GPU; a held executable handle still tests
+locked-file protection. GUI launches must pass on supported hardware.
 
-For the installer, confirm:
+Pass `-PreviousInstaller` and `-PreviousVersion` for an older-version upgrade.
+The workflow retrieves the most recent lower published version with installer
+and checksum assets. The first release reports that scenario as skipped. A
+previous application does not have to support the current board format.
 
-- Running it requires only the Install confirmation and does not request
-  administrator credentials.
-- Sawer launches after installation and its shortcuts work.
-- Double-clicking a `.sawer` board opens it in Sawer.
-- Running a newer installer upgrades in place.
-- Uninstall removes the application and shortcuts without deleting boards or
-  preferences.
+## Workflow and publication
 
-For the portable version, confirm startup, drawing, save/open, icon display,
-`--version`, and `--third-party-notices`.
+The Windows workflow runs manually and on version tags. Hosted tests cover
+headless unit, asset-fetch, Unicode file commands, portable documentation,
+installer preservation helpers, and version/notices checks. GPU/window/performance checks must also pass
+locally on the exact Release source. Validate Windows 10 and 11 interactively.
 
-## Publish
+A manual branch run creates an unpublished artifact. Matching tags publish
+automatically. After artifact validation:
 
-Create and push an annotated tag that exactly matches Sawer's version:
+```text
+git tag -a vX.Y.Z -m "Sawer X.Y.Z"
+git push origin vX.Y.Z
+```
 
-    git tag -a vX.Y.Z -m "Sawer X.Y.Z"
-    git push origin vX.Y.Z
-
-The tag workflow repeats the clean build and release checks, attests both
-executables, generates release notes, and publishes the installer, portable
-version, checksum manifest, and notices. Versions below 1.0.0 are marked as
-prereleases.
-
-The workflow rejects malformed tags and any disagreement between the tag,
-Meson project version, `BuildInfo`, version test, runtime `--version` output,
-embedded notices, installer version, or Windows executable metadata. It also
-performs silent install, reinstall, and uninstall checks in a Unicode path and
-verifies shortcuts, file registration, and board preservation.
-
-## If publication fails
-
-Do not move or replace a published release tag. Correct the source or workflow,
-increment the version, and publish a new tag. A failed workflow that did not
-create a release can be rerun after correcting an external transient failure.
-
-## Current limitation
-
-Windows releases are not Authenticode-signed. The checksums and GitHub build
-provenance establish integrity and origin, but Windows SmartScreen may still
-warn users. The installer does not use MSIX, the Microsoft Store, or a
-Microsoft developer account.
+Tags must match the runtime/source version. Versions below 1.0.0 are
+prereleases. Do not move a published tag; release a new version for fixes.
+Linux archives require compatible system libraries; AppImage/Flatpak
+packaging and Wayland/X11 validation remain separate work.

@@ -14,3 +14,5 @@
 *.user
 *.suo
 *.log
+__pycache__/
+*.py[cod]

@@ -54,8 +54,27 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-meson
             mingw-w64-ucrt-x86_64-ninja
-            mingw-w64-ucrt-x86_64-nsis
             mingw-w64-ucrt-x86_64-python
+
+      - name: Set up pinned NSIS compiler
+        shell: pwsh
+        run: |
+          $directory = Join-Path $env:RUNNER_TEMP 'nsis-3.12'
+          New-Item -ItemType Directory -Path $directory -Force | Out-Null
+          $archive = Join-Path $directory 'nsis-3.12.zip'
+          Invoke-WebRequest `
+            -Uri 'https://master.dl.sourceforge.net/project/nsis/NSIS%203/3.12/nsis-3.12.zip?viasf=1' `
+            -OutFile $archive
+          $expected = '56581f90db321581c5381193d796fffcf2d24b2f8fed2160a6c6a3baa67f2c4f'
+          if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $expected) {
+            throw 'NSIS archive checksum mismatch'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $directory
+          $compilerDirectory = Join-Path $directory 'nsis-3.12'
+          if ((& (Join-Path $compilerDirectory 'makensis.exe') -VERSION) -ne 'v3.12') {
+            throw 'Unexpected NSIS compiler version'
+          }
+          $compilerDirectory >> $env:GITHUB_PATH
 
       - name: Validate source version
         id: release
@@ -83,6 +102,10 @@ jobs:
         run: >-
           meson test -C build --print-errorlogs
           unit
+          "font fetch recovery"
+          "Unicode file commands"
+          "portable documentation layout"
+          "installer preservation helpers"
           "version command"
           "third-party notices command"
 
@@ -127,11 +150,6 @@ jobs:
         env:
           VERSION: ${{ steps.release.outputs.version }}
         run: |
-          package="$(pacman -Q mingw-w64-ucrt-x86_64-nsis)"
-          if [[ "$package" != "mingw-w64-ucrt-x86_64-nsis 3.12-1" ]]; then
-            echo "Unexpected NSIS package: $package" >&2
-            exit 1
-          fi
           if [[ "$(makensis -VERSION)" != "v3.12" ]]; then
             echo "Unexpected NSIS compiler version" >&2
             exit 1
@@ -146,16 +164,61 @@ jobs:
             "/DOUTPUT_DIR=$output" \
             "$script"
 
+      - name: Retrieve a previous installer for upgrade checks
+        id: previous
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          $releases = & gh api "repos/$env:GH_REPO/releases?per_page=100" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Could not query previous releases" }
+          $eligible = @($releases | Where-Object {
+            -not $_.draft -and $_.tag_name -match '^v[0-9]+\.[0-9]+\.[0-9]+$' -and
+            [version]($_.tag_name.Substring(1)) -lt [version]$env:VERSION -and
+            @($_.assets.name) -contains 'Sawer-Setup.exe' -and
+            @($_.assets.name) -contains 'SHA256SUMS.txt'
+          } | Sort-Object { [version]($_.tag_name.Substring(1)) } -Descending)
+          if ($eligible.Count -eq 0) {
+            Write-Output 'SKIP older-version upgrade: no previous installer release exists'
+            exit 0
+          }
+          $previous = $eligible[0]
+          New-Item -ItemType Directory -Path out/installer-upgrade -Force | Out-Null
+          & gh release download $previous.tag_name --repo $env:GH_REPO `
+            --pattern Sawer-Setup.exe --pattern SHA256SUMS.txt --dir out/installer-upgrade
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the previous installer' }
+          $entry = @(Get-Content out/installer-upgrade/SHA256SUMS.txt | Where-Object {
+            $_ -match '^[0-9a-fA-F]{64}  Sawer-Setup\.exe$'
+          })
+          if ($entry.Count -ne 1) { throw 'Previous installer checksum is missing or ambiguous' }
+          $expected = $entry[0].Substring(0, 64)
+          $actual = (Get-FileHash out/installer-upgrade/Sawer-Setup.exe -Algorithm SHA256).Hash
+          if ($actual -ne $expected) { throw 'Previous installer checksum mismatch' }
+          "installer=$((Resolve-Path out/installer-upgrade/Sawer-Setup.exe).Path)" >> $env:GITHUB_OUTPUT
+          "version=$($previous.tag_name.Substring(1))" >> $env:GITHUB_OUTPUT
+
       - name: Test install, upgrade, and uninstall
         shell: pwsh
         env:
           VERSION: ${{ steps.release.outputs.version }}
-        run: >-
-          ./tools/test_windows_installer.ps1
-          -Installer dist/Sawer-Setup.exe
-          -PortableExecutable dist/Sawer-Portable.exe
-          -Version $env:VERSION
-          -SourceRoot .
+          PREVIOUS_INSTALLER: ${{ steps.previous.outputs.installer }}
+          PREVIOUS_VERSION: ${{ steps.previous.outputs.version }}
+        run: |
+          $arguments = @{
+            Installer = 'dist/Sawer-Setup.exe'
+            PortableExecutable = 'dist/Sawer-Portable.exe'
+            Version = $env:VERSION
+            SourceRoot = '.'
+            BoardValidator = 'build/sawer-format.exe'
+          }
+          if ($env:PREVIOUS_INSTALLER) {
+            $arguments.PreviousInstaller = $env:PREVIOUS_INSTALLER
+            $arguments.PreviousVersion = $env:PREVIOUS_VERSION
+          }
+          $arguments.DetectApplicationLaunchSupport = $true
+          ./tools/test_windows_installer.ps1 @arguments
 
       - name: Create release checksums
         shell: pwsh
