@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import io
+import os
 import tempfile
 import unittest
 import urllib.error
@@ -50,7 +51,7 @@ class FetchFileTests(unittest.TestCase):
             self.assertEqual(self.fetch(), 0)
         self.assertEqual(network.call_count, 2)
         self.assertEqual(self.output.read_bytes(), self.font)
-        self.assertEqual(list(self.output.parent.iterdir()), [self.output])
+        self.assertEqual(os.listdir(self.output.parent), [self.output.name])
 
     def test_repeated_interruption_leaves_no_partial_font(self):
         with patch.object(fetch_file.urllib.request, "urlopen", side_effect=[
@@ -59,7 +60,7 @@ class FetchFileTests(unittest.TestCase):
             with self.assertRaises(urllib.error.ContentTooShortError):
                 self.fetch()
         self.assertEqual(network.call_count, 3)
-        self.assertEqual(list(self.output.parent.iterdir()), [])
+        self.assertEqual(os.listdir(self.output.parent), [])
 
     def test_wrong_archive_member_hash_preserves_existing_output(self):
         self.output.write_bytes(b"existing output")
@@ -71,7 +72,7 @@ class FetchFileTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "wrong SHA-256"):
                 self.fetch("font.ttf")
         self.assertEqual(self.output.read_bytes(), b"existing output")
-        self.assertEqual(list(self.output.parent.iterdir()), [self.output])
+        self.assertEqual(os.listdir(self.output.parent), [self.output.name])
 
     def test_valid_output_can_rebuild_without_network(self):
         self.output.write_bytes(self.font)
