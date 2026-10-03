@@ -110,15 +110,28 @@ function Close-TestApplication([System.Diagnostics.Process]$Process) {
     }
     Assert-Condition ($Process.ExitCode -eq 0) "Sawer failed during shutdown"
 }
+function Assert-Shortcut([string]$Shortcut, [string]$Executable) {
+    Assert-Condition (Test-Path -LiteralPath $Shortcut -PathType Leaf) "Shortcut is missing: $Shortcut"
+    # WScript.Shell reads ANSI targets and corrupts paths outside the system code page.
+    $shell = New-Object -ComObject Shell.Application
+    $fullPath = [IO.Path]::GetFullPath($Shortcut)
+    $folder = $shell.Namespace([IO.Path]::GetDirectoryName($fullPath))
+    Assert-Condition ($null -ne $folder) "Shortcut directory could not be read: $Shortcut"
+    $item = $folder.ParseName([IO.Path]::GetFileName($fullPath))
+    Assert-Condition ($null -ne $item) "Shortcut could not be read: $Shortcut"
+    $link = $item.GetLink
+    $target = $link.Path
+    Assert-Condition (-not [string]::IsNullOrEmpty($target)) "Shortcut target is empty: $Shortcut"
+    Assert-Condition ([string]::Equals(
+        [IO.Path]::GetFullPath($target), [IO.Path]::GetFullPath($Executable),
+        [StringComparison]::OrdinalIgnoreCase)) "Shortcut targets a different application: $Shortcut; actual '$target', expected '$Executable'"
+    Assert-Condition ([string]::IsNullOrEmpty($link.Arguments)) "Shortcut contains unexpected arguments: $Shortcut"
+}
 function Assert-Installed {
     Assert-Condition ((Get-FileHash -LiteralPath $installedExecutable -Algorithm SHA256).Hash -eq $portableHash) "Installed executable differs from the portable asset"
     Assert-Condition ((Get-Item -LiteralPath $installedExecutable).VersionInfo.ProductVersion -eq $Version) "Installed application version is wrong"
-    $shell = New-Object -ComObject WScript.Shell
     foreach ($shortcut in @($desktopShortcut, $startMenuShortcut)) {
-        Assert-Condition (Test-Path -LiteralPath $shortcut) "Shortcut is missing: $shortcut"
-        $link = $shell.CreateShortcut($shortcut)
-        Assert-Condition ($link.TargetPath -eq $installedExecutable) "Shortcut targets a different application"
-        Assert-Condition ([string]::IsNullOrEmpty($link.Arguments)) "Shortcut contains unexpected arguments"
+        Assert-Shortcut $shortcut $installedExecutable
     }
     $expected = '"' + $installedExecutable + '" "%1"'
     Assert-Condition ((Get-DefaultRegistryValue "Software\Classes\Sawer.Board\shell\open\command") -eq $expected) "The association command is not quoted correctly"

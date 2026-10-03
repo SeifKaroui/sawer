@@ -7,7 +7,7 @@ $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile(
     (Resolve-Path -LiteralPath $InstallerScript).Path, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors.Message -join [Environment]::NewLine) }
-$names = @('Assert-Condition', 'Get-PreferenceHashes', 'Assert-Preserved', 'Invoke-CheckedProcess')
+$names = @('Assert-Condition', 'Get-PreferenceHashes', 'Assert-Preserved', 'Invoke-CheckedProcess', 'Assert-Shortcut')
 foreach ($definition in $ast.FindAll({param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst]
 }, $false)) {
@@ -47,6 +47,29 @@ try {
     Assert-Rejected {
         Invoke-CheckedProcess $helper @('-NoProfile', '-Command', '"exit 2"')
     } '*exited with 2, expected 0'
+    # Build a real Shell link with a Unicode target and filename, without installing Sawer.
+    $unicodeDirectory = Join-Path $testRoot "$([char]0x753b)$([char]0x677f) shortcuts"
+    New-Item -ItemType Directory -Path $unicodeDirectory | Out-Null
+    $targetExecutable = Join-Path $unicodeDirectory 'Sawer.exe'
+    Copy-Item -LiteralPath $helper -Destination $targetExecutable
+    $seedPath = Join-Path $testRoot 'seed.lnk'
+    $wscript = New-Object -ComObject WScript.Shell
+    $seed = $wscript.CreateShortcut($seedPath)
+    $seed.TargetPath = $helper
+    $seed.Save()
+    $shell = New-Object -ComObject Shell.Application
+    $link = $shell.Namespace($testRoot).ParseName('seed.lnk').GetLink
+    $link.Path = $targetExecutable
+    $link.Arguments = ''
+    $shortcutPath = Join-Path $unicodeDirectory "$([char]0x753b)$([char]0x677f).lnk"
+    $link.Save($shortcutPath)
+    Assert-Shortcut $shortcutPath $targetExecutable
+    Assert-Shortcut $shortcutPath ($targetExecutable.Replace('\', '/').ToUpperInvariant())
+    Assert-Rejected { Assert-Shortcut $shortcutPath $helper } 'Shortcut targets a different application:*'
+    $link.Arguments = '--unexpected'
+    $link.Save($shortcutPath)
+    Assert-Rejected { Assert-Shortcut $shortcutPath $targetExecutable } 'Shortcut contains unexpected arguments:*'
+    Assert-Rejected { Assert-Shortcut (Join-Path $unicodeDirectory 'missing.lnk') $targetExecutable } 'Shortcut is missing:*'
     # Execute the workflow's actual download block with simulated transfers.
     $sourceRoot = Split-Path (Split-Path (Resolve-Path -LiteralPath $InstallerScript).Path -Parent) -Parent
     $workflow = Get-Content (Join-Path $sourceRoot '.github/workflows/windows-release.yml') -Raw
@@ -87,7 +110,7 @@ try {
         $env:NSIS_CACHE_DIR = $previousNsisCache
         Remove-Item Function:\curl.exe
     }
-    Write-Output 'Installer preservation, exit-code, HTTPS fallback, cache and checksum regression checks passed'
+    Write-Output 'Installer preservation, Unicode shortcuts, exit-code, HTTPS fallback, cache and checksum regression checks passed'
 } finally {
     $resolved = [IO.Path]::GetFullPath($testRoot)
     if (-not $resolved.StartsWith($temporaryRoot.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
