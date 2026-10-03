@@ -438,6 +438,8 @@ if get_option('tests')
       '-InstallerScript', files('tools/test_windows_installer.ps1'),
     ])
   endif
+  test('Linux display command cleanup', python, suite: 'headless',
+      args: files('tests/tools/LinuxDisplayTests.py'))
   test('Linux package payload', python, suite: 'headless',
     args: files('tests/tools/LinuxPackageTests.py'))
   test('Flatpak package payload', python, suite: 'headless',

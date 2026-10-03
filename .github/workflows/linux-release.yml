@@ -121,14 +121,14 @@ jobs:
       - name: Test X11 with software Vulkan
         run: >-
           dbus-run-session -- python tools/test_linux_display.py
-          --log-dir build/display-logs x11 --
+          --timeout 900 --log-dir build/display-logs x11 --
           meson test -C build --no-rebuild --suite graphics
           --num-processes 1 --timeout-multiplier 3 --print-errorlogs
 
       - name: Test Wayland with software Vulkan
         run: >-
           dbus-run-session -- python tools/test_linux_display.py
-          --log-dir build/display-logs wayland --
+          --timeout 900 --log-dir build/display-logs wayland --
           meson test -C build --no-rebuild --suite graphics
           --num-processes 1 --timeout-multiplier 3 --print-errorlogs
 
@@ -224,7 +224,7 @@ jobs:
           for backend in x11 wayland; do
             for executable in Sawer Sawer-x86_64.AppImage; do
               dbus-run-session -- python tools/test_linux_display.py \
-                --log-dir "build/download-logs/$executable" "$backend" -- \
+                --timeout 120 --log-dir "build/download-logs/$executable" "$backend" -- \
                 "$PWD/build/linux-dist/$executable" --render-test
             done
           done
@@ -310,10 +310,19 @@ jobs:
           retention-days: 14
 
   compatibility:
-    name: Check downloads on Ubuntu 24.04
+    name: Ubuntu 24.04 (${{ matrix.executable }}, ${{ matrix.backend }})
     needs: linux-x64
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        executable: [Sawer, Sawer-x86_64.AppImage]
+        backend: [x11, wayland]
+    env:
+      EXECUTABLE: ${{ matrix.executable }}
+      BACKEND: ${{ matrix.backend }}
+      APPIMAGE_EXTRACT_AND_RUN: "1"
     steps:
       - name: Check out source
         uses: actions/checkout@v6.0.2
@@ -334,40 +343,36 @@ jobs:
             dbus-x11 xvfb x11-utils openbox weston
 
       - name: Check bundled runtime on the stock system
-        env:
-          APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
           (cd build/linux-dist && sha256sum --check SHA256SUMS-Linux-x86_64.txt)
           chmod +x build/linux-dist/Sawer-x86_64.AppImage
           python3 tools/check_release.py --source-root . --executable build/linux-dist/Sawer-x86_64.AppImage
 
       - name: Install C++ runtime for the standalone executable
+        if: matrix.executable == 'Sawer'
         run: |
           repository="$(python3 -c 'import json; print(json.load(open("tools/gcc-toolchain.json"))["linux"]["repository"])')"
           sudo add-apt-repository --yes "$repository"
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y libstdc++6 libgcc-s1
 
-      - name: Verify checksums, versions, and graphics
-        env:
-          APPIMAGE_EXTRACT_AND_RUN: "1"
+      - name: Verify download version and notices
         run: |
-          (cd build/linux-dist && sha256sum --check SHA256SUMS-Linux-x86_64.txt)
-          chmod +x build/linux-dist/Sawer build/linux-dist/Sawer-x86_64.AppImage
-          for executable in Sawer Sawer-x86_64.AppImage; do
-            python3 tools/check_release.py --source-root . --executable "build/linux-dist/$executable"
-            for backend in x11 wayland; do
-              dbus-run-session -- python3 tools/test_linux_display.py \
-                --log-dir "build/download-logs/$executable" "$backend" -- \
-                "$PWD/build/linux-dist/$executable" --render-test
-            done
-          done
+          chmod +x "build/linux-dist/$EXECUTABLE"
+          python3 tools/check_release.py --source-root . --executable "build/linux-dist/$EXECUTABLE"
+
+      - name: Test download graphics
+        timeout-minutes: 4
+        run: |
+          dbus-run-session -- python3 tools/test_linux_display.py \
+            --timeout 120 --log-dir build/download-logs "$BACKEND" -- \
+            "$PWD/build/linux-dist/$EXECUTABLE" --render-test
 
       - name: Upload compatibility logs
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: Linux-compatibility-logs
+          name: Linux-compatibility-${{ matrix.executable }}-${{ matrix.backend }}-logs
           path: build/download-logs/
           if-no-files-found: ignore
           retention-days: 14

@@ -107,6 +107,10 @@ font-fetch recovery, package contents, versions, and embedded notices. The
 the requested SDL backend and Mesa lavapipe Vulkan. Isolated XDG directories
 keep test preferences away from the runner account. Backend processes are
 terminated on success and failure; readiness and command waits are bounded.
+Each download/Flatpak command has a 120-second deadline; full graphics suites
+allow 900 seconds. Timeout cleanup stops the command's process group, including
+launcher children. Logs include command output, display diagnostics, application
+logs from the isolated preferences, and process/thread wait locations on timeout.
 Build and display logs are retained even when checks fail.
 
 Software rendering exercises correctness, including pixel checks, resize,
@@ -147,9 +151,11 @@ rather than requiring a FUSE mount in CI.
 Payload extraction verifies that the application matches the plain download
 byte for byte and that executable modes, metadata, and notices survived
 packaging. Both downloads run version/notices checks and present frames under
-X11 and Wayland. A separate Ubuntu 24.04 job downloads the actual CI artifact,
-checks its checksums, restores executable permissions, and repeats startup and
-presentation checks for both files.
+X11 and Wayland. Four independent Ubuntu 24.04 jobs download the actual CI
+artifact, check its checksums, restore executable permissions, and repeat startup
+and presentation checks for each file/backend pair. A failure does not cancel the
+other checks. AppImage graphics run on the stock distribution runtime; only the
+standalone executable jobs install the newer system C++ runtime.
 
 Run **Linux release** manually from Actions to generate the
 `Sawer-<version>-Linux-x86_64` artifact. Artifact ZIPs and browser downloads may
