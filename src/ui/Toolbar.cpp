@@ -1059,7 +1059,8 @@ void Toolbar::update(
         .action = UiAction::rename_board,
         .bounds = status_bounds,
         .label = {},
-        .tooltip = filename_editing_ ? std::string{} : filename_,
+        .tooltip = filename_editing_ ? std::string_view{}
+                                     : std::string_view{filename_},
         .icon = UiIcon::none,
         .enabled = !loading_,
         .selected = false,

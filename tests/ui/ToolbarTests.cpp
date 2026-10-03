@@ -278,6 +278,8 @@ TEST_CASE("document header preserves full Unicode names in its delayed tooltip")
                 false, false, 1.0, name, false, {}, sawer::BackgroundStyle::dot, {});
             const auto* rename = toolbar.find(sawer::UiAction::rename_board);
             REQUIRE(rename != nullptr);
+            REQUIRE(static_cast<const void*>(rename->tooltip.data())
+                == static_cast<const void*>(toolbar.filename().data()));
             REQUIRE(rename->tooltip == name);
             const auto file = toolbar.find(sawer::UiAction::file_menu)->bounds;
             REQUIRE(rename->bounds.x - file.x - file.width == Catch::Approx(16.0 * toolbar.scale()));
@@ -292,6 +294,26 @@ TEST_CASE("document header preserves full Unicode names in its delayed tooltip")
             REQUIRE(toolbar.pointer_up(point) == sawer::UiAction::rename_board);
             REQUIRE(toolbar.tooltip_control() == nullptr);
         }
+    }
+}
+
+TEST_CASE("document tooltip retains owned storage across rename updates")
+{
+    sawer::Toolbar toolbar;
+    for (const std::string_view name : {
+             "A.sawer",
+             "Résumé — مخطط — 計画 — a long portable board filename.sawer",
+             "Renamed.sawer"}) {
+        toolbar.update(1280.0, 720.0, 1.0, sawer::Tool::pencil, {}, false,
+            false, false, 1.0, std::string{name}, false, {},
+            sawer::BackgroundStyle::dot, {});
+        const auto* rename = toolbar.find(sawer::UiAction::rename_board);
+        REQUIRE(rename != nullptr);
+        REQUIRE(static_cast<const void*>(rename->tooltip.data())
+            == static_cast<const void*>(toolbar.filename().data()));
+        REQUIRE(rename->tooltip == name);
+        for (int tick = 0; tick < 5; ++tick) toolbar.tick(0.1);
+        REQUIRE(rename->tooltip == name);
     }
 }
 
