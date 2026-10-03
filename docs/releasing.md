@@ -47,6 +47,8 @@ and preferences, and preservation of another default handler. It closes only
 processes started by the test. `-SkipApplicationLaunch` explicitly skips GUI
 launches on runners without SDL GPU; a held executable handle still tests
 locked-file protection. GUI launches must pass on supported hardware.
+Preservation hashes exclude the active diagnostic `Sawer.log` and disposable
+`previews/` cache; settings and other user files remain checked.
 
 Pass `-PreviousInstaller` and `-PreviousVersion` for an older-version upgrade.
 The workflow retrieves the most recent lower published version with installer

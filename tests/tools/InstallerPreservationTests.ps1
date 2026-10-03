@@ -34,6 +34,35 @@ try {
     $before = Get-PreferenceHashes
     Assert-Condition ($before.Count -eq 1) 'Unicode preference file was omitted'
     Assert-Preserved $before
+    $previewDirectory = Join-Path $preferencesRoot 'previews'
+    New-Item -ItemType Directory -Path $previewDirectory | Out-Null
+    $preview = Join-Path $previewDirectory 'board-preview.cache'
+    [IO.File]::WriteAllBytes($preview, [byte[]]@(1, 2))
+    $logLock = [IO.File]::Open((Join-Path $preferencesRoot 'Sawer.log'),
+        [IO.FileMode]::Create, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        $snapshot = Get-PreferenceHashes
+        Assert-Condition ($snapshot.Count -eq 1) 'Runtime log or disposable previews were included in preference hashes'
+        $logLock.WriteByte(42)
+        [IO.File]::WriteAllBytes($preview, [byte[]]@(3, 4))
+        Assert-Preserved $snapshot
+        # Similar directory and file names must still be protected as user data.
+        $nestedDirectory = Join-Path $preferencesRoot 'previews-backup'
+        New-Item -ItemType Directory -Path $nestedDirectory | Out-Null
+        $nestedPreference = Join-Path $nestedDirectory 'Sawer.log'
+        [IO.File]::WriteAllBytes($nestedPreference, [byte[]]@(5, 6))
+        $nestedSnapshot = Get-PreferenceHashes
+        Assert-Condition ($nestedSnapshot.Count -eq 2 -and $nestedSnapshot.ContainsKey($nestedPreference)) 'Exclusions hid unrelated nested user data'
+        [IO.File]::WriteAllBytes($nestedPreference, [byte[]]@(7, 8))
+        Assert-Rejected { Assert-Preserved $nestedSnapshot } 'Preferences changed:*'
+    } finally { $logLock.Dispose() }
+    $preferenceLock = [IO.File]::Open($preference, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::None)
+    try {
+        $lockedPreferenceRejected = $false
+        try { Get-PreferenceHashes | Out-Null } catch { $lockedPreferenceRejected = $true }
+        Assert-Condition $lockedPreferenceRejected 'An unreadable user preference was silently skipped'
+    } finally { $preferenceLock.Dispose() }
     [IO.File]::WriteAllBytes($preference, [byte[]]@(5, 6, 7, 9))
     Assert-Rejected { Assert-Preserved $before } 'Preferences changed:*'
     [IO.File]::WriteAllBytes($preference, [byte[]]@(5, 6, 7, 8))

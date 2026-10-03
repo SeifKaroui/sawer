@@ -69,8 +69,16 @@ function Get-DesktopDirectory {
 }
 function Get-PreferenceHashes {
     $hashes = @{}
-    foreach ($file in Get-ChildItem -LiteralPath $preferencesRoot -File -Recurse) {
-        $hashes[$file.FullName] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+    foreach ($entry in Get-ChildItem -LiteralPath $preferencesRoot) {
+        # The running app owns its log and disposable preview cache, not user preferences.
+        if ($entry.PSIsContainer -and $entry.Name -eq 'previews') { continue }
+        if (-not $entry.PSIsContainer -and $entry.Name -eq 'Sawer.log') { continue }
+        $files = if ($entry.PSIsContainer) {
+            Get-ChildItem -LiteralPath $entry.FullName -File -Recurse
+        } else { $entry }
+        foreach ($file in $files) {
+            $hashes[$file.FullName] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+        }
     }
     return $hashes
 }
