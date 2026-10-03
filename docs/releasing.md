@@ -5,6 +5,23 @@ The workflow builds `Sawer-Setup.exe` (per-user installer) and
 version metadata, and third-party notices are embedded. Tag runs publish
 checksums and build provenance. Binaries are not Authenticode-signed.
 
+## Shared CI compiler
+
+Windows and Linux use GCC **15.2.0**, selected by `tools/gcc-toolchain.json`.
+Linux installs the exact Ubuntu 22.04 compiler package from the Ubuntu
+Toolchain PPA. Windows downloads the complete WinLibs UCRT/POSIX toolchain,
+verifies its SHA-256, and selects its compiler and binutils ahead of MSYS2
+build tools. MSYS2 continues to provide the shell and build dependencies.
+Both workflows check the C and C++ compiler versions and x86_64 target,
+then compile `BoardPath.cpp` to verify its C++20 `clock_cast` support before
+building dependencies. Cached Windows toolchains undergo these checks too.
+
+The Linux executable requires a compatible system C++ runtime; the Ubuntu
+24.04 compatibility job installs it from the same PPA. The AppImage bundles
+its compiler runtime and first passes a version/notices check on stock Ubuntu
+24.04 before that installation. Updating CI compilers requires changing the
+shared pin, Linux package revision, and Windows archive URL/checksum together.
+
 ## Build and package
 
 Keep the version consistent in `meson.build`, `src/core/BuildInfo.hpp`, and
@@ -79,7 +96,7 @@ described below; Flatpak remains separate work.
 
 `.github/workflows/linux-release.yml` runs on pull requests, manually, and on
 version tags. It builds all Meson targets in Debug and Release on Ubuntu
-22.04 x86_64, using GCC 12, Meson 1.11.2, and CMake 3.31.6. Each job uses only
+22.04 x86_64, using GCC 15.2.0, Meson 1.11.2, and CMake 3.31.6. Each job uses only
 `build/`; Release wipes that directory after the initial Debug configuration.
 Dependencies and fonts retain the existing version/hash pins and download
 caches. Both SDL display backends and Vulkan are enabled explicitly.

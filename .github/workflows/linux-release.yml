@@ -26,8 +26,6 @@ jobs:
     outputs:
       version: ${{ steps.release.outputs.version }}
     env:
-      CC: gcc-12
-      CXX: g++-12
       PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
 
     steps:
@@ -51,11 +49,16 @@ jobs:
         with:
           python-version: "3.14"
 
+      - name: Select shared GCC release
+        run: python tools/ci_gcc.py environment linux --github-env "$GITHUB_ENV"
+
       - name: Install Linux build and display dependencies
         run: |
+          sudo add-apt-repository --yes "$GCC_REPOSITORY"
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
-            build-essential gcc-12 g++-12 ninja-build pkg-config \
+            build-essential "gcc-$GCC_MAJOR=$GCC_PACKAGE_VERSION" \
+            "g++-$GCC_MAJOR=$GCC_PACKAGE_VERSION" ninja-build pkg-config \
             libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev \
             libxi-dev libxss-dev libxtst-dev libxkbcommon-dev \
             libwayland-dev libdecor-0-dev libdrm-dev libgbm-dev \
@@ -65,6 +68,9 @@ jobs:
             dbus-x11 xvfb x11-utils openbox weston desktop-file-utils
           python -m pip install --disable-pip-version-check \
             --only-binary=:all: -r tools/linux-ci-requirements.txt
+
+      - name: Verify compiler version and C++20 support
+        run: python tools/ci_gcc.py check
 
       - name: Validate source version
         id: release
@@ -166,14 +172,14 @@ jobs:
           ldd build/linux-dist/Sawer > build/linux-dist/DEPENDENCIES-Linux-x86_64.txt
           python tools/package_linux.py --executable build/linux-dist/Sawer --appdir build/Sawer.AppDir
           desktop-file-validate build/Sawer.AppDir/io.sawer.app.desktop
-          cp --dereference /usr/share/doc/gcc-12-base/copyright \
+          cp --dereference /usr/share/doc/libstdc++6/copyright \
             build/Sawer.AppDir/usr/share/doc/Sawer/GCC-runtime-copyright.txt
           cp /usr/share/common-licenses/GPL-3 \
             build/Sawer.AppDir/usr/share/doc/Sawer/GNU-GPL-3.txt
           cp /usr/share/common-licenses/LGPL-2.1 \
             build/Sawer.AppDir/usr/share/doc/Sawer/GNU-LGPL-2.1.txt
           cat THIRD_PARTY_NOTICES.md packaging/linux/AppImage-runtime-LICENSE.txt \
-            /usr/share/doc/gcc-12-base/copyright /usr/share/common-licenses/GPL-3 \
+            /usr/share/doc/libstdc++6/copyright /usr/share/common-licenses/GPL-3 \
             /usr/share/common-licenses/LGPL-2.1 \
             > build/linux-dist/THIRD_PARTY_NOTICES-Linux.md
 
@@ -274,6 +280,21 @@ jobs:
           sudo apt-get install --no-install-recommends -y \
             mesa-vulkan-drivers libvulkan1 libdecor-0-0 \
             dbus-x11 xvfb x11-utils openbox weston
+
+      - name: Check bundled runtime on the stock system
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          (cd build/linux-dist && sha256sum --check SHA256SUMS-Linux-x86_64.txt)
+          chmod +x build/linux-dist/Sawer-x86_64.AppImage
+          python3 tools/check_release.py --source-root . --executable build/linux-dist/Sawer-x86_64.AppImage
+
+      - name: Install C++ runtime for the standalone executable
+        run: |
+          repository="$(python3 -c 'import json; print(json.load(open("tools/gcc-toolchain.json"))["linux"]["repository"])')"
+          sudo add-apt-repository --yes "$repository"
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libstdc++6 libgcc-s1
 
       - name: Verify checksums, versions, and graphics
         env:

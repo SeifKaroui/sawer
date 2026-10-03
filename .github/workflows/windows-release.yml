@@ -53,6 +53,38 @@ jobs:
         with:
           python-version: "3.14"
 
+      - name: Select shared GCC release
+        shell: pwsh
+        run: python tools/ci_gcc.py environment windows --github-env $env:GITHUB_ENV
+
+      - name: Restore pinned GCC toolchain
+        id: gcc-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .cache/toolchains
+          key: Windows-gcc-${{ hashFiles('tools/gcc-toolchain.json') }}
+
+      - name: Set up checksum-verified GCC toolchain
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:GCC_TOOLCHAIN_DIR 'winlibs.zip'
+          python tools/fetch_file.py --url $env:GCC_ARCHIVE_URL `
+            --sha256 $env:GCC_ARCHIVE_SHA256 --output $archive
+          if ($LASTEXITCODE -ne 0) { throw 'GCC toolchain download verification failed' }
+          if ('${{ steps.gcc-cache.outputs.cache-hit }}' -ne 'true') {
+            Expand-Archive -LiteralPath $archive -DestinationPath $env:GCC_TOOLCHAIN_DIR -Force
+          }
+          $env:PATH = "$env:GCC_TOOLCHAIN_BIN;$env:PATH"
+          python tools/ci_gcc.py check
+          if ($LASTEXITCODE -ne 0) { throw 'GCC toolchain verification failed' }
+
+      - name: Save verified GCC toolchain
+        if: steps.gcc-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6.1.0
+        with:
+          path: .cache/toolchains
+          key: ${{ steps.gcc-cache.outputs.cache-primary-key }}
+
       - name: Validate Windows icon
         shell: pwsh
         run: |
@@ -71,7 +103,6 @@ jobs:
           cache: true
           install: >-
             mingw-w64-ucrt-x86_64-cmake
-            mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-meson
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-python
@@ -141,13 +172,17 @@ jobs:
 
       - name: Configure Release build
         shell: msys2 {0}
-        run: >-
-          meson setup build --buildtype=release -Dsawer_werror=true
-          -Dfont_cache_dir="$PWD/.cache/fonts"
+        run: |
+          export PATH="$(cygpath -u "$GCC_TOOLCHAIN_BIN"):$PATH"
+          python tools/ci_gcc.py check
+          meson setup build --buildtype=release -Dsawer_werror=true \
+            -Dfont_cache_dir="$PWD/.cache/fonts"
 
       - name: Build Sawer and tests
         shell: msys2 {0}
-        run: meson compile -C build
+        run: |
+          export PATH="$(cygpath -u "$GCC_TOOLCHAIN_BIN"):$PATH"
+          meson compile -C build
 
       - name: Retain verified fonts
         shell: msys2 {0}
@@ -167,19 +202,14 @@ jobs:
 
       - name: Run release-safe tests
         shell: msys2 {0}
-        run: >-
-          meson test -C build --print-errorlogs
-          unit
-          "font fetch recovery"
-          "Unicode file commands"
-          "portable documentation layout"
-          "installer preservation helpers"
-          "version command"
-          "third-party notices command"
+        run: |
+          export PATH="$(cygpath -u "$GCC_TOOLCHAIN_BIN"):$PATH"
+          meson test -C build --print-errorlogs --suite headless
 
       - name: Prepare portable asset
         shell: msys2 {0}
         run: |
+          export PATH="$(cygpath -u "$GCC_TOOLCHAIN_BIN"):$PATH"
           mkdir -p dist
           asset="Sawer-Portable.exe"
           cp build/Sawer.exe "dist/$asset"

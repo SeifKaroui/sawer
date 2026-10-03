@@ -424,6 +424,7 @@ if get_option('tests')
     override_options: sawer_target_options,
   )
 
+  test('CI GCC toolchain', python, suite: 'headless', args: files('tests/tools/GccToolchainTests.py'))
   test('unit', sawer_tests, timeout: 180, suite: 'headless')
   test('font fetch recovery', python, suite: 'headless', args: files('tests/tools/FetchFileTests.py'))
   test('portable documentation layout', python, suite: 'headless',

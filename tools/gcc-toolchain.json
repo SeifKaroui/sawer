@@ -1,0 +1,12 @@
+{
+  "gcc_version": "15.2.0",
+  "linux": {
+    "repository": "ppa:ubuntu-toolchain-r/test",
+    "major": "15",
+    "package_version": "15.2.0-15ubuntu1~22~ppa2"
+  },
+  "windows": {
+    "url": "https://github.com/brechtsanders/winlibs_mingw/releases/download/15.2.0posix-13.0.0-ucrt-r4/winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-13.0.0-r4.zip",
+    "sha256": "cd140e153bf303703f9dce27a4b7d0a8dcb2a41c39b7fffa477a12a8bd049bca"
+  }
+}
