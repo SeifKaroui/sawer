@@ -23,22 +23,30 @@ organize ideas on a large canvas, with each board saved as one portable
 
 ## Download
 
-Find downloads in the [v0.9.0 release](https://github.com/SeifKaroui/sawer/releases/tag/v0.9.0).
-Both platforms target x64.
+Open the [v0.9.0 release page](https://github.com/SeifKaroui/sawer/releases/tag/v0.9.0)
+and expand **Assets** to find the files below. Choose one package for your
+platform; all downloads target x64.
 
 <details>
 <summary><strong>Windows</strong></summary>
 
 ### Setup installer (recommended)
 
-Download **sawer-v0.9.0-windows-x64-setup.exe**, run it, and choose **Install**. It installs for
-your Windows account without administrator access, adds shortcuts, and
-registers `.sawer` files so boards open directly from File Explorer.
+1. Download **sawer-v0.9.0-windows-x64-setup.exe** from the
+   [release page](https://github.com/SeifKaroui/sawer/releases/tag/v0.9.0).
+2. Open the downloaded file and choose **Install**.
+3. Launch **Sawer** from the Start menu or desktop shortcut.
+
+Setup installs for your Windows account without administrator access and
+lets you open `.sawer` boards directly from File Explorer.
 
 ### Portable executable
 
-Download **sawer-v0.9.0-windows-x64-portable.exe** and run it from any folder. No installation or
-companion files are needed.
+1. Download **sawer-v0.9.0-windows-x64-portable.exe** from the
+   [release page](https://github.com/SeifKaroui/sawer/releases/tag/v0.9.0).
+2. Move it to any folder and double-click it to launch Sawer.
+
+No installation or companion files are needed.
 
 Release checksums are in `sawer-v0.9.0-windows-x64-sha256sums.txt`. Windows downloads are not yet
 code-signed, so SmartScreen may show a warning.
@@ -48,41 +56,57 @@ code-signed, so SmartScreen may show a warning.
 <details>
 <summary><strong>Linux</strong></summary>
 
-### Standalone binary (recommended)
+### Flatpak (recommended)
 
-Download **sawer-v0.9.0-linux-x64**, make it executable, and launch it:
-
-```sh
-chmod +x sawer-v0.9.0-linux-x64
-./sawer-v0.9.0-linux-x64
-```
-
-SDL and application assets are embedded. A glibc-based distribution,
-compatible system C++ runtime libraries, and a working Vulkan driver are required.
-
-### AppImage
-
-**sawer-v0.9.0-linux-x64.AppImage** bundles the C++ runtime libraries:
-
-```sh
-chmod +x sawer-v0.9.0-linux-x64.AppImage
-./sawer-v0.9.0-linux-x64.AppImage
-```
-
-If FUSE mounting is unavailable, add `--appimage-extract-and-run` when launching.
-
-### Flatpak
-
-With Flatpak installed, install **sawer-v0.9.0-linux-x64.flatpak** and launch Sawer:
+1. Install Flatpak using your distribution's software manager if needed.
+2. Download **sawer-v0.9.0-linux-x64.flatpak** from the
+   [release page](https://github.com/SeifKaroui/sawer/releases/tag/v0.9.0).
+3. Open a terminal in the folder containing the download, then install and
+   launch Sawer:
 
 ```sh
 flatpak install --user ./sawer-v0.9.0-linux-x64.flatpak
 flatpak run io.sawer.app
 ```
 
-The runtime may download on first installation. Board access defaults to
-Documents; see [folder permissions](docs/releasing.md#flatpak-packaging-and-installation)
-for other locations.
+Accept the installation prompts; the required runtime may download the first
+time. After installation, you can also launch **Sawer** from your app menu.
+Boards are accessible in **Documents** by default; see
+[folder permissions](docs/releasing.md#flatpak-packaging-and-installation)
+to allow other locations.
+
+### AppImage
+
+1. Download **sawer-v0.9.0-linux-x64.AppImage** from the
+   [release page](https://github.com/SeifKaroui/sawer/releases/tag/v0.9.0).
+2. Open a terminal in the download folder and run:
+
+```sh
+chmod +x sawer-v0.9.0-linux-x64.AppImage
+./sawer-v0.9.0-linux-x64.AppImage
+```
+
+AppImage runs without installation and bundles the C++ runtime libraries.
+If it reports a FUSE error, launch it with:
+
+```sh
+./sawer-v0.9.0-linux-x64.AppImage --appimage-extract-and-run
+```
+
+### Standalone binary
+
+1. Download **sawer-v0.9.0-linux-x64** from the
+   [release page](https://github.com/SeifKaroui/sawer/releases/tag/v0.9.0).
+2. Open a terminal in the download folder and run:
+
+```sh
+chmod +x sawer-v0.9.0-linux-x64
+./sawer-v0.9.0-linux-x64
+```
+
+The binary runs without installation. It needs a glibc-based distribution,
+compatible system C++ runtime libraries, and a working Vulkan driver. Choose
+Flatpak or AppImage if your system is missing the required C++ runtime.
 
 Release checksums are in `sawer-v0.9.0-linux-x64-sha256sums.txt`.
 

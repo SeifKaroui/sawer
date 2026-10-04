@@ -91,9 +91,12 @@ A manual platform run creates an unpublished artifact. A matching tag starts
 both platforms from the same commit. Publication waits for Windows installer
 checks, both Linux build types, and all Ubuntu 24.04 compatibility jobs.
 
-`tools/publish_release.py` verifies the exact asset sets and checksums, confirms
-that the tag points to the tested commit, and uploads both platforms to one
-draft. It downloads and compares the uploaded bytes before making the release
+`tools/publish_release.py` verifies the complete CI artifacts and checksums,
+confirms that the tag points to the tested commit, and uploads the five
+application packages and two package-only checksum manifests to one draft.
+Dependency reports, runtime records, and standalone notices stay in the CI
+artifacts; required licenses remain embedded or included inside the packages.
+It downloads and compares the uploaded bytes before making the release
 public. Failed uploads or verification leave the draft unpublished; retries
 can resume that draft. Published releases are never overwritten.
 
@@ -147,8 +150,9 @@ Release runs generate the following artifact contents:
   compiler runtimes, with desktop, file-type, and application metadata.
 - `sawer-vX.Y.Z-linux-x64-flatpak-runtime.txt`: the Freedesktop runtime branch and
   runtime/graphics-extension commits used for the Flatpak checks.
-- `sawer-vX.Y.Z-linux-x64-sha256sums.txt`: checksums for the downloads and companion
-  dependency/notice reports.
+- `sawer-vX.Y.Z-linux-x64-sha256sums.txt`: CI checksums for the downloads and companion
+  dependency/notice reports. Publication produces a checksum file covering only
+  the binary, AppImage, and Flatpak downloads.
 - `sawer-vX.Y.Z-linux-x64-dependencies.txt`: the plain executable's shared dependencies.
 - `sawer-vX.Y.Z-linux-x64-third-party-notices.md`: application, runtime, and compiler notices.
 

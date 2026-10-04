@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -56,6 +57,28 @@ def validate_assets(tag: str, platform: str, directory: Path) -> list[Path]:
     return [directory / name for name in sorted(expected)]
 
 
+def download_names(tag: str, platform: str) -> set[str]:
+    suffixes = ["-setup.exe", "-portable.exe"] if platform == "windows" else ["", ".AppImage", ".flatpak"]
+    return {f"sawer-{tag}-{platform}-x64{suffix}" for suffix in suffixes}
+
+
+def prepare_downloads(tag: str, windows: Path, linux: Path, output: Path) -> list[Path]:
+    # Reports remain in the CI artifacts; public checksums cover packages only.
+    assets = []
+    for platform, directory in (("windows", windows), ("linux", linux)):
+        validate_assets(tag, platform, directory)
+        names = download_names(tag, platform)
+        for name in sorted(names):
+            destination = output / name
+            shutil.copyfile(directory / name, destination)
+            assets.append(destination)
+        manifest = output / f"sawer-{tag}-{platform}-x64-sha256sums.txt"
+        manifest.write_text("".join(f"{sha256(output / name)}  {name}\n" for name in sorted(names)),
+                            encoding="utf-8", newline="\n")
+        assets.append(manifest)
+    return assets
+
+
 def gh(*arguments: str) -> str:
     return subprocess.run(["gh", *arguments], check=True, capture_output=True,
                           text=True, timeout=180).stdout
@@ -63,7 +86,12 @@ def gh(*arguments: str) -> str:
 
 def publish(repository: str, tag: str, commit: str,
             windows: Path, linux: Path) -> None:
-    assets = validate_assets(tag, "windows", windows) + validate_assets(tag, "linux", linux)
+    with tempfile.TemporaryDirectory(prefix="sawer-release-assets-") as temporary:
+        assets = prepare_downloads(tag, windows, linux, Path(temporary))
+        publish_downloads(repository, tag, commit, assets)
+
+
+def publish_downloads(repository: str, tag: str, commit: str, assets: list[Path]) -> None:
     if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None:
         raise ValueError("expected an owner/repository name")
     if re.fullmatch(r"[0-9a-fA-F]{40}", commit) is None:

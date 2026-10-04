@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -45,6 +44,7 @@ class ReleasePublicationTests(unittest.TestCase):
             manifest.write_text("\n".join(checksums) + "\n")
             self.assets.append(manifest)
         self.calls = []
+        self.uploaded = {}
         self.release = None
         self.target_commit = COMMIT
         self.corrupt_download = False
@@ -65,10 +65,13 @@ class ReleasePublicationTests(unittest.TestCase):
             return json.dumps(self.release)
         if arguments[:2] == ("release", "upload") and self.failed_upload:
             raise subprocess.CalledProcessError(1, arguments, stderr="upload failed")
+        if arguments[:2] == ("release", "upload"):
+            self.uploaded = {Path(name).name: Path(name).read_bytes()
+                             for name in arguments[6:]}
         if arguments[:2] == ("release", "download"):
             directory = Path(arguments[arguments.index("--dir") + 1])
-            for path in self.assets:
-                shutil.copyfile(path, directory / path.name)
+            for name, contents in self.uploaded.items():
+                (directory / name).write_bytes(contents)
             if self.corrupt_download:
                 (directory / self.assets[0].name).write_bytes(b"wrong upload")
         return ""
@@ -90,8 +93,18 @@ class ReleasePublicationTests(unittest.TestCase):
         self.assertIn("--verify-tag", creation)
         self.assertIn("--draft", creation)
         self.assertIn("--prerelease", creation)
-        upload = next(call for call in self.calls if call[:2] == ("release", "upload"))
-        self.assertTrue({str(path.resolve()) for path in self.assets}.issubset(upload))
+        expected = publish_release.download_names(TAG, "windows") | publish_release.download_names(TAG, "linux")
+        expected |= {f"sawer-{TAG}-{platform}-x64-sha256sums.txt" for platform in ("windows", "linux")}
+        self.assertEqual(set(self.uploaded), expected)
+        self.assertEqual(len(self.uploaded), 7)
+        for platform in ("windows", "linux"):
+            lines = self.uploaded[f"sawer-{TAG}-{platform}-x64-sha256sums.txt"].decode().splitlines()
+            self.assertEqual(set(line[66:] for line in lines), publish_release.download_names(TAG, platform))
+            for line in lines:
+                self.assertEqual(line[:64], hashlib.sha256(self.uploaded[line[66:]]).hexdigest())
+        for path in self.assets:
+            if path.name in expected and not path.name.endswith("-sha256sums.txt"):
+                self.assertEqual(self.uploaded[path.name], path.read_bytes())
         self.assertIn("--draft=false", self.calls[-1])
         self.assertIn("--prerelease=true", self.calls[-1])
 
