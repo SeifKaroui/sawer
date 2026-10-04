@@ -21,6 +21,10 @@ organize ideas on a large canvas, with each board saved as one portable
 - **Portable.** Each board is one self-contained `.sawer` file, including
   pasted images. Save it anywhere, then move, back up, or share it.
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/SeifKaroui/sawer/main/assets/demo.gif" alt="Sawer drawing and board navigation demo" width="100%">
+</p>
+
 ## Download
 
 Open the [v0.9.0 release page](https://github.com/SeifKaroui/sawer/releases/tag/v0.9.0)
