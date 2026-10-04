@@ -3,10 +3,12 @@
 #include "document/Document.hpp"
 #include "document/Object.hpp"
 #include "image/ImageCodec.hpp"
+#include "renderer/BoardTheme.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 
 namespace sawer {
 namespace {
@@ -158,7 +160,8 @@ public:
 
     void composite(
         const Color color,
-        std::vector<std::uint8_t>& rgba) noexcept
+        std::vector<std::uint8_t>& rgba,
+        const bool clear = true) noexcept
     {
         for (const std::size_t pixel : touched_) {
             const std::uint32_t source_alpha =
@@ -191,9 +194,9 @@ public:
                 rgba[offset + 3U] =
                     static_cast<std::uint8_t>(output_alpha);
             }
-            pixels_[pixel] = 0U;
+            if (clear) pixels_[pixel] = 0U;
         }
-        touched_.clear();
+        if (clear) touched_.clear();
     }
 
 private:
@@ -202,6 +205,9 @@ private:
         const int y,
         const std::uint8_t coverage) noexcept
     {
+        // Rounded zero coverage must not enqueue a pixel repeatedly; both
+        // palette composites consume the same deduplicated coverage list.
+        if (coverage == 0U) return;
         const std::size_t index =
             static_cast<std::size_t>(y) * BoardPreview::pixel_width
             + static_cast<std::size_t>(x);
@@ -220,7 +226,7 @@ private:
     const Image& image,
     const Vec2d first,
     const Vec2d second,
-    std::vector<std::uint8_t>& destination)
+    BoardPreview& preview)
 {
     if (!image.asset || image.asset->preview.empty()) return false;
     DecodedImage proxy;
@@ -257,19 +263,22 @@ private:
                     + static_cast<std::size_t>(x)) * 4U;
             const std::uint32_t source_alpha = proxy.rgba[source_offset + 3U];
             if (source_alpha == 0U) continue;
-            const std::uint32_t destination_alpha = destination[target_offset + 3U];
-            const std::uint32_t inverse = 255U - source_alpha;
-            const std::uint32_t output_alpha = source_alpha
-                + (destination_alpha * inverse + 127U) / 255U;
-            for (std::size_t channel = 0U; channel < 3U; ++channel) {
-                const std::uint32_t numerator =
-                    static_cast<std::uint32_t>(proxy.rgba[source_offset + channel]) * source_alpha
-                    + (static_cast<std::uint32_t>(destination[target_offset + channel])
-                        * destination_alpha * inverse + 127U) / 255U;
-                destination[target_offset + channel] = static_cast<std::uint8_t>(
-                    (numerator + output_alpha / 2U) / output_alpha);
+            for (auto* const pixels : {&preview.rgba, &preview.dark_rgba}) {
+                auto& destination = *pixels;
+                const std::uint32_t destination_alpha = destination[target_offset + 3U];
+                const std::uint32_t inverse = 255U - source_alpha;
+                const std::uint32_t output_alpha = source_alpha
+                    + (destination_alpha * inverse + 127U) / 255U;
+                for (std::size_t channel = 0U; channel < 3U; ++channel) {
+                    const std::uint32_t numerator =
+                        static_cast<std::uint32_t>(proxy.rgba[source_offset + channel]) * source_alpha
+                        + (static_cast<std::uint32_t>(destination[target_offset + channel])
+                            * destination_alpha * inverse + 127U) / 255U;
+                    destination[target_offset + channel] = static_cast<std::uint8_t>(
+                        (numerator + output_alpha / 2U) / output_alpha);
+                }
+                destination[target_offset + 3U] = static_cast<std::uint8_t>(output_alpha);
             }
-            destination[target_offset + 3U] = static_cast<std::uint8_t>(output_alpha);
         }
     }
     return true;
@@ -336,6 +345,11 @@ BoardPreview rasterize_board_preview(const Document& document)
         static_cast<std::size_t>(BoardPreview::pixel_width)
             * BoardPreview::pixel_height * 4U,
         0U);
+    preview.dark_rgba.resize(preview.rgba.size(), 0U);
+    const auto composite = [&](const Color color) {
+        raster.composite(color, preview.rgba, false);
+        raster.composite(board_display_color(color, 1.0), preview.dark_rgba);
+    };
     constexpr std::size_t ellipse_segments = 36U;
     for (const Object* const object : objects) {
         if (const auto* const line = std::get_if<Line>(&object->geometry)) {
@@ -343,7 +357,7 @@ BoardPreview rasterize_board_preview(const Document& document)
                 map(line->start),
                 map(line->end),
                 stroke_radius(object->style));
-            raster.composite(object->style.stroke, preview.rgba);
+            composite(object->style.stroke);
         } else if (const auto* const stroke =
                        std::get_if<Stroke>(&object->geometry)) {
             if (stroke->points.empty()) {
@@ -354,7 +368,7 @@ BoardPreview rasterize_board_preview(const Document& document)
                     map(stroke->points.front()),
                     stroke_radius(object->style),
                     stroke_coverage);
-                raster.composite(object->style.stroke, preview.rgba);
+                composite(object->style.stroke);
                 continue;
             }
             Vec2d previous = map(stroke->points.front());
@@ -370,14 +384,14 @@ BoardPreview rasterize_board_preview(const Document& document)
                     previous, next, stroke_radius(object->style));
                 previous = next;
             }
-            raster.composite(object->style.stroke, preview.rgba);
+            composite(object->style.stroke);
         } else if (const auto* const rectangle =
                        std::get_if<RectangleShape>(&object->geometry)) {
             const Vec2d first = map(rectangle->first);
             const Vec2d second = map(rectangle->second);
             if (object->style.fill.has_value()) {
                 raster.filled_rectangle(first, second, fill_coverage);
-                raster.composite(*object->style.fill, preview.rgba);
+                composite(*object->style.fill);
             }
             const double radius = stroke_radius(object->style);
             const Vec2d top_left{
@@ -390,14 +404,14 @@ BoardPreview rasterize_board_preview(const Document& document)
             raster.segment(top_right, bottom_right, radius);
             raster.segment(bottom_right, bottom_left, radius);
             raster.segment(bottom_left, top_left, radius);
-            raster.composite(object->style.stroke, preview.rgba);
+            composite(object->style.stroke);
         } else if (const auto* const ellipse =
                        std::get_if<Ellipse>(&object->geometry)) {
             const Vec2d first = map(ellipse->first);
             const Vec2d second = map(ellipse->second);
             if (object->style.fill.has_value()) {
                 raster.filled_ellipse(first, second, fill_coverage);
-                raster.composite(*object->style.fill, preview.rgba);
+                composite(*object->style.fill);
             }
             const Vec2d center{
                 (first.x + second.x) * 0.5,
@@ -420,24 +434,39 @@ BoardPreview rasterize_board_preview(const Document& document)
                     previous, next, stroke_radius(object->style));
                 previous = next;
             }
-            raster.composite(object->style.stroke, preview.rgba);
+            composite(object->style.stroke);
         } else if (const auto* const image =
                        std::get_if<Image>(&object->geometry)) {
             const Vec2d first = map(image->first);
             const Vec2d second = map(image->second);
             const bool composited =
-                composite_image_proxy(*image, first, second, preview.rgba);
+                composite_image_proxy(*image, first, second, preview);
             // Missing or corrupt proxies are intentionally non-fatal. Keep
             // their placement visible without touching the raw full image.
             if (!composited) {
                 raster.filled_rectangle(first, second, fill_coverage);
-                raster.composite({104U, 122U, 158U, 120U}, preview.rgba);
+                composite({104U, 122U, 158U, 120U});
             }
         }
     }
 
     preview.has_content = true;
     return preview;
+}
+
+void write_board_preview_pixels(const BoardPreview& preview,
+    const std::uint8_t dark_amount, const std::span<std::uint8_t> destination)
+{
+    if (destination.size() != preview.rgba.size()
+        || preview.dark_rgba.size() != preview.rgba.size()) {
+        throw std::invalid_argument{"Invalid themed preview pixel payload"};
+    }
+    for (std::size_t index = 0; index < destination.size(); ++index) {
+        destination[index] = static_cast<std::uint8_t>(
+            (static_cast<std::uint32_t>(preview.rgba[index]) * (255U - dark_amount)
+                + static_cast<std::uint32_t>(preview.dark_rgba[index]) * dark_amount
+                + 127U) / 255U);
+    }
 }
 
 } // namespace sawer

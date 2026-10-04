@@ -2,10 +2,8 @@ name: Linux release
 
 on:
   workflow_dispatch:
+  workflow_call:
   pull_request:
-  push:
-    tags:
-      - "v[0-9]*.[0-9]*.[0-9]*"
 
 concurrency:
   group: linux-release-${{ github.ref }}
@@ -84,6 +82,7 @@ jobs:
           fi
           version="$(python tools/check_release.py "${arguments[@]}")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_STEM=sawer-v${version}-linux-x64" >> "$GITHUB_ENV"
           echo "Source commit: $GITHUB_SHA; Linux x86_64 $version (${{ matrix.buildtype }})" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Configure build
@@ -168,10 +167,10 @@ jobs:
         run: |
           mkdir -p build/linux-dist
           strip --strip-unneeded build/Sawer
-          install -m 755 build/Sawer build/linux-dist/Sawer
-          python tools/check_release.py --source-root . --executable build/linux-dist/Sawer
-          ldd build/linux-dist/Sawer > build/linux-dist/DEPENDENCIES-Linux-x86_64.txt
-          python tools/package_linux.py --executable build/linux-dist/Sawer --appdir build/Sawer.AppDir
+          install -m 755 build/Sawer build/linux-dist/$RELEASE_STEM
+          python tools/check_release.py --source-root . --executable build/linux-dist/$RELEASE_STEM
+          ldd build/linux-dist/$RELEASE_STEM > build/linux-dist/$RELEASE_STEM-dependencies.txt
+          python tools/package_linux.py --executable build/linux-dist/$RELEASE_STEM --appdir build/Sawer.AppDir
           desktop-file-validate build/Sawer.AppDir/io.sawer.app.desktop
           cp --dereference /usr/share/doc/libstdc++6/copyright \
             build/Sawer.AppDir/usr/share/doc/Sawer/GCC-runtime-copyright.txt
@@ -182,7 +181,7 @@ jobs:
           cat THIRD_PARTY_NOTICES.md packaging/linux/AppImage-runtime-LICENSE.txt \
             /usr/share/doc/libstdc++6/copyright /usr/share/common-licenses/GPL-3 \
             /usr/share/common-licenses/LGPL-2.1 \
-            > build/linux-dist/THIRD_PARTY_NOTICES-Linux.md
+            > build/linux-dist/$RELEASE_STEM-third-party-notices.md
 
       - name: Build AppImage without FUSE or unpinned downloads
         if: matrix.buildtype == 'release'
@@ -192,16 +191,16 @@ jobs:
         run: |
           build/appimagetool/squashfs-root/AppRun --no-appstream \
             --runtime-file .cache/appimage/runtime-20251108-x86_64 \
-            build/Sawer.AppDir build/linux-dist/Sawer-x86_64.AppImage
-          chmod +x build/linux-dist/Sawer-x86_64.AppImage
+            build/Sawer.AppDir build/linux-dist/$RELEASE_STEM.AppImage
+          chmod +x build/linux-dist/$RELEASE_STEM.AppImage
 
       - name: Validate extracted AppImage payload
         if: matrix.buildtype == 'release'
         run: |
           mkdir -p build/appimage-check
           cd build/appimage-check
-          ../linux-dist/Sawer-x86_64.AppImage --appimage-extract
-          cmp squashfs-root/usr/bin/Sawer ../linux-dist/Sawer
+          ../linux-dist/$RELEASE_STEM.AppImage --appimage-extract
+          cmp squashfs-root/usr/bin/Sawer ../linux-dist/$RELEASE_STEM
           cmp squashfs-root/usr/share/doc/Sawer/THIRD_PARTY_NOTICES.md ../../THIRD_PARTY_NOTICES.md
           test -x squashfs-root/AppRun
           test -x squashfs-root/usr/bin/Sawer
@@ -214,7 +213,7 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: >-
           python tools/check_release.py --source-root .
-          --executable build/linux-dist/Sawer-x86_64.AppImage
+          --executable build/linux-dist/$RELEASE_STEM.AppImage
 
       - name: Test both downloads on X11 and Wayland
         if: matrix.buildtype == 'release'
@@ -222,7 +221,7 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: |
           for backend in x11 wayland; do
-            for executable in Sawer Sawer-x86_64.AppImage; do
+            for executable in "$RELEASE_STEM" "$RELEASE_STEM.AppImage"; do
               dbus-run-session -- python tools/test_linux_display.py \
                 --timeout 120 --log-dir "build/download-logs/$executable" "$backend" -- \
                 "$PWD/build/linux-dist/$executable" --render-test
@@ -246,7 +245,7 @@ jobs:
             echo "Freedesktop runtime branch: $runtime"
             flatpak info --user --arch=x86_64 --show-commit "org.freedesktop.Platform//$runtime"
             flatpak info --user --arch=x86_64 --show-commit "org.freedesktop.Platform.GL.default//$runtime"
-          } > build/linux-dist/FLATPAK-RUNTIME-Linux-x86_64.txt
+          } > build/linux-dist/$RELEASE_STEM-flatpak-runtime.txt
 
       - name: Stage Flatpak desktop integration and release payload
         if: matrix.buildtype == 'release'
@@ -268,30 +267,30 @@ jobs:
             build/Sawer.Flatpak build/flatpak-source/io.sawer.app.json
           flatpak build-bundle --arch=x86_64 \
             --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
-            build/flatpak-repo build/linux-dist/Sawer-x86_64.flatpak io.sawer.app stable
+            build/flatpak-repo build/linux-dist/$RELEASE_STEM.flatpak io.sawer.app stable
 
       - name: Install and test the actual Flatpak download
         if: matrix.buildtype == 'release'
         run: |
-          flatpak install --user --noninteractive --bundle build/linux-dist/Sawer-x86_64.flatpak
+          flatpak install --user --noninteractive --bundle build/linux-dist/$RELEASE_STEM.flatpak
           dbus-run-session -- python tools/test_flatpak.py \
-            --executable build/linux-dist/Sawer --graphics --log-dir build/flatpak-logs
+            --executable build/linux-dist/$RELEASE_STEM --graphics --log-dir build/flatpak-logs
           flatpak info --user --show-permissions io.sawer.app
 
       - name: Create Linux checksums
         if: matrix.buildtype == 'release'
         run: |
           cd build/linux-dist
-          sha256sum Sawer Sawer-x86_64.AppImage Sawer-x86_64.flatpak \
-            THIRD_PARTY_NOTICES-Linux.md DEPENDENCIES-Linux-x86_64.txt \
-            FLATPAK-RUNTIME-Linux-x86_64.txt > SHA256SUMS-Linux-x86_64.txt
-          sha256sum --check SHA256SUMS-Linux-x86_64.txt
+          sha256sum "$RELEASE_STEM" "$RELEASE_STEM.AppImage" "$RELEASE_STEM.flatpak" \
+            $RELEASE_STEM-third-party-notices.md $RELEASE_STEM-dependencies.txt \
+            $RELEASE_STEM-flatpak-runtime.txt > $RELEASE_STEM-sha256sums.txt
+          sha256sum --check $RELEASE_STEM-sha256sums.txt
 
       - name: Upload tested Linux assets
         if: matrix.buildtype == 'release'
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: Sawer-${{ steps.release.outputs.version }}-Linux-x86_64
+          name: sawer-v${{ steps.release.outputs.version }}-linux-x64
           path: build/linux-dist/
           if-no-files-found: error
           retention-days: 14
@@ -300,7 +299,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: Linux-${{ matrix.buildtype }}-logs
+          name: sawer-v${{ steps.release.outputs.version || 'unknown' }}-linux-x64-${{ matrix.buildtype }}-logs
           path: |
             build/meson-logs/
             build/display-logs/
@@ -317,10 +316,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        executable: [Sawer, Sawer-x86_64.AppImage]
+        executable: [binary, appimage]
         backend: [x11, wayland]
     env:
-      EXECUTABLE: ${{ matrix.executable }}
+      RELEASE_STEM: sawer-v${{ needs.linux-x64.outputs.version }}-linux-x64
+      EXECUTABLE: sawer-v${{ needs.linux-x64.outputs.version }}-linux-x64${{ matrix.executable == 'appimage' && '.AppImage' || '' }}
       BACKEND: ${{ matrix.backend }}
       APPIMAGE_EXTRACT_AND_RUN: "1"
     steps:
@@ -332,7 +332,7 @@ jobs:
       - name: Download tested Linux assets
         uses: actions/download-artifact@v8.0.1
         with:
-          name: Sawer-${{ needs.linux-x64.outputs.version }}-Linux-x86_64
+          name: sawer-v${{ needs.linux-x64.outputs.version }}-linux-x64
           path: build/linux-dist
 
       - name: Install display test dependencies
@@ -344,12 +344,12 @@ jobs:
 
       - name: Check bundled runtime on the stock system
         run: |
-          (cd build/linux-dist && sha256sum --check SHA256SUMS-Linux-x86_64.txt)
-          chmod +x build/linux-dist/Sawer-x86_64.AppImage
-          python3 tools/check_release.py --source-root . --executable build/linux-dist/Sawer-x86_64.AppImage
+          (cd build/linux-dist && sha256sum --check $RELEASE_STEM-sha256sums.txt)
+          chmod +x build/linux-dist/$RELEASE_STEM.AppImage
+          python3 tools/check_release.py --source-root . --executable build/linux-dist/$RELEASE_STEM.AppImage
 
       - name: Install C++ runtime for the standalone executable
-        if: matrix.executable == 'Sawer'
+        if: matrix.executable == 'binary'
         run: |
           repository="$(python3 -c 'import json; print(json.load(open("tools/gcc-toolchain.json"))["linux"]["repository"])')"
           sudo add-apt-repository --yes "$repository"
@@ -372,7 +372,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: Linux-compatibility-${{ matrix.executable }}-${{ matrix.backend }}-logs
+          name: sawer-v${{ needs.linux-x64.outputs.version }}-linux-x64-compatibility-${{ matrix.executable }}-${{ matrix.backend }}-logs
           path: build/download-logs/
           if-no-files-found: ignore
           retention-days: 14

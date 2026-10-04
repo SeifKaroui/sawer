@@ -1,8 +1,10 @@
 """Check Linux payload validation, dependency isolation, and launcher behavior."""
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,6 +22,47 @@ def elf_header(machine: int = 62, bits: int = 2) -> bytes:
 
 
 class LinuxPackageTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("bash"), "Bash is required for workflow checksum checks")
+    def test_versioned_download_checksums_and_tamper_detection(self) -> None:
+        workflow = (SOURCE / ".github/workflows/linux-release.yml").read_text(encoding="utf-8")
+        step = re.search(
+            r"(?ms)^      - name: Create Linux checksums\n.*?        run: \|\n"
+            r"(?P<body>.*?)(?=^      - name:)", workflow)
+        self.assertIsNotNone(step)
+        body = re.sub(r"(?m)^          ", "", step.group("body"))
+        stem = "sawer-v0.9.0-linux-x64"
+        payload = {stem + suffix: ("fixture " + suffix).encode() for suffix in (
+            "", ".AppImage", ".flatpak", "-third-party-notices.md",
+            "-dependencies.txt", "-flatpak-runtime.txt")}
+        with tempfile.TemporaryDirectory(prefix="sawer release downloads ") as temporary:
+            root = Path(temporary)
+            distribution = root / "build/linux-dist"
+            distribution.mkdir(parents=True)
+            for name, contents in payload.items():
+                (distribution / name).write_bytes(contents)
+            environment = dict(os.environ, RELEASE_STEM=stem)
+            subprocess.run([shutil.which("bash"), "-e", "-c", body], cwd=root,
+                           env=environment, check=True, capture_output=True, text=True)
+            manifest = distribution / (stem + "-sha256sums.txt")
+            # GNU coreutils on Windows marks binary mode with '*'; Linux uses a space.
+            entries = set()
+            for line in manifest.read_text().splitlines():
+                self.assertRegex(line, r"^[0-9a-f]{64} [ *]")
+                entries.add((line[:64], line[66:]))
+            self.assertEqual(entries, {
+                (hashlib.sha256(contents).hexdigest(), name)
+                for name, contents in payload.items()})
+            (distribution / stem).write_bytes(b"modified download")
+            checked = subprocess.run([
+                shutil.which("bash"), "-e", "-c",
+                'cd build/linux-dist; sha256sum --check "$RELEASE_STEM-sha256sums.txt"'],
+                cwd=root, env=environment, capture_output=True, text=True)
+            self.assertNotEqual(checked.returncode, 0)
+            (distribution / (stem + "-dependencies.txt")).unlink()
+            incomplete = subprocess.run([shutil.which("bash"), "-e", "-c", body],
+                                        cwd=root, env=environment, capture_output=True, text=True)
+            self.assertNotEqual(incomplete.returncode, 0)
+
     def test_only_x86_64_elf_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             executable = Path(temporary) / "Sawer"

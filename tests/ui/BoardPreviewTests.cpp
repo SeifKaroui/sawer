@@ -2,6 +2,7 @@
 #include "document/Object.hpp"
 #include "image/ImageCodec.hpp"
 #include "ui/BoardPreview.hpp"
+#include "renderer/BoardTheme.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -62,6 +63,89 @@ TEST_CASE("empty board preview has no raster payload")
         sawer::rasterize_board_preview(document);
     REQUIRE_FALSE(preview.has_content);
     REQUIRE(preview.rgba.empty());
+    REQUIRE(preview.dark_rgba.empty());
+}
+
+TEST_CASE("Home preview ink follows board themes and restores canonical pixels")
+{
+    using namespace sawer;
+    for (const Color ink : {Color{0, 0, 0, 128}, Color{30, 34, 42, 255},
+            Color{32, 36, 44, 255}, Color{255, 255, 255, 255},
+            Color{82, 145, 244, 255}, Color{31, 34, 42, 255}}) {
+        Document document;
+        Style style;
+        style.stroke = ink;
+        REQUIRE(document.insert(Object::make_line(ObjectId::from_u64(1), 0,
+            {{0, 0}, {100, 0}}, style)));
+        const auto preview = rasterize_board_preview(document);
+        const auto expected = board_display_color(ink, 1.0);
+        std::vector<std::uint8_t> pixels(preview.rgba.size());
+        write_board_preview_pixels(preview, 255U, pixels);
+        REQUIRE(pixels == preview.dark_rgba);
+        bool found_ink = false;
+        bool colors_match = true;
+        bool alpha_preserved = true;
+        for (std::size_t offset = 0; offset < pixels.size(); offset += 4) {
+            alpha_preserved = alpha_preserved
+                && pixels[offset + 3] == preview.rgba[offset + 3];
+            if (pixels[offset + 3] == 0) continue;
+            found_ink = true;
+            colors_match = colors_match && pixels[offset] == expected.red
+                && pixels[offset + 1] == expected.green && pixels[offset + 2] == expected.blue;
+        }
+        REQUIRE(found_ink);
+        REQUIRE(colors_match);
+        REQUIRE(alpha_preserved);
+        write_board_preview_pixels(preview, 128U, pixels);
+        bool transition_matches = true;
+        for (std::size_t index = 0; index < pixels.size(); ++index) {
+            transition_matches = transition_matches
+                && pixels[index] == (static_cast<unsigned>(preview.rgba[index]) * 127U
+                    + static_cast<unsigned>(preview.dark_rgba[index]) * 128U + 127U) / 255U;
+        }
+        REQUIRE(transition_matches);
+        write_board_preview_pixels(preview, 0U, pixels);
+        REQUIRE(pixels == preview.rgba);
+        REQUIRE(document.all_objects().front()->style.stroke == ink);
+    }
+}
+
+TEST_CASE("preview maps neutral fill before compositing overlapping colored ink")
+{
+    using namespace sawer;
+    Document document;
+    Style paper;
+    paper.stroke = {255, 255, 255, 255};
+    paper.fill = paper.stroke;
+    REQUIRE(document.insert(Object::make_rectangle(ObjectId::from_u64(1), 0,
+        {{0, 0}, {100, 100}}, paper)));
+    Style ink;
+    ink.stroke = {220, 40, 30, 128};
+    ink.stroke_width = 20;
+    REQUIRE(document.insert(Object::make_line(ObjectId::from_u64(2), 1,
+        {{0, 50}, {100, 50}}, ink)));
+    const auto preview = rasterize_board_preview(document);
+    const std::size_t center = (BoardPreview::pixel_height / 2U * BoardPreview::pixel_width
+        + BoardPreview::pixel_width / 2U) * 4U;
+    REQUIRE(preview.rgba[center + 3] == 255U);
+    REQUIRE(preview.dark_rgba[center + 3] == 255U);
+    for (std::size_t channel = 0; channel < 3; ++channel)
+        REQUIRE(preview.dark_rgba[center + channel] < preview.rgba[center + channel]);
+}
+
+TEST_CASE("preview preserves black image pixels in both themes")
+{
+    using namespace sawer;
+    auto asset = std::make_shared<ImageAsset>();
+    asset->pixel_width = 1U;
+    asset->pixel_height = 1U;
+    asset->preview = encode_png_rgba({1U, 1U, {0U, 0U, 0U, 255U}});
+    Document document;
+    REQUIRE(document.insert(Object::make_image(ObjectId::from_u64(1), 0,
+        {asset, {0, 0}, {100, 100}})));
+    const auto preview = rasterize_board_preview(document);
+    REQUIRE(preview.rgba == preview.dark_rgba);
+    REQUIRE(std::ranges::any_of(preview.rgba, [](auto channel) { return channel != 0U; }));
 }
 
 TEST_CASE("subpixel stroke samples accumulate across the thumbnail")

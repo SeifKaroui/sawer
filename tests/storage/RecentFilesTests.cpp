@@ -18,6 +18,28 @@ std::filesystem::path test_settings_path()
 
 } // namespace
 
+TEST_CASE("recent-file preferences default to light when no theme is saved")
+{
+    const auto directory = std::filesystem::temp_directory_path()
+        / ("sawer-default-theme-" + sawer::ObjectId::random().to_string());
+    struct Cleanup final {
+        std::filesystem::path path;
+        ~Cleanup() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
+    } cleanup{directory};
+    const auto settings = directory / "preferences.json";
+    REQUIRE(sawer::RecentFiles{settings}.light_theme());
+    std::filesystem::create_directories(directory);
+    for (const auto& legacy : {nlohmann::json::array(),
+            nlohmann::json{{"recent", nlohmann::json::array()}},
+            nlohmann::json{{"recent", nlohmann::json::array()}, {"drawing", {{"light_theme", "invalid"}}}}}) {
+        { std::ofstream output{settings}; output << legacy.dump(); }
+        sawer::RecentFiles preferences{settings};
+        REQUIRE(preferences.light_theme());
+        preferences.set_light_theme(false);
+        REQUIRE_FALSE(sawer::RecentFiles{settings}.light_theme());
+    }
+}
+
 TEST_CASE("Unicode recent files and zoom levels survive preference reload and rename")
 {
     const auto directory = std::filesystem::temp_directory_path()

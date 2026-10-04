@@ -21,18 +21,19 @@ DOCUMENTS = [*(SOURCE / "docs" / name for name in (
 
 class PortablePackageTests(unittest.TestCase):
     def test_extracted_documentation_links_and_executable(self) -> None:
-        for extension in (".zip", ".tar.gz"):
+        for platform, extension in (("windows", ".zip"), ("linux", ".tar.gz")):
             with self.subTest(extension=extension), tempfile.TemporaryDirectory() as temporary:
                 directory = Path(temporary)
                 executable = directory / "Sawer.exe"
                 executable.write_bytes(b"standalone application fixture")
-                archive = directory / ("Sawer" + extension)
+                package_name = f"sawer-v0.9.0-{platform}-x64"
+                archive = directory / (package_name + extension)
                 subprocess.run([
                     sys.executable, str(SOURCE / "tools/package_portable.py"),
                     "--executable", str(executable), "--readme", str(SOURCE / "README.md"),
                     "--banner", str(SOURCE / "assets/banner.png"),
                     "--notices", str(SOURCE / "THIRD_PARTY_NOTICES.md"),
-                    "--source-root", str(SOURCE), "--output", str(archive), "--root", "Sawer",
+                    "--source-root", str(SOURCE), "--output", str(archive), "--root", package_name,
                     "--documentation", *map(str, DOCUMENTS),
                 ], check=True, timeout=30)
                 extraction = directory / "extracted"
@@ -43,7 +44,7 @@ class PortablePackageTests(unittest.TestCase):
                     with tarfile.open(archive) as packed:
                         options = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
                         packed.extractall(extraction, **options)
-                root = extraction / "Sawer"
+                root = extraction / package_name
                 self.assertEqual((root / executable.name).read_bytes(), executable.read_bytes())
                 self.assertEqual((root / "THIRD_PARTY_NOTICES.md").read_bytes(),
                                  (SOURCE / "THIRD_PARTY_NOTICES.md").read_bytes())

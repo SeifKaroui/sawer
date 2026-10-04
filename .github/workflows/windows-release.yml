@@ -2,9 +2,7 @@ name: Windows release
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "v[0-9]*.[0-9]*.[0-9]*"
+  workflow_call:
 
 concurrency:
   group: windows-release-${{ github.ref }}
@@ -22,7 +20,7 @@ jobs:
       PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
       NSIS_CACHE_DIR: ${{ github.workspace }}/.cache/nsis-3.12
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
 
@@ -169,6 +167,7 @@ jobs:
           fi
           version="$(python tools/check_release.py "${arguments[@]}")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "RELEASE_STEM=sawer-v${version}-windows-x64" >> "$GITHUB_ENV"
 
       - name: Configure Release build
         shell: msys2 {0}
@@ -211,9 +210,9 @@ jobs:
         run: |
           export PATH="$(cygpath -u "$GCC_TOOLCHAIN_BIN"):$PATH"
           mkdir -p dist
-          asset="Sawer-Portable.exe"
+          asset="${RELEASE_STEM}-portable.exe"
           cp build/Sawer.exe "dist/$asset"
-          cp THIRD_PARTY_NOTICES.md dist/THIRD_PARTY_NOTICES.md
+          cp THIRD_PARTY_NOTICES.md "dist/${RELEASE_STEM}-third-party-notices.md"
           python tools/check_release.py \
             --source-root . \
             --executable "dist/$asset"
@@ -229,7 +228,7 @@ jobs:
           VERSION: ${{ steps.release.outputs.version }}
         run: |
           Add-Type -AssemblyName System.Drawing
-          $asset = "dist/Sawer-Portable.exe"
+          $asset = "dist/${env:RELEASE_STEM}-portable.exe"
           $metadata = (Get-Item -LiteralPath $asset).VersionInfo
           if ($metadata.ProductVersion -ne $env:VERSION) {
             throw "ProductVersion '$($metadata.ProductVersion)' does not match '$env:VERSION'"
@@ -254,7 +253,7 @@ jobs:
             echo "Unexpected NSIS compiler version" >&2
             exit 1
           fi
-          portable="$(cygpath -w "$(pwd)/dist/Sawer-Portable.exe")"
+          portable="$(cygpath -w "$(pwd)/dist/${RELEASE_STEM}-portable.exe")"
           output="$(cygpath -w "$(pwd)/dist")"
           script="$(cygpath -w "$(pwd)/packaging/windows/Sawer.nsi")"
           MSYS2_ARG_CONV_EXCL='*' "$compiler" \
@@ -277,26 +276,38 @@ jobs:
           $eligible = @($releases | Where-Object {
             -not $_.draft -and $_.tag_name -match '^v[0-9]+\.[0-9]+\.[0-9]+$' -and
             [version]($_.tag_name.Substring(1)) -lt [version]$env:VERSION -and
-            @($_.assets.name) -contains 'Sawer-Setup.exe' -and
-            @($_.assets.name) -contains 'SHA256SUMS.txt'
+            ((@($_.assets.name) -contains "sawer-$($_.tag_name)-windows-x64-setup.exe" -and
+              @($_.assets.name) -contains "sawer-$($_.tag_name)-windows-x64-sha256sums.txt") -or
+             (@($_.assets.name) -contains 'Sawer-Setup.exe' -and
+              @($_.assets.name) -contains 'SHA256SUMS.txt'))
           } | Sort-Object { [version]($_.tag_name.Substring(1)) } -Descending)
           if ($eligible.Count -eq 0) {
             Write-Output 'SKIP older-version upgrade: no previous installer release exists'
             exit 0
           }
           $previous = $eligible[0]
+          $stem = "sawer-$($previous.tag_name)-windows-x64"
+          $installerName = "$stem-setup.exe"
+          $checksumName = "$stem-sha256sums.txt"
+          if (@($previous.assets.name) -notcontains $installerName -or
+              @($previous.assets.name) -notcontains $checksumName) {
+            $installerName = 'Sawer-Setup.exe'
+            $checksumName = 'SHA256SUMS.txt'
+          }
           New-Item -ItemType Directory -Path out/installer-upgrade -Force | Out-Null
           & gh release download $previous.tag_name --repo $env:GH_REPO `
-            --pattern Sawer-Setup.exe --pattern SHA256SUMS.txt --dir out/installer-upgrade
+            --pattern $installerName --pattern $checksumName --dir out/installer-upgrade
           if ($LASTEXITCODE -ne 0) { throw 'Could not download the previous installer' }
-          $entry = @(Get-Content out/installer-upgrade/SHA256SUMS.txt | Where-Object {
-            $_ -match '^[0-9a-fA-F]{64}  Sawer-Setup\.exe$'
+          $checksumPath = Join-Path out/installer-upgrade $checksumName
+          $installerPath = Join-Path out/installer-upgrade $installerName
+          $entry = @(Get-Content -LiteralPath $checksumPath | Where-Object {
+            $_ -cmatch ('^[0-9a-fA-F]{64}  ' + [regex]::Escape($installerName) + '$')
           })
           if ($entry.Count -ne 1) { throw 'Previous installer checksum is missing or ambiguous' }
           $expected = $entry[0].Substring(0, 64)
-          $actual = (Get-FileHash out/installer-upgrade/Sawer-Setup.exe -Algorithm SHA256).Hash
+          $actual = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash
           if ($actual -ne $expected) { throw 'Previous installer checksum mismatch' }
-          "installer=$((Resolve-Path out/installer-upgrade/Sawer-Setup.exe).Path)" >> $env:GITHUB_OUTPUT
+          "installer=$((Resolve-Path -LiteralPath $installerPath).Path)" >> $env:GITHUB_OUTPUT
           "version=$($previous.tag_name.Substring(1))" >> $env:GITHUB_OUTPUT
 
       - name: Test install, upgrade, and uninstall
@@ -307,8 +318,8 @@ jobs:
           PREVIOUS_VERSION: ${{ steps.previous.outputs.version }}
         run: |
           $arguments = @{
-            Installer = 'dist/Sawer-Setup.exe'
-            PortableExecutable = 'dist/Sawer-Portable.exe'
+            Installer = "dist/${env:RELEASE_STEM}-setup.exe"
+            PortableExecutable = "dist/${env:RELEASE_STEM}-portable.exe"
             Version = $env:VERSION
             SourceRoot = '.'
             BoardValidator = 'build/sawer-format.exe'
@@ -323,14 +334,15 @@ jobs:
       - name: Create release checksums
         shell: pwsh
         run: |
-          $names = @("Sawer-Setup.exe", "Sawer-Portable.exe")
+          $names = @("${env:RELEASE_STEM}-setup.exe", "${env:RELEASE_STEM}-portable.exe",
+            "${env:RELEASE_STEM}-third-party-notices.md")
           $lines = foreach ($name in $names) {
             $hash = (Get-FileHash -LiteralPath "dist/$name" -Algorithm SHA256).Hash
             "$($hash.ToLowerInvariant())  $name"
           }
           $encoding = [System.Text.UTF8Encoding]::new($false)
           [System.IO.File]::WriteAllLines(
-            (Join-Path (Resolve-Path "dist") "SHA256SUMS.txt"),
+            (Join-Path (Resolve-Path "dist") "${env:RELEASE_STEM}-sha256sums.txt"),
             $lines,
             $encoding
           )
@@ -338,7 +350,7 @@ jobs:
       - name: Upload tested Windows assets
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: Sawer-${{ steps.release.outputs.version }}-Windows-AMD64
+          name: sawer-v${{ steps.release.outputs.version }}-windows-x64
           path: dist/
           if-no-files-found: error
           retention-days: 14
@@ -347,25 +359,4 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: actions/attest@v4
         with:
-          subject-path: dist/Sawer-*.exe
-
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: msys2 {0}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.release.outputs.version }}
-        run: |
-          release_flags=()
-          if [[ "$VERSION" == 0.* ]]; then
-            release_flags+=(--prerelease)
-          fi
-          gh release create "$GITHUB_REF_NAME" \
-            "dist/Sawer-Setup.exe" \
-            "dist/Sawer-Portable.exe" \
-            "dist/SHA256SUMS.txt" \
-            "dist/THIRD_PARTY_NOTICES.md" \
-            --verify-tag \
-            --generate-notes \
-            --title "Sawer ${VERSION}" \
-            "${release_flags[@]}"
+          subject-path: dist/sawer-v*-windows-x64-*.exe

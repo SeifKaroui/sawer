@@ -24,7 +24,7 @@ struct Color final {
 struct Style final {
     Color stroke{30U, 34U, 42U, 255U};
     std::optional<Color> fill;
-    double stroke_width{4.0};
+    double stroke_width{5.0};
 
     friend constexpr bool operator==(const Style&, const Style&) = default;
 };

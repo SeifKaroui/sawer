@@ -139,7 +139,125 @@ try {
         $env:NSIS_CACHE_DIR = $previousNsisCache
         Remove-Item Function:\curl.exe
     }
-    Write-Output 'Installer preservation, Unicode shortcuts, exit-code, HTTPS fallback, cache and checksum regression checks passed'
+    # Run the actual upgrade-download step with legacy and versioned release fixtures.
+    $upgradeStep = [regex]::Match($workflow, '(?ms)^      - name: Retrieve a previous installer for upgrade checks\r?\n.*?        run: \|\r?\n(?<body>.*?)(?=^      - name:)')
+    Assert-Condition $upgradeStep.Success 'Installer upgrade step was not found'
+    $upgradeBody = [regex]::Replace($upgradeStep.Groups['body'].Value, '(?m)^          ', '')
+    $upgrade = [scriptblock]::Create($upgradeBody)
+    $previousLocation = Get-Location
+    $previousVersionEnv = $env:VERSION
+    $previousRepoEnv = $env:GH_REPO
+    $previousOutputEnv = $env:GITHUB_OUTPUT
+    function gh {
+        param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+        $global:LASTEXITCODE = 0
+        if ($Arguments[0] -eq 'api') {
+            ConvertTo-Json -InputObject @($script:upgradeReleases) -Depth 5
+            return
+        }
+        Assert-Condition ($Arguments[0] -eq 'release' -and $Arguments[1] -eq 'download') 'Unexpected GitHub command'
+        Assert-Condition ($Arguments[2] -eq $script:upgradeTag) 'Upgrade did not select the latest eligible lower release'
+        $patterns = @()
+        for ($index = 0; $index -lt $Arguments.Count; ++$index) {
+            if ($Arguments[$index] -eq '--pattern') { $patterns += $Arguments[$index + 1] }
+        }
+        Assert-Condition ($patterns.Count -eq 2 -and $patterns[0] -ceq $script:upgradeInstaller -and
+            $patterns[1] -ceq $script:upgradeChecksums) 'Download patterns do not match the selected release'
+        $destination = $Arguments[[Array]::IndexOf($Arguments, '--dir') + 1]
+        $destination = Join-Path (Get-Location).Path $destination
+        $bytes = if ($script:upgradeCorrupt) { [byte[]]@(9, 9) } else { [byte[]]@(1, 2, 3, 4) }
+        [IO.File]::WriteAllBytes((Join-Path $destination $script:upgradeInstaller), $bytes)
+        $line = "$($boardHash.ToLowerInvariant())  $script:upgradeEntryName"
+        $lines = if ($script:upgradeDuplicate) { @($line, $line) } else { @($line) }
+        [IO.File]::WriteAllLines((Join-Path $destination $script:upgradeChecksums), $lines)
+    }
+    try {
+        $legacy = @{tag_name = 'v0.8.0'; draft = $false; assets = @(
+            @{name = 'Sawer-Setup.exe'}, @{name = 'SHA256SUMS.txt'})}
+        $versioned = @{tag_name = 'v0.9.0'; draft = $false; assets = @(
+            @{name = 'sawer-v0.9.0-windows-x64-setup.exe'},
+            @{name = 'sawer-v0.9.0-windows-x64-sha256sums.txt'})}
+        $incomplete = @{tag_name = 'v0.9.1'; draft = $false; assets = @(
+            @{name = 'sawer-v0.9.1-windows-x64-setup.exe'})}
+        $current = @{tag_name = 'v0.10.0'; draft = $false; assets = $versioned.assets}
+        $draft = @{tag_name = 'v0.9.2'; draft = $true; assets = $versioned.assets}
+        $mixed = @{tag_name = 'v0.9.0'; draft = $false; assets = @(
+            @{name = 'sawer-v0.9.0-windows-x64-setup.exe'},
+            @{name = 'Sawer-Setup.exe'}, @{name = 'SHA256SUMS.txt'})}
+        $env:VERSION = '0.10.0'
+        $env:GH_REPO = 'fixture/sawer'
+        foreach ($scenario in @('legacy', 'versioned', 'mixed', 'wrong-name', 'duplicate', 'corrupt')) {
+            $scenarioRoot = Join-Path $testRoot ('upgrade-' + $scenario)
+            New-Item -ItemType Directory -Path $scenarioRoot | Out-Null
+            Set-Location -LiteralPath $scenarioRoot
+            $env:GITHUB_OUTPUT = Join-Path $scenarioRoot 'output.txt'
+            $script:upgradeTag = if ($scenario -eq 'legacy') { 'v0.8.0' } else { 'v0.9.0' }
+            $script:upgradeInstaller = if ($scenario -in @('legacy', 'mixed')) {
+                'Sawer-Setup.exe'
+            } else { 'sawer-v0.9.0-windows-x64-setup.exe' }
+            $script:upgradeChecksums = if ($scenario -in @('legacy', 'mixed')) {
+                'SHA256SUMS.txt'
+            } else { 'sawer-v0.9.0-windows-x64-sha256sums.txt' }
+            $script:upgradeEntryName = if ($scenario -eq 'wrong-name') {
+                'sawer-v0X9X0-windows-x64-setup.exe'
+            } else { $script:upgradeInstaller }
+            $script:upgradeDuplicate = $scenario -eq 'duplicate'
+            $script:upgradeCorrupt = $scenario -eq 'corrupt'
+            $script:upgradeReleases = @($legacy, $incomplete, $current, $draft)
+            if ($scenario -eq 'mixed') { $script:upgradeReleases += $mixed }
+            elseif ($scenario -ne 'legacy') { $script:upgradeReleases += $versioned }
+            if ($scenario -in @('wrong-name', 'duplicate')) {
+                Assert-Rejected { & $upgrade } 'Previous installer checksum is missing or ambiguous'
+            } elseif ($scenario -eq 'corrupt') {
+                Assert-Rejected { & $upgrade } 'Previous installer checksum mismatch'
+            } else {
+                & $upgrade
+                $output = Get-Content -LiteralPath $env:GITHUB_OUTPUT
+                $expectedInstaller = (Resolve-Path -LiteralPath (Join-Path $scenarioRoot ('out/installer-upgrade/' + $script:upgradeInstaller))).Path
+                Assert-Condition ($output -contains "installer=$expectedInstaller") 'Upgrade output contains the wrong installer path'
+                Assert-Condition ($output -contains "version=$($script:upgradeTag.Substring(1))") 'Upgrade output contains the wrong version'
+            }
+        }
+    } finally {
+        Set-Location -LiteralPath $previousLocation.Path
+        $env:VERSION = $previousVersionEnv
+        $env:GH_REPO = $previousRepoEnv
+        $env:GITHUB_OUTPUT = $previousOutputEnv
+        Remove-Item Function:\gh
+    }
+    # Generate the real release checksum manifest with the versioned download names.
+    $checksumStep = [regex]::Match($workflow, '(?ms)^      - name: Create release checksums\r?\n.*?        run: \|\r?\n(?<body>.*?)(?=^      - name:)')
+    Assert-Condition $checksumStep.Success 'Windows checksum step was not found'
+    $checksumBody = [regex]::Replace($checksumStep.Groups['body'].Value, '(?m)^          ', '')
+    $previousLocation = Get-Location
+    $previousStem = $env:RELEASE_STEM
+    try {
+        $checksumRoot = Join-Path $testRoot 'release-checksums'
+        $distribution = Join-Path $checksumRoot 'dist'
+        New-Item -ItemType Directory -Path $distribution -Force | Out-Null
+        Set-Location -LiteralPath $checksumRoot
+        $env:RELEASE_STEM = 'sawer-v0.9.0-windows-x64'
+        $setupName = "$($env:RELEASE_STEM)-setup.exe"
+        $portableName = "$($env:RELEASE_STEM)-portable.exe"
+        $noticesName = "$($env:RELEASE_STEM)-third-party-notices.md"
+        [IO.File]::WriteAllBytes((Join-Path $distribution $setupName), [byte[]]@(1, 2, 3, 4))
+        [IO.File]::WriteAllBytes((Join-Path $distribution $portableName), [byte[]]@(5, 6, 7, 8))
+        [IO.File]::WriteAllBytes((Join-Path $distribution $noticesName), [byte[]]@(9, 10))
+        & ([scriptblock]::Create($checksumBody))
+        $manifest = Join-Path $distribution "$($env:RELEASE_STEM)-sha256sums.txt"
+        $lines = Get-Content -LiteralPath $manifest
+        Assert-Condition ($lines.Count -eq 3) 'Release checksum manifest omitted a download'
+        foreach ($name in @($setupName, $portableName, $noticesName)) {
+            $hash = (Get-FileHash -LiteralPath (Join-Path $distribution $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+            Assert-Condition ($lines -ccontains "$hash  $name") 'Checksum entry does not match the versioned filename and bytes'
+        }
+        $bytes = [IO.File]::ReadAllBytes($manifest)
+        Assert-Condition (-not ($bytes[0] -eq 0xef -and $bytes[1] -eq 0xbb -and $bytes[2] -eq 0xbf)) 'Checksum manifest must not have a UTF-8 BOM'
+    } finally {
+        Set-Location -LiteralPath $previousLocation.Path
+        $env:RELEASE_STEM = $previousStem
+    }
+    Write-Output 'Installer preservation, Unicode shortcuts, exit-code, HTTPS cache, versioned upgrade and checksum regression checks passed'
 } finally {
     $resolved = [IO.Path]::GetFullPath($testRoot)
     if (-not $resolved.StartsWith($temporaryRoot.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {

@@ -63,3 +63,22 @@ TEST_CASE("board theme transitions restore colors and respect fixed backgrounds"
     REQUIRE(board_theme_amount(toolbar) == 0.0);
     REQUIRE(board_display_color(white, board_theme_amount(toolbar)) == white);
 }
+
+TEST_CASE("Home preview themes ease in both directions with the gallery palette")
+{
+    using namespace sawer;
+    HomeView home;
+    home.update(1280, 720, 1, Theme::light, {});
+    REQUIRE(board_theme_amount(home) == 0.0);
+    home.relayout(1280, 720, 1, Theme::dark);
+    REQUIRE(board_theme_amount(home) == 0.0);
+    home.tick(0.1);
+    REQUIRE(board_theme_amount(home) > 0.0);
+    REQUIRE(board_theme_amount(home) < 1.0);
+    for (int frame = 0; frame < 4; ++frame) home.tick(0.1);
+    REQUIRE(board_theme_amount(home) == 1.0);
+    home.relayout(1280, 720, 1, Theme::light);
+    REQUIRE(board_theme_amount(home) == 1.0);
+    for (int frame = 0; frame < 4; ++frame) home.tick(0.1);
+    REQUIRE(board_theme_amount(home) == 0.0);
+}

@@ -6788,7 +6788,7 @@ void GpuRenderer::create_text_resources()
 }
 
 SDL_GPUTexture* GpuRenderer::ensure_thumbnail_texture(
-    const std::shared_ptr<const BoardPreview>& preview)
+    const std::shared_ptr<const BoardPreview>& preview, const std::uint8_t dark_amount)
 {
     if (preview == nullptr || !preview->has_content) {
         return nullptr;
@@ -6797,7 +6797,7 @@ SDL_GPUTexture* GpuRenderer::ensure_thumbnail_texture(
         static_cast<std::size_t>(BoardPreview::pixel_width)
         * BoardPreview::pixel_height;
     const std::size_t rgba_bytes = pixel_count * 4U;
-    if (preview->rgba.size() != rgba_bytes) {
+    if (preview->rgba.size() != rgba_bytes || preview->dark_rgba.size() != rgba_bytes) {
         return nullptr;
     }
 
@@ -6842,7 +6842,8 @@ SDL_GPUTexture* GpuRenderer::ensure_thumbnail_texture(
         [key](const ThumbnailUpload& upload) {
             return upload.key == key;
         });
-    if (!found->second.uploaded && !upload_already_queued) {
+    if ((!found->second.uploaded || found->second.dark_amount != dark_amount)
+        && !upload_already_queued) {
         const std::size_t first_byte = thumbnail_upload_pixels_.size();
         if (first_byte > std::numeric_limits<std::uint32_t>::max()
             || rgba_bytes
@@ -6850,10 +6851,13 @@ SDL_GPUTexture* GpuRenderer::ensure_thumbnail_texture(
             throw std::runtime_error{
                 "Home thumbnail upload exceeded its byte budget"};
         }
-        thumbnail_upload_pixels_.insert(
-            thumbnail_upload_pixels_.end(),
-            preview->rgba.begin(),
-            preview->rgba.end());
+        thumbnail_upload_pixels_.resize(first_byte + rgba_bytes);
+        write_board_preview_pixels(*preview, dark_amount,
+            std::span{thumbnail_upload_pixels_}.subspan(first_byte, rgba_bytes));
+        // Mark pending uploads invalid until submission succeeds, including
+        // theme changes to textures that were previously uploaded.
+        found->second.uploaded = false;
+        found->second.dark_amount = dark_amount;
         thumbnail_uploads_.push_back({
             found->second.texture,
             key,
@@ -6866,7 +6870,8 @@ SDL_GPUTexture* GpuRenderer::ensure_thumbnail_texture(
 void GpuRenderer::queue_home_thumbnail(
     const std::shared_ptr<const BoardPreview>& preview,
     const UiRect bounds,
-    const std::array<float, 4> color)
+    const std::array<float, 4> color,
+    const std::uint8_t dark_amount)
 {
     if (bounds.width <= 1.0 || bounds.height <= 1.0
         || color[3] <= 0.004F
@@ -6874,7 +6879,7 @@ void GpuRenderer::queue_home_thumbnail(
         || text_indices_.size() + 6U > maximum_text_indices) {
         return;
     }
-    SDL_GPUTexture* const texture = ensure_thumbnail_texture(preview);
+    SDL_GPUTexture* const texture = ensure_thumbnail_texture(preview, dark_amount);
     if (texture == nullptr) {
         return;
     }
@@ -8149,6 +8154,8 @@ void GpuRenderer::build_home_text_geometry(
     };
 
     const auto& boards = home.boards();
+    const auto dark_amount = static_cast<std::uint8_t>(
+        std::lround(board_theme_amount(home) * 255.0));
     const double vertical_margin = 20.0 * scale;
     for (std::size_t index = 0U; index < boards.size(); ++index) {
         if (boards[index].preview == nullptr
@@ -8167,7 +8174,7 @@ void GpuRenderer::build_home_text_geometry(
             boards[index].preview,
             thumbnail,
             {1.0F, 1.0F, 1.0F,
-             static_cast<float>(home.entrance(index))});
+             static_cast<float>(home.entrance(index))}, dark_amount);
     }
 
     const UiRect heading = home.heading_bounds();

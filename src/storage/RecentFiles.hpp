@@ -36,7 +36,7 @@ private:
     std::size_t limit_;
     std::vector<std::filesystem::path> entries_;
     std::unordered_map<std::filesystem::path, double> zoom_levels_;
-    bool light_theme_{};
+    bool light_theme_{true};
 };
 
 } // namespace sawer

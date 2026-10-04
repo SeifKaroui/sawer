@@ -330,13 +330,13 @@ install_data('tools/compile_shaders.py',
 package_documents = technical_documents + files(
   'assets/shaders/README.md', 'tools/compile_shaders.py')
 
-package_system = host_machine.system() == 'windows' ? 'Windows' : 'Linux'
+package_system = host_machine.system() == 'windows' ? 'windows' : 'linux'
 package_cpu = host_machine.cpu_family()
-if package_cpu == 'x86_64' and host_machine.system() == 'windows'
-  package_cpu = 'AMD64'
+if package_cpu == 'x86_64'
+  package_cpu = 'x64'
 endif
 package_root = (
-  'Sawer-' + meson.project_version() + '-' + package_system + '-' + package_cpu
+  'sawer-v' + meson.project_version() + '-' + package_system + '-' + package_cpu
 )
 package_extension = host_machine.system() == 'windows' ? '.zip' : '.tar.gz'
 portable_package = custom_target(
@@ -444,6 +444,8 @@ if get_option('tests')
     args: files('tests/tools/LinuxPackageTests.py'))
   test('Flatpak package payload', python, suite: 'headless',
     args: files('tests/tools/FlatpakPackageTests.py'))
+  test('release publication guards', python, suite: 'headless',
+    args: files('tests/tools/ReleasePublicationTests.py'))
   test('version command', sawer_executable, suite: 'headless', args: ['--version'])
   test(
     'third-party notices command',

@@ -23,6 +23,23 @@ def elf_header() -> bytes:
 
 
 class FlatpakPackageTests(unittest.TestCase):
+    def test_shared_application_icon_contains_all_desktop_sizes(self):
+        icon = (SOURCE / "assets/windows/Sawer.ico").read_bytes()
+        reserved, kind, count = struct.unpack_from("<HHH", icon)
+        self.assertEqual((reserved, kind), (0, 1))
+        sizes = set()
+        for index in range(count):
+            width, height, _, _, _, _, size, offset = struct.unpack_from(
+                "<BBBBHHII", icon, 6 + index * 16)
+            width, height = width or 256, height or 256
+            self.assertEqual(width, height)
+            self.assertGreater(size, 0)
+            self.assertGreaterEqual(offset, 6 + count * 16)
+            self.assertLessEqual(offset + size, len(icon))
+            sizes.add(width)
+        self.assertEqual(sizes, {16, 24, 32, 48, 64, 128, 256})
+        self.assertEqual(count, len(sizes))
+
     def make_appdir(self, root: Path) -> Path:
         executable = root / "Sawer"
         executable.write_bytes(elf_header() + b"same GCC-built executable")

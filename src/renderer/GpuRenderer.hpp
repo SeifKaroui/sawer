@@ -296,6 +296,7 @@ private:
         std::weak_ptr<const BoardPreview> owner;
         std::uint64_t last_used_frame{};
         bool uploaded{};
+        std::uint8_t dark_amount{};
     };
 
     struct ThumbnailUpload final {
@@ -368,11 +369,12 @@ private:
     [[nodiscard]] TTF_Font* text_font(TextStyle style) const noexcept;
     [[nodiscard]] Vec2d tooltip_text_extent(const Toolbar& toolbar, const UiControl& control);
     [[nodiscard]] SDL_GPUTexture* ensure_thumbnail_texture(
-        const std::shared_ptr<const BoardPreview>& preview);
+        const std::shared_ptr<const BoardPreview>& preview, std::uint8_t dark_amount);
     void queue_home_thumbnail(
         const std::shared_ptr<const BoardPreview>& preview,
         UiRect bounds,
-        std::array<float, 4> color);
+        std::array<float, 4> color,
+        std::uint8_t dark_amount);
     [[nodiscard]] double measure_text_width(
         std::string_view text,
         TextStyle style = TextStyle::regular);

@@ -1,9 +1,14 @@
 # Release builds
 
-The workflow builds `Sawer-Setup.exe` (per-user installer) and
-`Sawer-Portable.exe` from one statically linked executable. Fonts, icons,
+The workflow builds `sawer-vX.Y.Z-windows-x64-setup.exe` (per-user installer) and
+`sawer-vX.Y.Z-windows-x64-portable.exe` from one statically linked executable. Fonts, icons,
 version metadata, and third-party notices are embedded. Tag runs publish
 checksums and build provenance. Binaries are not Authenticode-signed.
+
+Download filenames and Actions artifact names use lowercase `sawer-vX.Y.Z`,
+with `windows-x64` or `linux-x64`. The conventional `.AppImage` extension is
+preserved. Replace `X.Y.Z` in the examples below with the source version.
+The installed executable and displayed application name remain `Sawer`.
 
 ## Shared CI compiler
 
@@ -69,18 +74,31 @@ Preservation hashes exclude the active diagnostic `Sawer.log` and disposable
 
 Pass `-PreviousInstaller` and `-PreviousVersion` for an older-version upgrade.
 The workflow retrieves the most recent lower published version with installer
-and checksum assets. The first release reports that scenario as skipped. A
-previous application does not have to support the current board format.
+and checksum assets, accepting both versioned filenames and legacy
+`Sawer-Setup.exe` / `SHA256SUMS.txt` downloads. The first release reports that
+scenario as skipped. A previous application does not have to support the current board format.
 
 ## Workflow and publication
 
-The Windows workflow runs manually and on version tags. Hosted tests cover
+The Windows and Linux workflows can run manually and are reusable jobs in
+`.github/workflows/release.yml`. Only the Release workflow handles version-tag
+pushes and publishes downloads. Hosted tests cover
 headless unit, asset-fetch, Unicode file commands, portable documentation,
 installer preservation helpers, and version/notices checks. GPU/window/performance checks must also pass
 locally on the exact Release source. Validate Windows 10 and 11 interactively.
 
-A manual branch run creates an unpublished artifact. Matching tags publish
-automatically. After artifact validation:
+A manual platform run creates an unpublished artifact. A matching tag starts
+both platforms from the same commit. Publication waits for Windows installer
+checks, both Linux build types, and all Ubuntu 24.04 compatibility jobs.
+
+`tools/publish_release.py` verifies the exact asset sets and checksums, confirms
+that the tag points to the tested commit, and uploads both platforms to one
+draft. It downloads and compares the uploaded bytes before making the release
+public. Failed uploads or verification leave the draft unpublished; retries
+can resume that draft. Published releases are never overwritten.
+
+The workflow uses GitHub's provided token; no personal token is required.
+After local Release validation, commit the intended source and push it, then:
 
 ```text
 git tag -a vX.Y.Z -m "Sawer X.Y.Z"
@@ -122,17 +140,17 @@ checks, and real Intel/AMD/NVIDIA validation remain required release checks.
 
 Release runs generate the following artifact contents:
 
-- `Sawer`: the stripped, statically linked SDL executable.
-- `Sawer-x86_64.AppImage`: that exact executable plus compiler runtime
+- `sawer-vX.Y.Z-linux-x64`: the stripped, statically linked SDL executable.
+- `sawer-vX.Y.Z-linux-x64.AppImage`: that exact executable plus compiler runtime
   libraries, launcher, desktop metadata, icon, documentation, and notices.
-- `Sawer-x86_64.flatpak`: an installable bundle of the same executable and
+- `sawer-vX.Y.Z-linux-x64.flatpak`: an installable bundle of the same executable and
   compiler runtimes, with desktop, file-type, and application metadata.
-- `FLATPAK-RUNTIME-Linux-x86_64.txt`: the Freedesktop runtime branch and
+- `sawer-vX.Y.Z-linux-x64-flatpak-runtime.txt`: the Freedesktop runtime branch and
   runtime/graphics-extension commits used for the Flatpak checks.
-- `SHA256SUMS-Linux-x86_64.txt`: checksums for the downloads and companion
+- `sawer-vX.Y.Z-linux-x64-sha256sums.txt`: checksums for the downloads and companion
   dependency/notice reports.
-- `DEPENDENCIES-Linux-x86_64.txt`: the plain executable's shared dependencies.
-- `THIRD_PARTY_NOTICES-Linux.md`: application, runtime, and compiler notices.
+- `sawer-vX.Y.Z-linux-x64-dependencies.txt`: the plain executable's shared dependencies.
+- `sawer-vX.Y.Z-linux-x64-third-party-notices.md`: application, runtime, and compiler notices.
 
 The AppDir preparation rejects unresolved libraries, shared SDL, unexpected
 dependencies, wrong architectures, and existing output directories. It copies
@@ -160,10 +178,10 @@ other checks. AppImage graphics run on the stock distribution runtime; only the
 standalone executable jobs install the newer system C++ runtime.
 
 Run **Linux release** manually from Actions to generate the
-`Sawer-<version>-Linux-x86_64` artifact. Artifact ZIPs and browser downloads may
-lose executable permissions; use `chmod +x Sawer Sawer-x86_64.AppImage`.
-These runs generate and validate artifacts only. Linux release publication
-requires a separate authorized step; the existing Windows workflow is unchanged.
+`sawer-v<version>-linux-x64` artifact. Artifact ZIPs and browser downloads may
+lose executable permissions; use `chmod +x sawer-vX.Y.Z-linux-x64 sawer-vX.Y.Z-linux-x64.AppImage`.
+Manual Linux runs generate and validate artifacts only. Tag releases publish
+the tested Linux assets alongside Windows through the shared Release workflow.
 
 ## Flatpak packaging and installation
 
@@ -193,11 +211,12 @@ and presents frames on X11 and Wayland. Graphics checks select lavapipe from
 inside the runtime; host Vulkan ICD paths are not used by the sandbox. Display
 logs are retained under `build/flatpak-logs/`. Flatpak staging, state, and export
 repositories stay under `build/`; they are packaging outputs, not Meson build
-configurations. There is no Flathub submission or release publication.
+configurations. The bundle is published with the other release assets; there
+is no Flathub submission.
 
 After installing Flatpak, users can install and run the artifact with:
 
-    flatpak install --user ./Sawer-x86_64.flatpak
+    flatpak install --user ./sawer-vX.Y.Z-linux-x64.flatpak
     flatpak run io.sawer.app
 
 The sandbox allows Wayland, fallback X11, graphics devices, and Documents.
@@ -223,12 +242,12 @@ the runtime/SDK as shown in the workflow:
 
     python tools/package_flatpak.py --appdir build/Sawer.AppDir --output build/flatpak-source --version X.Y.Z --release-date YYYY-MM-DD
     flatpak-builder --user --arch=x86_64 --disable-rofiles-fuse --disable-cache --state-dir=build/flatpak-state --repo=build/flatpak-repo build/Sawer.Flatpak build/flatpak-source/io.sawer.app.json
-    flatpak build-bundle --arch=x86_64 --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo build/flatpak-repo build/linux-dist/Sawer-x86_64.flatpak io.sawer.app stable
+    flatpak build-bundle --arch=x86_64 --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo build/flatpak-repo build/linux-dist/sawer-vX.Y.Z-linux-x64.flatpak io.sawer.app stable
 
 Use a fresh staging/output directory and the source version and commit date.
 After installing the bundle, run the same metadata and presentation checks:
 
-    dbus-run-session -- python tools/test_flatpak.py --executable build/linux-dist/Sawer --graphics
+    dbus-run-session -- python tools/test_flatpak.py --executable build/linux-dist/sawer-vX.Y.Z-linux-x64 --graphics
 
 ## Rebuild an AppImage locally
 

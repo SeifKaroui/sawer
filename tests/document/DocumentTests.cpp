@@ -45,7 +45,7 @@ TEST_CASE("object identifiers have UUID v4 layout")
 
 TEST_CASE("default style uses the regular pencil width")
 {
-    REQUIRE(sawer::Style{}.stroke_width == 4.0);
+    REQUIRE(sawer::Style{}.stroke_width == 5.0);
 }
 
 TEST_CASE("line bounds include stroke width")

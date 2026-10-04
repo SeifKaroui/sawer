@@ -13,7 +13,7 @@ namespace sawer {
 namespace {
 
 constexpr std::array<char, 8> cache_magic{
-    'S', 'A', 'W', 'E', 'R', 'P', 'V', '2'};
+    'S', 'A', 'W', 'E', 'R', 'P', 'V', '3'};
 constexpr std::size_t maximum_cache_files = 128U;
 
 std::uint64_t fnv1a(
@@ -41,7 +41,7 @@ std::filesystem::path cache_path(
     const auto modified_ticks = modified.time_since_epoch().count();
     hash = fnv1a(hash, &modified_ticks, sizeof(modified_ticks));
     hash = fnv1a(hash, &file_size, sizeof(file_size));
-    constexpr std::uint32_t raster_version = 3U;
+    constexpr std::uint32_t raster_version = 4U;
     hash = fnv1a(hash, &raster_version, sizeof(raster_version));
 
     constexpr std::string_view digits{"0123456789abcdef"};
@@ -127,6 +127,10 @@ std::optional<BoardPreview> load_preview_cache(
     input.read(
         reinterpret_cast<char*>(preview.rgba.data()),
         static_cast<std::streamsize>(preview.rgba.size()));
+    preview.dark_rgba.resize(preview.rgba.size());
+    input.read(
+        reinterpret_cast<char*>(preview.dark_rgba.data()),
+        static_cast<std::streamsize>(preview.dark_rgba.size()));
     if (!input
         || input.peek() != std::char_traits<char>::eof()) {
         return std::nullopt;
@@ -144,7 +148,8 @@ void store_preview_cache(
     const std::size_t expected_size =
         static_cast<std::size_t>(BoardPreview::pixel_width)
         * BoardPreview::pixel_height * 4U;
-    if (!preview.has_content || preview.rgba.size() != expected_size) {
+    if (!preview.has_content || preview.rgba.size() != expected_size
+        || preview.dark_rgba.size() != expected_size) {
         return;
     }
 
@@ -177,6 +182,9 @@ void store_preview_cache(
         output.write(
             reinterpret_cast<const char*>(preview.rgba.data()),
             static_cast<std::streamsize>(preview.rgba.size()));
+        output.write(
+            reinterpret_cast<const char*>(preview.dark_rgba.data()),
+            static_cast<std::streamsize>(preview.dark_rgba.size()));
         output.flush();
         if (!output) {
             output.close();

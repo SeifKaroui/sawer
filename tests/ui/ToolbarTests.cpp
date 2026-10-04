@@ -84,6 +84,20 @@ TEST_CASE("selection control activates in the editing milestone")
     }) == sawer::UiAction::select);
 }
 
+TEST_CASE("drawing defaults use light theme and the second width preset")
+{
+    sawer::Toolbar toolbar;
+    sawer::Style style;
+    toolbar.update(
+        1280.0, 720.0, 1.0, sawer::Tool::pencil, style, false, false, false, 1.0,
+        "Untitled", false, {}, sawer::BackgroundStyle::dot, {});
+    REQUIRE(toolbar.theme() == sawer::Theme::light);
+    REQUIRE(style.stroke_width == sawer::Toolbar::width_for(sawer::UiAction::width_regular));
+    REQUIRE(toolbar.context_stroke_width() == 5.0);
+    REQUIRE(toolbar.find(sawer::UiAction::width_regular)->selected);
+    REQUIRE_FALSE(toolbar.find(sawer::UiAction::width_thin)->selected);
+}
+
 TEST_CASE("toolbar scales and reports palette choices")
 {
     sawer::Toolbar toolbar;

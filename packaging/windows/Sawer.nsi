@@ -21,7 +21,7 @@ RequestExecutionLevel user
 ManifestDPIAware true
 ManifestSupportedOS Win10
 Name "${APP_NAME} ${APP_VERSION}"
-OutFile "${OUTPUT_DIR}\Sawer-Setup.exe"
+OutFile "${OUTPUT_DIR}\sawer-v${APP_VERSION}-windows-x64-setup.exe"
 InstallDir "$LOCALAPPDATA\Programs\Sawer"
 InstallDirRegKey HKCU "${UNINSTALL_KEY}" "InstallLocation"
 SetCompressor /FINAL zlib

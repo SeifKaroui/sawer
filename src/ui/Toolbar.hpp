@@ -62,7 +62,7 @@ struct SelectionStyleSummary final {
     PropertyValueState stroke_color{PropertyValueState::unavailable};
     Color stroke_color_value;
     PropertyValueState stroke_width{PropertyValueState::unavailable};
-    double stroke_width_value{4.0};
+    double stroke_width_value{5.0};
     PropertyValueState fill{PropertyValueState::unavailable};
     bool fill_enabled{};
     PropertyValueState fill_color{PropertyValueState::unavailable};
@@ -462,10 +462,10 @@ private:
     Tool properties_tool_{Tool::pencil};
     Color current_color_{31U, 41U, 55U, 255U};
     bool current_color_mixed_{};
-    double context_stroke_width_{4.0};
+    double context_stroke_width_{5.0};
     bool context_stroke_width_mixed_{};
     bool stroke_width_editing_{};
-    std::string stroke_width_label_{"4 px"};
+    std::string stroke_width_label_{"5 px"};
     std::optional<Vec2d> pointer_;
     std::optional<UiAction> pressed_action_;
     std::optional<UiAction> repeated_action_;

@@ -2,6 +2,7 @@
 
 #include "document/Object.hpp"
 #include "ui/Toolbar.hpp"
+#include "ui/HomeView.hpp"
 
 #include <algorithm>
 #include <array>
@@ -28,14 +29,25 @@ inline bool adaptive_board_background(const Color color) noexcept
     return false;
 }
 
+inline double board_theme_amount(const Theme previous_theme,
+    const Theme theme, const double transition) noexcept
+{
+    const double t = std::clamp(transition, 0.0, 1.0);
+    const double eased = t * t * (3.0 - 2.0 * t);
+    const double previous = previous_theme == Theme::dark ? 1.0 : 0.0;
+    const double current = theme == Theme::dark ? 1.0 : 0.0;
+    return previous + (current - previous) * eased;
+}
+
 inline double board_theme_amount(const Toolbar& toolbar) noexcept
 {
     if (!adaptive_board_background(toolbar.background_color())) return 0.0;
-    const double t = std::clamp(toolbar.theme_transition(), 0.0, 1.0);
-    const double eased = t * t * (3.0 - 2.0 * t);
-    const double previous = toolbar.previous_theme() == Theme::dark ? 1.0 : 0.0;
-    const double current = toolbar.theme() == Theme::dark ? 1.0 : 0.0;
-    return previous + (current - previous) * eased;
+    return board_theme_amount(toolbar.previous_theme(), toolbar.theme(), toolbar.theme_transition());
+}
+
+inline double board_theme_amount(const HomeView& home) noexcept
+{
+    return board_theme_amount(home.previous_theme(), home.theme(), home.theme_transition());
 }
 
 inline Color board_display_color(const Color color, const double amount) noexcept

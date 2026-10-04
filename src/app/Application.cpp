@@ -906,6 +906,11 @@ int Application::run_input_test()
 
 int Application::run_ui_input_test()
 {
+    if (current_style_.stroke_width != Toolbar::width_for(UiAction::width_regular)
+        || !toolbar_.find(UiAction::width_regular)->selected) {
+        log::write(log::Level::error, "Drawing did not start with the second width preset");
+        return 1;
+    }
     if (recent_files_ && (toolbar_.theme() == Theme::light) != recent_files_->light_theme()) {
         log::write(log::Level::error, "Saved theme was not restored on startup");
         return 1;
@@ -1660,6 +1665,9 @@ int Application::run_home_test()
             camera_.viewport().x, camera_.viewport().y, display_scale_, theme);
         home_view_.clear_pointer();
         home_view_.clear_focus();
+        for (int frame = 0; frame < 6; ++frame) home_view_.tick(0.1);
+        static_cast<void>(renderer_->render(
+            camera_, document_, nullptr, toolbar_, selection_, &home_view_));
         const UiRect card = home_view_.controls().front().bounds;
         const Vec2d point{card.x + 4.0, card.y + 4.0};
         for (int state = 0; state < 4; ++state) {
@@ -1747,6 +1755,47 @@ int Application::run_home_test()
     }
     refresh_home();
 
+    // Verify actual thumbnail pixels through a light/dark/light round trip.
+    // Palette changes may upload blended pixels, but settled frames reuse them.
+    {
+        Document fixture;
+        static_cast<void>(fixture.insert(Object::make_line(ObjectId::random(), 0,
+            {{0.0, 0.0}, {100.0, 0.0}},
+            {.stroke = {0U, 0U, 0U, 255U}, .fill = std::nullopt, .stroke_width = 20.0})));
+        HomeView home;
+        home.update(camera_.viewport().x, camera_.viewport().y, display_scale_, Theme::light,
+            {{"Ink", "Today", std::make_shared<const BoardPreview>(rasterize_board_preview(fixture)),
+                directory / "Ink.sawer"}});
+        for (const Theme theme : {Theme::light, Theme::dark, Theme::light}) {
+            home.relayout(camera_.viewport().x, camera_.viewport().y, display_scale_, theme);
+            for (int frame = 0; frame < 6; ++frame) home.tick(0.1);
+            const UiRect bounds = home.board_preview_bounds(0U);
+            int width = 0;
+            int height = 0;
+            if (!SDL_GetWindowSizeInPixels(window_.get(), &width, &height)) return 1;
+            const auto x = static_cast<std::uint32_t>(
+                (bounds.x + bounds.width * 0.5) * width / camera_.viewport().x);
+            const auto y = static_cast<std::uint32_t>(
+                (bounds.y + bounds.height * 0.5) * height / camera_.viewport().y);
+            renderer_->request_rendered_pixel(x, y);
+            if (!renderer_->render(camera_, document_, nullptr, toolbar_, selection_, &home)) return 1;
+            const auto pixel = renderer_->read_rendered_pixel(x, y);
+            const Color expected = theme == Theme::light
+                ? Color{0U, 0U, 0U, 255U} : Color{235U, 240U, 248U, 255U};
+            if (!pixel || std::abs(static_cast<int>((*pixel)[0]) - expected.red) > 8
+                || std::abs(static_cast<int>((*pixel)[1]) - expected.green) > 8
+                || std::abs(static_cast<int>((*pixel)[2]) - expected.blue) > 8) {
+                log::write(log::Level::error, "Home thumbnail ink did not follow the theme");
+                result = 1;
+            }
+            if (!renderer_->render(camera_, document_, nullptr, toolbar_, selection_, &home)
+                || renderer_->stats().thumbnail_upload_bytes != 0U) {
+                log::write(log::Level::error, "Settled Home theme repeated its thumbnail upload");
+                result = 1;
+            }
+        }
+    }
+
     // Thumbnail density must not affect Home's geometry count: even a fully
     // covered raster is one textured quad and cannot exhaust the overlay.
     auto dense_preview = std::make_shared<BoardPreview>();
@@ -1755,6 +1804,7 @@ int Application::run_home_test()
         static_cast<std::size_t>(BoardPreview::pixel_width)
             * BoardPreview::pixel_height * 4U,
         255U);
+    dense_preview->dark_rgba = dense_preview->rgba;
     std::vector<HomeBoard> dense_boards;
     dense_boards.reserve(12U);
     for (std::size_t index = 0U; index < 12U; ++index) {
