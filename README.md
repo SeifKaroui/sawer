@@ -34,6 +34,12 @@ platform; all downloads target x64.
 <details>
 <summary><strong>Windows</strong></summary>
 
+**Windows security warning:** The installer and portable executable are not yet
+code-signed, so SmartScreen may show **Windows protected your PC** before launch.
+This warning can appear for legitimate unsigned apps and does not by itself mean
+Sawer is harmful. Download from this repository's official release page and verify
+the release checksum, then choose **More info → Run anyway** if this prompt appears.
+
 <details>
 <summary><strong>Setup installer (recommended)</strong></summary>
 
@@ -58,8 +64,7 @@ No installation or companion files are needed.
 
 </details>
 
-Release checksums are in `sawer-v0.9.0-windows-x64-sha256sums.txt`. Windows downloads are not yet
-code-signed, so SmartScreen may show a warning.
+Release checksums are in `sawer-v0.9.0-windows-x64-sha256sums.txt`.
 
 </details>
 
